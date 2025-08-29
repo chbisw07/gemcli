@@ -1,2 +1,9 @@
-requests
-black
+# requirements.txt
+requests>=2.31.0
+streamlit>=1.30.0
+black>=24.3.0  # optional: used by format_python_files
+
+# Optional future extensions:
+# openai
+# google-generativeai
+# deepseek

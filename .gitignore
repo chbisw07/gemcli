@@ -1,71 +1,22 @@
-# Bytecode / cache
+# .gitignore
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
-
-# Jupyter/IPython history
-.ipynb_checkpoints/
-
-# Logs and local output
 *.log
-*.tmp
-*.out
-*.bak
-
-# Environment & dependencies
-.venv/
-.env
-.env.*
-*.egg-info/
-pip-wheel-metadata/
-*.sqlite3
+*.sqlite
 *.db
-
-# Python dependency lock files
-poetry.lock
-Pipfile.lock
-
-# Python compiled extensions
-*.so
-*.dylib
-*.pyd
-
-# IDEs and editors
-.vscode/
-.idea/
-*.sublime-workspace
-*.sublime-project
-
-# OS junk
+.env
+.venv
+.vscode
+.idea
 .DS_Store
-Thumbs.db
+*~
 
-# Test & debug artifacts
-*.coverage
-htmlcov/
-coverage.xml
-*.prof
+# gemcli scratch files
+data/*
+!data/models.json
+*.ods
 
-# Local config or test models
-model_config.json
-*.jsonl
-*.parquet
-*.csv
-
-# Dist / builds
-dist/
-build/
-*.tar.gz
-*.whl
-
-# PyInstaller
-*.spec
-
-# Notebook artifacts
-*.ipynb
-
-# Gemini project extras
-workspace/
-.RAG/
-chroma_db/
-
+# Streamlit state
+gemcli_ui/.streamlit/
+gemcli_ui/__pycache__/

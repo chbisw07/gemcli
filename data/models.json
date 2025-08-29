@@ -9,6 +9,7 @@
       "system_prompt": "You are a state-of-the-art code and reasoning assistant. Use all provided code, docs, and chat context to resolve ambiguity and explain concepts precisely. Clarify all references in your answers and use markdown for code or technical content.",
       "max_context_tokens": 16384,
       "api_key_reqd": true,
+      "api_key_env": "OPENAI_API_KEY",
       "tags": ["code", "chat", "creative", "tools", "long-context"],
       "group": ["paid"]
     },

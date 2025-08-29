@@ -1,0 +1,575 @@
+# agent.py
+import json
+import re
+from typing import List, Dict, Optional, Any
+
+from models import LLMModel
+from tools.registry import ToolRegistry
+from adapters.openai_compat import OpenAICompatAdapter
+
+# Optional Gemini adapter; safe stub if not present
+try:
+    from adapters.gemini import GeminiAdapter  # type: ignore
+except Exception:  # pragma: no cover
+    class GeminiAdapter:  # minimal stub to avoid NameError if not used
+        def __init__(self, *_, **__):
+            raise NotImplementedError("GeminiAdapter not implemented; please add adapters/gemini.py")
+
+
+class Agent:
+    _RE_QUOTED = r"'([^']*)'|\"([^\"]*)\""   # matches 'x' or "x"
+
+    def __init__(self, model: LLMModel, tools: ToolRegistry, enable_tools: bool = True):
+        self.model = model
+        self.tools = tools
+        self.enable_tools = enable_tools
+
+        if model.is_openai_compat():
+            self.adapter = OpenAICompatAdapter(model, tools)
+        elif model.is_gemini():
+            self.adapter = GeminiAdapter(model, tools)
+        else:
+            self.adapter = OpenAICompatAdapter(model, tools)
+
+    # --------------------------- Prompt ---------------------------
+
+    def system_prompt(self) -> str:
+        """
+        Keep the LLM in charge. If tools are available, instruct the preferred flow and
+        provide a JSON fallback protocol if the model can't emit native tool_calls.
+        """
+        prompt = self.model.system_prompt or "You are a helpful coding assistant."
+        if self.model.supports_thinking():
+            prompt += "\nThink step-by-step internally, then provide a concise final answer."
+
+        if self.enable_tools:
+            if self.model.is_openai_compat():
+                prompt += (
+                    "\nYou can call tools via function calling. "
+                    "When asked to find or fix code, CALL a tool instead of narrating. "
+                    "Preferred flow: scan_relevant_files → analyze_files → propose & apply edits (dry_run first). "
+                    "NEVER dump large file blobs; summarize and use the tools."
+                )
+            else:
+                prompt += (
+                    "\nWhen you want to act, reply with ONLY a single JSON object on one line: "
+                    "{\"tool\":\"<name>\",\"arguments\":{...}}. No prose. "
+                    "After the tool result is returned, continue. "
+                    "Preferred flow: scan_relevant_files → analyze_files → propose & apply edits (dry_run first). "
+                    "NEVER dump large file blobs; summarize and use the tools."
+                )
+        return prompt
+
+    # --------------------------- Public API ---------------------------
+
+    def ask_once(self, query: str, max_iters: int = 3) -> str:
+        """
+        Single-turn ask with an internal tool loop. Keeps the LLM primary:
+        - If OpenAI-native tool_calls arrive, execute them in the correct order.
+        - Otherwise, if assistant content is a JSON tool request, execute it (textual protocol).
+        - Deterministic parsers + search intent filter act as safety hatches.
+        """
+        # Deterministic / intent fast-paths (no LLM needed)
+        direct = self._try_direct_actions(query)
+        if direct is not None:
+            return direct
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt()},
+            {"role": "user", "content": query},
+        ]
+
+        if not self.enable_tools:
+            resp = self.adapter.chat(messages)
+            return (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+
+        # Tooling enabled
+        tool_choice_override = self._route_tool_call(query)  # hint for first hop
+
+        for _ in range(max_iters):
+            try:
+                resp = self.adapter.chat(messages, tool_choice_override=tool_choice_override)
+            except Exception as e:
+                return f"[error] chat failed: {e}"
+
+            msg = (resp.get("choices") or [{}])[0].get("message", {}) or {}
+            tool_calls = msg.get("tool_calls") or []
+            content = msg.get("content")
+
+            if tool_calls:
+                # ✅ Correct order: assistant with tool_calls, then tool replies (one per id)
+                messages.append(msg)
+                for tc in tool_calls:
+                    fn = (tc.get("function") or {}).get("name")
+                    args_str = (tc.get("function") or {}).get("arguments", "{}")
+                    try:
+                        args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
+                    except Exception:
+                        args = {}
+                    try:
+                        result = self.tools.call(fn, **args)
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "name": fn,
+                            "content": json.dumps(result),
+                        }
+                    except Exception as e:
+                        tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": tc.get("id"),
+                            "name": fn,
+                            "content": json.dumps({"error": str(e)}),
+                        }
+                    messages.append(tool_msg)
+
+                # after first hop, let the model decide next steps
+                tool_choice_override = None
+                continue  # loop again with tool results in context
+
+            # No native tool_calls → textual JSON tool protocol fallback for non-OpenAI models
+            if content and not self.model.is_openai_compat():
+                ran, tool_msg = self._maybe_run_textual_tool(content)
+                if ran:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append(tool_msg)
+                    tool_choice_override = None
+                    continue  # loop again with tool result
+
+            # If OpenAI-compatible model responded with prose instead of calling tools,
+            # provide a very small safety net for common "scan/search" prompts.
+            if content and self.model.is_openai_compat():
+                if self._looks_like_scan_search(query) and not tool_calls:
+                    try:
+                        res = self.tools.call("search_code", query=self._extract_search_term(query) or query.strip(), subdir=self._guess_subdir_from_prompt(query))
+                        return f"search_code -> {json.dumps(res, indent=2)}"
+                    except Exception as e:
+                        return f"[error] search_code failed: {e}"
+
+            # Final answer
+            if content:
+                # If the "content" itself is a JSON tool ask, run it once as a last resort
+                ran, result_or_text = self._maybe_run_textual_tool(content)
+                if ran:
+                    return result_or_text["content"]  # show tool result JSON
+                return content
+
+            # No content and no tools? Stop.
+            break
+
+        return "[tool loop exhausted]"
+
+    # --------------------------- JSON-tool fallback ---------------------------
+
+    def _maybe_run_textual_tool(self, content: str):
+        """
+        If assistant content looks like {"tool":"...", "arguments":{...}}, execute it and
+        return (True, tool_message_dict). Otherwise (False, original_content).
+        """
+        try:
+            obj = json.loads(content)
+            if isinstance(obj, dict) and "tool" in obj and "arguments" in obj:
+                name = obj["tool"]
+                args = obj.get("arguments") or {}
+                result = self.tools.call(name, **args)
+                return True, {
+                    "role": "tool",
+                    "tool_call_id": f"textual-{name}",
+                    "name": name,
+                    "content": json.dumps(result),
+                }
+        except Exception:
+            pass
+        return False, content
+
+    # --------------------------- Router ---------------------------
+
+    def _route_tool_call(self, query: str) -> Optional[Dict[str, Any]]:
+        """
+        Heuristic router that maps a natural-language prompt to the most likely tool.
+        It only returns a tool_choice override; the model will still supply arguments.
+        Priority matters: match specific intents first.
+        """
+        q = (query or "").lower()
+
+        def choose(name: str) -> Dict[str, Any]:
+            return {"type": "function", "function": {"name": name}}
+
+        # Edits / replacements
+        if any(k in q for k in ("bulk edit", "bulk change", "multiple files", "across the repo", "across the project")):
+            return choose("bulk_edit")
+        if any(k in q for k in ("replace", "substitute", "find and replace", "search and replace", "swap text")):
+            return choose("replace_in_file")
+        if any(k in q for k in ("rewrite open(", "fix open()", "context manager", "with open", "file leak", "not close", "don’t close", "doesn't close", "doesnt close")):
+            return choose("rewrite_naive_open")
+
+        # Write/create files
+        if any(k in q for k in ("write file", "create file", "new file", "make file", "save file")):
+            return choose("write_file")
+
+        # Formatting / cleanup
+        if any(k in q for k in ("format python", "run black", "reformat", "auto format", "auto-format", "code style", "pep8")):
+            return choose("format_python_files")
+
+        # Scan → Analyze flow
+        if any(k in q for k in ("scan for", "find relevant files", "which files are relevant", "search repo for", "locate files", "discover files")):
+            return choose("scan_relevant_files")
+        if any(k in q for k in ("analyze files", "analyze these files", "summarize files", "quick analysis", "file signals", "show preview", "line counts")):
+            return choose("analyze_files")
+
+        # Listing
+        if ("list" in q or "show" in q) and ("file" in q or "files" in q):
+            return choose("list_files")
+
+        # Searching
+        if any(k in q for k in ("search", "find", "grep", "look for", "scan")) and any(
+            k in q for k in ("code", "function", "class", "def ", ".py", ".js", ".ts", ".jsx", ".tsx")
+        ):
+            return choose("search_code")
+
+        # Reading
+        if any(k in q for k in ("read", "open", "show contents", "view file", "print file")):
+            return choose("read_file")
+
+        return None
+
+    # --------------------------- REPL ---------------------------
+
+    def repl(self, max_iters: int = 3):
+        tool_names = list(getattr(self.tools, "tools", {}).keys()) if self.enable_tools else []
+        print(f"Model: {self.model.name} ({self.model.provider})  |  Tools: {', '.join(tool_names) if tool_names else 'disabled'}")
+        print("Enter your question (Ctrl+C to exit)")
+        while True:
+            try:
+                q = input("you> ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("bye!")
+                break
+            if not q:
+                continue
+            try:
+                ans = self.ask_once(q, max_iters=max_iters)
+            except Exception as e:
+                ans = f"[error] {e}"
+            print(f"assistant> {ans}")
+
+    # --------------------------- Helpers: search intent filter ---------------------------
+
+    def _is_search_intent(self, q: str) -> bool:
+        return bool(re.search(r"(?i)\b(search|scan|find)\b", q or ""))
+
+    def _extract_search_term(self, q: str) -> Optional[str]:
+        # prefer quoted
+        m = re.search(r"""['"]([^'"]+)['"]""", q or "")
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        # next: code-ish token (json.loads, ClassName, snake_case)
+        m = re.search(r"([A-Za-z_][A-Za-z0-9_\.\-]+)", q or "")
+        if m:
+            return m.group(1).strip()
+        # fallback: last word
+        parts = re.findall(r"[A-Za-z0-9_\.\-]+", q or "")
+        return parts[-1] if parts else None
+
+    def _guess_subdir_from_prompt(self, q: str) -> str:
+        """
+        Heuristically pick the best-matching directory from user text by scoring
+        tokens against actual directories under repo root. Case-insensitive partials.
+        """
+        root = getattr(self.tools, "root", None)
+        if root is None:
+            return ""
+
+        # candidate tokens after 'in|under|inside|within' or just all words
+        m = re.search(r"(?i)\b(in|under|inside|within)\b\s+(.*)$", q or "")
+        tail = m.group(2) if m else (q or "")
+        raw_tokens = re.findall(r"[A-Za-z0-9_\-/.]+", tail.lower())
+
+        # common noise words to ignore
+        stop = {"the", "this", "that", "these", "those", "folder", "dir", "directory",
+                "module", "modules", "pkg", "package", "project", "repo", "code",
+                "inside", "within", "under", "in"}
+        tokens = [t.strip("/.") for t in raw_tokens if t not in stop and t.strip("/.")]
+        if not tokens:
+            return ""
+
+        # build a directory list (relative paths)
+        dirs = []
+        for p in root.rglob("*"):
+            if p.is_dir():
+                try:
+                    rel = str(p.relative_to(root))
+                except Exception:
+                    continue
+                if rel == ".":
+                    continue
+                dirs.append(rel)
+
+        # score: +2 for exact segment match, +1 for substring match
+        best_dir = ""
+        best_score = 0
+        for d in dirs:
+            segs = d.lower().split("/")
+            score = 0
+            for t in tokens:
+                if not t:
+                    continue
+                if t in segs:
+                    score += 2
+                elif t in d.lower():
+                    score += 1
+            if score > best_score:
+                best_dir, best_score = d, score
+
+        return best_dir if best_score > 0 else ""
+
+    # --------------------------- Helpers: legacy parsers (safety hatches) ---------------------------
+
+    def _unquote(self, m) -> str:
+        return m.group(1) if m.group(1) is not None else m.group(2)
+
+    def _first(self, *vals) -> str:
+        for v in vals:
+            if v is not None:
+                return str(v)
+        return ""
+
+    def _parse_replace(self, q: str):
+        pat = re.compile(
+            r"""(?ix)
+            \breplace\s+
+              (?:'(?P<find_sq>[^']*)'|"(?P<find_dq>[^"]*)")   # find
+            \s+with\s+
+              (?:'(?P<repl_sq>[^']*)'|"(?P<repl_dq>[^"]*)")   # replace
+            \s+in\s+
+              (?P<path>\S+)
+            (?:\s*\(\s*(?P<dry>dry\s*run)\s*\))?             # optional (dry run)
+            """,
+        )
+        m = pat.search(q or "")
+        if not m:
+            return None
+        find_val = self._first(m.group("find_sq"), m.group("find_dq"))
+        repl_val = self._first(m.group("repl_sq"), m.group("repl_dq"))
+        path_val = m.group("path")
+        dry = bool(m.group("dry"))
+        return {
+            "tool": "replace_in_file",
+            "args": {
+                "path": path_val,
+                "find": find_val,
+                "replace": repl_val,
+                "dry_run": dry,
+                "backup": True,
+            },
+        }
+
+    def _parse_writefile(self, q: str):
+        pat = re.compile(
+            r"""(?ix)
+            \b(?:create|write)\b .*? \bfile\b .*?
+            (?:under|at|in)\s+(?P<path>\S+)
+            (?: .*? (?:with|containing)\s+
+                (?:'(?P<text_sq>[^']*)'|"(?P<text_dq>[^"]*)")
+            )?
+            """,
+        )
+        m = pat.search(q or "")
+        if not m:
+            return None
+        path = m.group("path")
+        content = self._first(m.group("text_sq"), m.group("text_dq"))
+        if content == "":
+            content = "Hello, world!\n"
+        return {
+            "tool": "write_file",
+            "args": {
+                "path": path,
+                "content": content,
+                "overwrite": False,
+                "backup": True,
+            },
+        }
+
+    def _parse_search(self, q: str):
+        m = re.search(
+            r"(?i)\bsearch\s+for\s+(?:'(?P<sq>[^']*)'|\"(?P<dq>[^\"]*)\"|(?P<plain>\S+))\s+(?:in|under)\s+(?P<dir>\S+)",
+            q or "",
+        )
+        if not m:
+            return None
+        term = m.group("sq") or m.group("dq") or m.group("plain")
+        return {"tool": "search_code", "args": {"query": term, "subdir": m.group("dir")}}
+
+    def _parse_list_files(self, q: str):
+        m = re.search(r"(?i)list\s+all\s+python\s+files\s+(?:in|under)\s+(?P<dir>\S+)", q or "")
+        if not m:
+            return None
+        return {"tool": "list_files", "args": {"subdir": m.group("dir"), "exts": [".py"]}}
+
+    def _flag(self, q: str, *phrases: str) -> bool:
+        ql = (q or "").lower()
+        return any(p.lower() in ql for p in phrases)
+
+    def _extract_json_block(self, q: str) -> Optional[str]:
+        m = re.search(r"```json\s*(?P<body>\{.*?\}|\[.*?\])\s*```", q or "", flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            return m.group("body")
+        m2 = re.search(r"(?P<body>\{.*\}|\[.*\])", q or "", flags=re.DOTALL)
+        if m2:
+            return m2.group("body")
+        return None
+
+    def _parse_bool_flag(self, q: str, default: bool, *aliases: str) -> bool:
+        ql = (q or "").lower()
+        yes = {"true", "yes", "y", "on", "enable", "enabled"}
+        for a in aliases:
+            if re.search(rf"\(\s*{re.escape(a)}\s*\)", ql):
+                return True
+            if re.search(rf"\(\s*no\s+{re.escape(a)}\s*\)", ql):
+                return False
+            m = re.search(rf"{re.escape(a)}\s*=\s*(\w+)", ql)
+            if m:
+                return m.group(1) in yes
+        return default
+
+    def _parse_format_python(self, q: str):
+        m = re.search(r"(?:format|reformat|run\s+black).*(?:under|in)\s+(?P<dir>\S+)", q or "", flags=re.IGNORECASE)
+        if not m:
+            return None
+        dir_val = m.group("dir")
+        mlen = re.search(r"(?:line\s*length|ll)\s*(?P<ll>\d{2,3})", q or "", flags=re.IGNORECASE)
+        ll = int(mlen.group("ll")) if mlen else 88
+        dry = self._parse_bool_flag(q or "", True, "preview", "dry run")
+        return {
+            "tool": "format_python_files",
+            "args": {"subdir": dir_val, "line_length": ll, "dry_run": dry},
+        }
+
+    def _parse_rewrite_open(self, q: str):
+        if not self._flag(q, "rewrite open", "fix open()", "with open", "context manager"):
+            return None
+        m = re.search(r"(?:in|under)\s+(?P<dir>\S+)", q or "", flags=re.IGNORECASE)
+        dir_val = m.group("dir") if m else "."
+        dry = self._parse_bool_flag(q or "", True, "dry run", "preview")
+        return {
+            "tool": "rewrite_naive_open",
+            "args": {"dir": dir_val, "exts": [".py"], "dry_run": dry, "backup": True},
+        }
+
+    def _parse_bulk_edit(self, q: str):
+        if not self._flag(q, "bulk edit", "bulk change", "multiple files", "across the repo", "across the project"):
+            return None
+        raw = self._extract_json_block(q or "")
+        if raw:
+            try:
+                payload = json.loads(raw)
+                if isinstance(payload, dict) and "edits" in payload:
+                    edits = payload["edits"]
+                else:
+                    edits = payload if isinstance(payload, list) else []
+            except Exception:
+                edits = []
+        else:
+            edits = []
+        dry = self._parse_bool_flag(q or "", default=True, *("dry run", "preview"))
+        if not edits:
+            return {
+                "tool": "bulk_edit",
+                "args": {"edits": [], "dry_run": True, "backup": True},
+                "warning": "No edits parsed. Provide JSON `edits` or specify explicit file paths."
+            }
+        return {"tool": "bulk_edit", "args": {"edits": edits, "dry_run": dry, "backup": True}}
+
+    # --------------------------- Direct executor ---------------------------
+
+    def _try_direct_actions(self, query: str) -> Optional[str]:
+        """
+        Deterministic fast-paths & robust intent filter for search.
+        """
+        q = (query or "").strip()
+        if not q:
+            return None
+
+        # 0) Intent filter: normalize search-like prompts -> search_code(query, subdir)
+        if self._is_search_intent(q):
+            term = self._extract_search_term(q)
+            if term:
+                subdir = self._guess_subdir_from_prompt(q)  # "" if none matched
+                try:
+                    res = self.tools.call("search_code", query=term, subdir=subdir)
+                    return f"search_code -> {json.dumps(res, indent=2)}"
+                except Exception as e:
+                    return f"[error] search_code failed: {e}"
+
+        # 1) Replace in file
+        rep = self._parse_replace(q)
+        if rep:
+            try:
+                res = self.tools.call(rep["tool"], **rep["args"])
+                return f"{rep['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {rep['tool']} failed: {e}"
+
+        # 2) Write/Create file
+        wf = self._parse_writefile(q)
+        if wf:
+            try:
+                res = self.tools.call(wf["tool"], **wf["args"])
+                return f"{wf['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {wf['tool']} failed: {e}"
+
+        # 3) List python files
+        lf = self._parse_list_files(q)
+        if lf:
+            try:
+                res = self.tools.call(lf["tool"], **lf["args"])
+                return f"{lf['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {lf['tool']} failed: {e}"
+
+        # 4) legacy search parser (rarely used now)
+        srch = self._parse_search(q)
+        if srch:
+            try:
+                res = self.tools.call(srch["tool"], **srch["args"])
+                return f"{srch['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {srch['tool']} failed: {e}"
+
+        # 5) Format Python files
+        fmt = self._parse_format_python(q)
+        if fmt:
+            try:
+                res = self.tools.call(fmt["tool"], **fmt["args"])
+                return f"{fmt['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {fmt['tool']} failed: {e}"
+
+        # 6) Rewrite naive open()
+        rno = self._parse_rewrite_open(q)
+        if rno:
+            try:
+                res = self.tools.call(rno["tool"], **rno["args"])
+                return f"{rno['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {rno['tool']} failed: {e}"
+
+        # 7) Bulk edit
+        be = self._parse_bulk_edit(q)
+        if be:
+            try:
+                res = self.tools.call(be["tool"], **be["args"])
+                prefix = "" if "warning" not in be else "[warn] " + be["warning"] + "\n"
+                return f"{prefix}{be['tool']} -> {json.dumps(res, indent=2)}"
+            except Exception as e:
+                return f"[error] {be['tool']} failed: {e}"
+
+        # Nothing matched
+        return None
+
+    # --------------------------- Tiny nudge helpers ---------------------------
+
+    def _looks_like_scan_search(self, q: str) -> bool:
+        return bool(re.search(r"(?i)\b(scan|search|find)\b", q or ""))
