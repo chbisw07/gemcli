@@ -1,6 +1,8 @@
 # tools/enhanced_registry.py
-from typing import List, Dict, Any
 import ast
+import re
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 class EnhancedToolRegistry:
     """
@@ -110,7 +112,118 @@ class EnhancedToolRegistry:
             
             return errors
         
+        def _find_function_definition(root: Path, func_name: str, subdir: str = "") -> Optional[str]:
+            base = root / (subdir or "")
+            for p in sorted(base.rglob("*.py")):
+                try:
+                    src = p.read_text(encoding="utf-8", errors="ignore")
+                    tree = ast.parse(src)
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+                            return str(p.relative_to(root))
+                except Exception:
+                    continue
+            return None
+
+        def _calls_in_function(src: str, func_name: str) -> List[str]:
+            calls = []
+            try:
+                tree = ast.parse(src)
+            except Exception:
+                return calls
+
+            class _Visitor(ast.NodeVisitor):
+                def __init__(self):
+                    self.in_target = False
+
+                def visit_FunctionDef(self, node: ast.FunctionDef):
+                    if node.name == func_name:
+                        self.in_target = True
+                        self.generic_visit(node)
+                        self.in_target = False
+                    else:
+                        # don't dive into other defs at top level
+                        for n in node.body:
+                            self.visit(n)
+
+                def visit_Call(self, node: ast.Call):
+                    if self.in_target:
+                        # fn name can be Name or Attribute (e.g., mod.fn)
+                        name = None
+                        if isinstance(node.func, ast.Name):
+                            name = node.func.id
+                        elif isinstance(node.func, ast.Attribute):
+                            # grab the last attribute part
+                            name = node.func.attr
+                        if name:
+                            calls.append(name)
+                    # continue traversal
+                    self.generic_visit(node)
+
+            _Visitor().visit(tree)
+            return calls
+
+        def _dot_from_edges(center: str, edges: List[tuple]) -> str:
+            # Graphviz DOT
+            # center node is the queried function (boxed), others are ellipses
+            lines = ["digraph G {", '  rankdir=LR;', '  node [shape=ellipse, fontsize=12];',
+                     f'  "{center}" [shape=box, style=filled, fillcolor="#eef"];']
+            seen = set()
+            for u, v in edges:
+                edge = (u, v)
+                if edge in seen:
+                    continue
+                seen.add(edge)
+                lines.append(f'  "{u}" -> "{v}";')
+            lines.append("}")
+            return "\n".join(lines)
+
+        def call_graph_for_function(function: str, subdir: str = "") -> dict:
+            """
+            Build a call graph rooted at `function`:
+            - locate the file that defines `function`
+            - parse the function body to collect direct calls
+            - try to resolve where those callees are defined
+            Returns: {
+              "function": "<name>",
+              "file": "<relative path>",
+              "calls": [{"name": "...", "defined_in": "<path>|None"}],
+              "edges": [["function", "callee"], ...],
+              "dot": "graphviz DOT string"
+            }
+            """
+            # 1) find definition file
+            def_file = _find_function_definition(self.root, function, subdir=subdir)
+            if not def_file:
+                return {"error": f"Could not find definition for function '{function}'", "function": function}
+
+            p = self.root / def_file
+            src = p.read_text(encoding="utf-8", errors="ignore")
+
+            # 2) collect direct calls inside the function body
+            callees = _calls_in_function(src, function)
+
+            # 3) attempt to resolve where callees are defined (best-effort scan by name)
+            resolved = []
+            for cal in sorted(set(callees)):
+                found_path = _find_function_definition(self.root, cal, subdir=subdir)
+                resolved.append({"name": cal, "defined_in": found_path})
+
+            # 4) edges and DOT
+            edges = [(function, c["name"]) for c in resolved]
+            dot = _dot_from_edges(function, edges)
+
+            return {
+                "function": function,
+                "file": def_file,
+                "calls": resolved,
+                "edges": edges,
+                "dot": dot,
+            }
+        
         # Register enhanced tools
         self.tools["analyze_code_structure"] = analyze_code_structure
         self.tools["find_related_files"] = find_related_files
         self.tools["detect_errors"] = detect_errors
+
+        self.tools["call_graph_for_function"] = call_graph_for_function

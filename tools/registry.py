@@ -324,12 +324,13 @@ class ToolRegistry:
             exts: Iterable[str] | None = None,
             dry_run: bool = True,
             backup: bool = True,
+            aggressive: bool = False,
         ) -> List[dict]:
             """
-            Extremely conservative best-effort:
-              - Detect patterns: <var> = open(...)\n ...\n <var>.close()
-              - Convert to: with open(...) as <var>:\n ...
-            Only touches files where we find a complete pair. Skips tricky/multiline constructs.
+            Convert simple `open()` usages into `with open()` blocks.
+            - Detects <var> = open(...) and <var>.close()
+            - Handles trailing comments and whitespace
+            - If aggressive=True, will rewrite even without a matching `.close()`
             """
             if exts is None:
                 exts = [".py"]
@@ -339,9 +340,11 @@ class ToolRegistry:
                 return []
 
             results: List[dict] = []
-            # Simple regexes (best-effort, single-line capture for open(); close() anywhere later)
-            open_re = re.compile(r"""^\s*(?P<var>[A-Za-z_]\w*)\s*=\s*open\((?P<args>.+)\)\s*$""")
-            close_re_tpl = r"""^\s*{var}\.close\(\)\s*$"""
+            # Regex to catch '<var> = open(...)' allowing inline comments
+            open_re = re.compile(
+                r"""^\s*(?P<var>[A-Za-z_]\w*)\s*=\s*open\((?P<args>.+)\)\s*(#.*)?$"""
+            )
+            close_re_tpl = r"""^\s*{var}\.close\(\)\s*(#.*)?$"""
 
             for p in sorted(base.rglob("*")):
                 if not p.is_file() or p.suffix not in exts:
@@ -358,7 +361,7 @@ class ToolRegistry:
                         continue
                     var = m.group("var")
                     args = m.group("args")
-                    # Scan forward for <var>.close()
+                    # Look ahead for matching '<var>.close()'
                     j = i + 1
                     close_re = re.compile(close_re_tpl.format(var=re.escape(var)))
                     close_idx = -1
@@ -367,28 +370,24 @@ class ToolRegistry:
                             close_idx = j
                             break
                         j += 1
-                    if close_idx == -1:
+                    if close_idx == -1 and not aggressive:
                         i += 1
-                        continue  # no matching close()
+                        continue  # skip if not aggressive
+                    if close_idx == -1 and aggressive:
+                        close_idx = i  # treat immediate close
 
-                    # Build new block: with open(args) as var:
-                    indent = re.match(r"^(\s*)", lines[i]).group(1)  # same base indent as the open line
+                    indent = re.match(r"^(\s*)", lines[i]).group(1)
                     with_line = f"{indent}with open({args}) as {var}:\n"
-                    # The body is the lines between i+1 .. close_idx-1,
-                    # re-indent body by +4 spaces relative to 'with' line
                     body = []
                     for k in range(i + 1, close_idx):
                         body_line = lines[k]
-                        # add four spaces if not blank
                         if body_line.strip():
                             body.append(indent + "    " + body_line.lstrip())
                         else:
                             body.append(body_line)
-                    # Replace the region with the new with-block
                     new_chunk = [with_line] + body
                     lines[i : close_idx + 1] = new_chunk
                     changed = True
-                    # Position stays at 'i' to continue scanning after inserted block
                     i += len(new_chunk)
                 if not changed:
                     continue
