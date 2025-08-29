@@ -1,0 +1,103 @@
+{
+  "default_llm_model": "gpt-4o",
+  "llm_models": [
+    {
+      "name": "gpt-4o",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1",
+      "temperature": 0.4,
+      "system_prompt": "You are a state-of-the-art code and reasoning assistant. Use all provided code, docs, and chat context to resolve ambiguity and explain concepts precisely. Clarify all references in your answers and use markdown for code or technical content.",
+      "max_context_tokens": 16384,
+      "api_key_reqd": true,
+      "tags": ["code", "chat", "creative", "tools", "long-context"],
+      "group": ["paid"]
+    },
+    {
+      "name": "deepseek-r1",
+      "provider": "deepseek",
+      "endpoint": "https://api.deepseek.com",
+      "model": "deepseek-reasoner",
+      "temperature": 0.1,
+      "system_prompt": "You are a deep reasoning assistant. Always generate intermediate reasoning steps before final answer. Use markdown and LaTeX when needed.",
+      "max_context_tokens": 65536,
+      "api_key_reqd": true,
+      "api_key_env": "DEEPSEEK_API_KEY",
+      "tags": ["reasoning", "chain-of-thought", "tools"],
+      "group": ["paid"]
+    },
+    {
+      "name": "gemini-2.5-pro",
+      "provider": "google",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/",
+      "model": "models/gemini-2.5-flash",
+      "temperature": 0.7,
+      "system_prompt": "You are a helpful assistant powered by Google Gemini 2.5 Flash. Provide fast, accurate, and cost-efficient responses.",
+      "max_context_tokens": 1048576,
+      "api_key_reqd": true,
+      "api_key_env": "GEMINI_API_KEY",
+      "tags": ["general", "google", "tools"],
+      "group": ["premium"]
+    },
+    {
+      "name": "deepseek-coder-6.7b-instruct",
+      "provider": "deepseek",
+      "endpoint": "http://localhost:1234/v1",
+      "model": "deepseek-coder-6.7b-instruct",
+      "temperature": 0.1,
+      "system_prompt": "You are a helpful coding assistant. Always format math in LaTeX markdown. Explain step-by-step when needed.",
+      "max_context_tokens": 32768,
+      "api_key_reqd": false,
+      "tags": ["code", "reasoning", "tools"],
+      "group": ["free"]
+    },
+    {
+      "name": "deepseek-qwen3-8b",
+      "provider": "deepseek",
+      "endpoint": "http://localhost:1234/v1",
+      "model": "deepseek/deepseek-r1-0528-qwen3-8b",
+      "temperature": 0.6,
+      "system_prompt": "You are a careful, helpful reasoning assistant. Think step-by-step to reach correct answers.",
+      "max_context_tokens": 32768,
+      "api_key_reqd": false,
+      "tags": ["reasoning", "math", "code", "tools"],
+      "group": ["free"]
+    },
+    {
+      "name": "qwen3-4b-thinking",
+      "provider": "qwen",
+      "endpoint": "http://localhost:1234/v1",
+      "model": "qwen/qwen3-4b-thinking-2507",
+      "temperature": 0.1,
+      "system_prompt": "You are a reasoning-focused assistant optimized for thought and explanation.",
+      "max_context_tokens": 32768,
+      "api_key_reqd": false,
+      "tags": ["reasoning", "lightweight", "tools"],
+      "group": ["free"]
+    },
+    {
+      "name": "qwen3-coder-30b",
+      "provider": "qwen",
+      "endpoint": "http://localhost:1234/v1",
+      "model": "qwen/qwen3-coder-30b",
+      "temperature": 0.1,
+      "system_prompt": "You are a powerful coding assistant. Generate code snippets, explain them, and use best practices.",
+      "max_context_tokens": 32768,
+      "api_key_reqd": false,
+      "tags": ["code", "large", "tools"],
+      "group": ["free"]
+    },
+    {
+      "name": "gpt-oss-20b",
+      "provider": "openai",
+      "endpoint": "http://localhost:1234/v1",
+      "model": "openai/gpt-oss-20b",
+      "temperature": 0.1,
+      "system_prompt": "You are a general-purpose assistant. Follow instructions carefully.",
+      "max_context_tokens": 32768,
+      "api_key_reqd": false,
+      "tags": ["general", "large", "tools"],
+      "group": ["free"]
+    }
+  ]
+}
+
