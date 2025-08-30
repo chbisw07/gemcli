@@ -140,9 +140,9 @@ class EnhancedToolRegistry:
             except Exception as e:
                 return [{'error': str(e)}]
         
-        def detect_errors(path: str) -> list:
+        def detect_errors(path: str, subdir: str = "") -> list:
             """Static analysis to detect potential errors"""
-            resolved = self._resolve_path(path, subdir=subdir)
+            resolved = self._resolve_path(path, subdir=subdir or "")
             if not resolved:
                 return {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
             p = self.root / resolved

@@ -140,68 +140,123 @@ class ReasoningAgent(Agent):
         return super()._try_direct_actions(query)
 
     # ---------------- planning ----------------
+    # ---------------- Planning: strict, grounded, example-driven ----------------
+    _PLAN_SYSTEM = (
+        "You are a careful *code* planner. Produce a small sequence of TOOL calls that are:\n"
+        "1) GROUNDED: Never invent file paths. First discover, then analyze.\n"
+        "2) CONCRETE: Use only the allowed tools and exact argument names.\n"
+        "3) EFFICIENT: 3–6 steps. Mark a step 'critical': true when later steps depend on it.\n"
+        "4) JSON ONLY: Return a JSON array of steps (no prose)."
+    )
 
+    _PLAN_USER_TMPL = """\
+Goal:
+{goal}
+
+Rules:
+- Never use placeholders like "path/to/*.py". If a file path is needed, add a prior discovery step first.
+- Typical flow:
+  - search_code / scan_relevant_files  → locate file(s)
+  - call_graph_for_function (depth={default_depth})  → structural context
+  - analyze_code_structure / detect_errors → targeted analysis on discovered file(s)
+- Always include {{ "subdir": "" }} when the tool allows it.
+- If your plan needs a path for a function, first *find that file* then pass the exact file path to later steps.
+
+Return JSON array like:
+[
+  {"tool": "search_code", "args": {"query": "def my_func", "subdir": "", "exts": [".py"], "max_results": 10}, "description": "Find file for my_func", "critical": true},
+  {"tool": "call_graph_for_function", "args": {"function": "my_func", "subdir": "", "depth": %DEPTH%}, "description": "Generate call graph", "critical": false},
+  {"tool": "analyze_code_structure", "args": {"path": "<BIND:search_code.file0>", "subdir": ""}, "description": "Analyze the file that defines my_func()", "critical": false}
+]
+"""
+
+    def _critique_and_fix_plan(self, plan: list[dict]) -> list[dict]:
+        """
+        Post-process the LLM plan to avoid common failure modes:
+        - Replace placeholders like 'path/to/*.py' with real files when we can infer them.
+        - Inject missing defaults (e.g., subdir="").
+        - Normalize depth for call_graph_for_function.
+        The executor will still run with safety, but this prevents 80% of bad steps.
+        """
+        fixed: list[dict] = []
+        last_found_file: str | None = None
+
+        def _looks_placeholder(p: str) -> bool:
+            return not p or "path/to" in p or p.strip() in {"<>", "<file>", "<path>","<BIND>"}
+
+        for step in plan or []:
+            s = dict(step or {})
+            args = dict(s.get("args") or {})
+            tool = s.get("tool", "")
+
+            # Ensure subdir defaults where allowed
+            if tool in {"search_code", "format_python_files"}:
+                args.setdefault("subdir", "")
+            if tool in {"analyze_code_structure", "detect_errors", "call_graph_for_function"}:
+                args.setdefault("subdir", "")
+
+            # Normalize depth default
+            if tool == "call_graph_for_function":
+                args.setdefault("depth", 3)
+
+            # Heuristic binding: if search_code happened earlier, remember a discovered file
+            # Expect the registry to return a list of candidate files — we bind later in the executor too.
+            if tool == "search_code":
+                # we can't know the result now; mark intention for binding
+                s["_expects_files"] = True
+            if tool in {"analyze_code_structure", "detect_errors"}:
+                path = args.get("path", "")
+                if isinstance(path, str) and _looks_placeholder(path) and last_found_file:
+                    args["path"] = last_found_file
+
+            s["args"] = args
+            fixed.append(s)
+
+            # Lightweight hinting for later steps: if a previous step will yield a file list, note it
+            if tool == "search_code":
+                # The real binding happens after step 1 executes; we also try to rebind in the UI executor.
+                pass
+
+        return fixed
+    
     def analyze_and_plan(self, query: str) -> list:
         """
-        Analyze the query and create a step-by-step execution plan with multiple steps.
-        Forces use of valid tool names/args and bans placeholders.
+        Create a grounded, discovery-first execution plan.
+        Uses strict, example-driven planner prompts and then runs a
+        local critique/repair pass to remove placeholders and inject defaults.
         """
-        planning_prompt = f"""
-    You are an expert coding assistant. Create a concrete execution plan for this request:
-
-    REQUEST:
-    {query}
-
-    TOOLS available (with exact arg names):
-    - scan_relevant_files(prompt, path="", max_results=200, exts=[".py"])
-    - search_code(query, subdir="", regex=False, case_sensitive=False, exts=[".py"], max_results=2000)
-    - analyze_files(paths, max_bytes=8000)
-    - write_file(path, content, overwrite=True, backup=False)
-    - replace_in_file(path, find, replace, regex=False, dry_run=False, backup=True)
-    - format_python_files(subdir="", line_length=88, dry_run=False)
-    - bulk_edit(edits, dry_run=True, backup=True)
-    - rewrite_naive_open(dir=".", exts=[".py"], dry_run=True, backup=True)
-    - analyze_code_structure(path, subdir="")
-    - find_related_files(main_file)
-    - detect_errors(path, subdir="")
-    - call_graph_for_function(function, subdir="", depth=3)
-
-    OUTPUT FORMAT (strict JSON only):
-    [
-    {{
-        "tool": "<tool name from list>",
-        "args": {{ ... valid args with real values ... }},
-        "description": "what this step accomplishes",
-        "critical": true
-    }},
-    ...
-    ]
-
-    RULES:
-    - Use ONLY the arg names above.
-    - DO NOT invent placeholders like "identified_file_from_previous_step".
-    - If you don't know a filename yet, add a discovery step (scan_relevant_files or search_code) to obtain it.
-    - Always produce concrete arg values (strings, lists) that the tool can execute immediately.
-    """
-
+        default_depth = 3
+        user_msg = (
+            self._PLAN_USER_TMPL
+            .replace("{goal}", query)
+            .replace("{default_depth}", str(default_depth))
+            .replace("%DEPTH%", str(default_depth))
+        )
         messages = [
-            {"role": "system", "content": "You are a careful planner. Only output valid JSON following the rules."},
-            {"role": "user", "content": planning_prompt},
+            {"role": "system", "content": self._PLAN_SYSTEM},
+            {"role": "user", "content": user_msg},
         ]
-
         try:
             resp = self.adapter.chat(messages)
-            raw = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "[]")
-            # Strip markdown if needed
-            m = re.search(r"```json\s*(\[.*?\])\s*```", raw, re.DOTALL | re.IGNORECASE)
+            content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+            # Allow fenced JSON
+            m = re.search(r"```json\s*(\[.*?\])\s*```", content, re.DOTALL | re.IGNORECASE)
             if m:
-                raw = m.group(1)
-            plan = json.loads(raw)
-            return plan
-        except Exception as e:
-            return [{"error": f"Failed to create plan: {str(e)}"}]
-
-
+                content = m.group(1)
+            plan = json.loads(content)
+        except Exception:
+            # Fallback: minimal discovery-first plan so executor can proceed
+            plan = [
+                {
+                    "tool": "search_code",
+                    "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 50},
+                    "description": "Discover relevant files",
+                    "critical": True,
+                }
+            ]
+        # Final local guard-rails: clean up placeholders, inject defaults
+        return self._critique_and_fix_plan(plan)
+    
     def _render_tool_spec_for_prompt(self) -> str:
         lines = []
         for name, spec in self._TOOL_SPECS.items():

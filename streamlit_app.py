@@ -225,7 +225,7 @@ with st.sidebar:
     max_iters = st.number_input("Max tool iters (--max-iters)", min_value=1, max_value=20, value=5 if ENHANCED_AVAILABLE else 3, step=1)
     analysis_only = st.checkbox("Analysis-only (no writes)", value=True)
     callgraph_depth = st.number_input(
-        "Call graph depth (0 = full)", min_value=0, max_value=10, value=1, step=1
+        "Call graph depth (0 = full)", min_value=0, max_value=10, value=3, step=1
     )
     st.session_state["callgraph_depth"] = callgraph_depth
 
@@ -295,6 +295,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
     """
     results = []
     applied_payloads = []  # track {tool,args} for potentially-applicable edits
+    discovered_files: list[str] = []  # accumulate file paths from discovery steps
     # When analysis-only is ON, we force preview for edit tools even if the UI toggle is off
     effective_preview = preview_only or analysis_only
 
@@ -334,8 +335,15 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
             log(f"🛠️ Executing step {i}: **{tool_name}** with args `{args}`")
             # Inject UI depth into call_graph_for_function
             if tool_name == "call_graph_for_function":
-                args.setdefault("depth", st.session_state.get("callgraph_depth", 1))
-            
+                args.setdefault("depth", st.session_state.get("callgraph_depth", 3))
+
+            # Opportunistic binding: if analyze/detect_errors has a placeholder path, patch it
+            if tool_name in {"analyze_code_structure", "detect_errors"}:
+                p = args.get("path")
+                if isinstance(p, str) and (not p or "path/to" in p or p.strip() in {"<>", "<file>", "<path>", "<BIND:search_code.file0>"}):
+                    if discovered_files:
+                        args["path"] = discovered_files[0]
+
             res = tools.call(tool_name, **args)
             results.append({"step": i, "tool": tool_name, "args": args, "result": res, "success": True, "description": desc})
 
@@ -343,6 +351,21 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
             # In analysis-only mode we *do not* queue applies.
             if tool_name in EDIT_TOOLS and not analysis_only:
                 applied_payloads.append({"tool": tool_name, "args": args})
+
+            # Capture discovered files from search_code / scan_relevant_files results
+            try:
+                if tool_name in {"search_code", "scan_relevant_files"} and isinstance(res, dict):
+                    if isinstance(res.get("files"), list):
+                        for f in res["files"]:
+                            if isinstance(f, str):
+                                discovered_files.append(f)
+                    elif isinstance(res.get("results"), list):
+                        for r in res["results"]:
+                            pth = r.get("path") if isinstance(r, dict) else None
+                            if isinstance(pth, str):
+                                discovered_files.append(pth)
+            except Exception:
+                pass
 
             # Stream diffs if present
             diffs = _extract_diffs(res)
@@ -395,20 +418,16 @@ if do_execute:
             results = execute_plan(st.session_state["last_plan"], analysis_only=analysis_only)
 
             # ---------- Final Report (natural language) ----------
-            # Prefer the agent-appended summary (from execute_plan in analysis-only mode).
-            final_report = None
+            report_text = None
             if isinstance(results, list):
                 for rec in reversed(results):
-                    if isinstance(rec, dict) and rec.get("tool") == "_summarize" and "report" in rec:
-                        final_report = rec["report"]
+                    if isinstance(rec, dict) and rec.get("tool") == "_summarize":
+                        val = rec.get("report")
+                        if isinstance(val, str) and val.strip():
+                            report_text = val.strip()
                         break
-            
-            if final_report:
-                st.markdown("### Final Report")
-                st.write(final_report)  
 
-            # If the agent didn't add one (e.g., analysis_only off), synthesize here.
-            if not final_report and ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):
+            if not report_text and ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):
                 try:
                     synth_prompt = (
                         "Synthesize a concise, actionable report from these execution results.\n"
@@ -419,20 +438,24 @@ if do_execute:
                         "4) Recommended fix steps (do NOT write or apply code)\n\n"
                         f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
                     )
-                    # Use one LLM call; avoid tools in this path.
-                    final_report = agent.ask_once(synth_prompt, max_iters=0)
+                    resp = agent.adapter.chat([
+                        {"role": "system", "content": "You are a precise code analyst. Be concrete and terse."},
+                        {"role": "user", "content": synth_prompt},
+                    ])
+                    report_text = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "").strip()
                 except Exception as e:
-                    final_report = f"(Failed to synthesize final report: {e})"
+                    report_text = f"(Failed to synthesize final report: {e})"
 
-            if final_report:
+            if isinstance(report_text, str) and report_text.strip():
                 st.markdown("### Final Report")
-                st.write(final_report)
+                st.write(report_text)
+
         else:
             # 🔎 Intercept single-turn call-graph requests so we can honor UI depth
             cg_match = re.search(r"(?:call\s*graph|callgraph).*(?:of|for)\s+([A-Za-z_]\w*)\s*\(\)?", prompt, re.IGNORECASE)
             if cg_match:
                 fn = cg_match.group(1)
-                depth = st.session_state.get("callgraph_depth", 1)
+                depth = st.session_state.get("callgraph_depth", 3)
                 log(f"🔎 Direct call graph for `{fn}` (depth={depth})")
                 try:
                     res = tools.call("call_graph_for_function", function=fn, depth=depth)
@@ -447,19 +470,16 @@ if do_execute:
 
             # 💬 Fallback: standard single-turn ask
             log("💬 Running single-turn ask (agent.ask_once)...")
-            # Single-turn path: still respect analysis-only for internal direct actions
             if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent) and plan_mode:
                 answer = agent.ask_with_planning(prompt, max_iters=int(max_iters), analysis_only=analysis_only)
             else:
                 answer = agent.ask_once(prompt, max_iters=int(max_iters))
             st.markdown("### Assistant Response")
 
-            # Try to extract tool JSON and render diffs/graphs
             parsed = _looks_like_tool_blob(answer)
             if parsed is not None:
-                # If it's a tool call for call_graph_for_function, inject UI depth before rendering
                 if isinstance(parsed, dict) and parsed.get("tool") == "call_graph_for_function":
-                    parsed.setdefault("args", {}).setdefault("depth", st.session_state.get("callgraph_depth", 1))
+                    parsed.setdefault("args", {}).setdefault("depth", st.session_state.get("callgraph_depth", 3))
 
                 diffs = _extract_diffs(parsed)
                 if diffs:
@@ -468,7 +488,6 @@ if do_execute:
                         st.markdown(f"**File:** `{d['path']}`")
                         st.code(d["diff"] or "(no diff)", language="diff")
 
-                # Prefer the polished call-graph renderer; fall back to DOT if needed
                 if not _render_call_graph_payload(parsed):
                     _maybe_render_graph(parsed)
 
@@ -476,7 +495,6 @@ if do_execute:
                     with st.expander("Raw tool JSON"):
                         st.code(_pretty(parsed), language="json")
             else:
-                # No structured JSON — try to render a DOT block directly from text
                 if not _maybe_render_dot_from_text(answer):
                     st.write(answer)
                 if show_raw_json:
