@@ -2,6 +2,8 @@
 # streamlit_app.py
 import json
 import os
+import re
+import ast
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
@@ -71,27 +73,79 @@ def _extract_diffs(tool_result: Any) -> List[Dict[str, str]]:
                 diffs.append({"path": item.get("path", ""), "diff": item.get("diff", "")})
     return diffs
 
-def _looks_like_tool_blob(text: str) -> Optional[Any]:
+def _looks_like_tool_blob(text: str):
     """
-    Agent sometimes returns 'toolname -> {...json...}' or raw json.
-    Try to peel out JSON so we can render diffs.
+    Try hard to extract a structured object (dict/list) from assistant text:
+      • accepts 'toolname -> {...}' or plain JSON
+      • tolerates code fences and leading/trailing prose
+      • falls back to ast.literal_eval on Python reprs (single quotes/None/True/False)
+    Returns parsed object or None.
     """
     if not text:
         return None
-    # e.g., "replace_in_file -> { ... }"
-    if "->" in text:
-        right = text.split("->", 1)[1].strip()
-    else:
-        right = text.strip()
-    # tolerate code fences
+
+    # 1) If the model prefixed with "tool -> { ... }", strip the left part
+    right = text.split("->", 1)[1].strip() if "->" in text else text.strip()
+
+    # 2) Strip code fences if present
     if right.startswith("```"):
         right = right.strip("` \n")
         if right.lower().startswith("json"):
             right = right[4:].strip()
+
+    # 3) Try direct JSON
     try:
         return json.loads(right)
     except Exception:
-        return None
+        pass
+
+    # 4) Try to locate the first {...} or [...] region inside the text
+    m = re.search(r"(\{.*\}|\[.*\])", right, re.DOTALL)
+    if m:
+        candidate = m.group(1)
+
+        # 4a) JSON first
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+
+        # 4b) Last resort: Python literal (handles single quotes/None/etc.)
+        try:
+            return ast.literal_eval(candidate)
+        except Exception:
+            return None
+
+    return None
+
+
+def _maybe_render_dot_from_text(text: str) -> bool:
+    """
+    If the assistant returned only text, try to find a Graphviz DOT block
+    (digraph G { ... }), normalize it, and render it. Returns True if rendered.
+    """
+    if not isinstance(text, str):
+        return False
+
+    # Find a DOT block (tolerate newlines and extra prose)
+    m = re.search(r"(digraph\s+G\s*\{.*?\})", text, re.DOTALL | re.IGNORECASE)
+    if not m:
+        return False
+
+    dot = m.group(1)
+
+    # Unescape common JSON escapes if the DOT came from a JSON string
+    dot = dot.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"')
+
+    # Normalize any Unicode arrows that sometimes sneak in
+    dot = dot.replace("→", "->").replace("⇒", "->")
+
+    try:
+        st.graphviz_chart(dot)  # streamlit renderer
+        return True
+    except Exception:
+        return False
+
 
 def _maybe_render_graph(result: Any):
     """
@@ -103,6 +157,39 @@ def _maybe_render_graph(result: Any):
             st.graphviz_chart(result["dot"])
     except Exception as e:
         st.warning(f"Graph render failed: {e}")
+
+# NEW: nice visualizer for call-graph payloads
+def _render_call_graph_payload(result: Any) -> bool:
+    """
+    If 'result' looks like output from call_graph_for_function, render a polished view
+    and return True. Otherwise return False so caller can fall back to default.
+    """
+    if not isinstance(result, dict):
+        return False
+    if not (("calls" in result and isinstance(result["calls"], list)) or ("dot" in result and isinstance(result["dot"], str))):
+        return False
+
+    # Header
+    fn = result.get("function", "<function>")
+    file_ = result.get("file", "<file>")
+    st.markdown("### Call graph")
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        st.markdown(f"**Function:** `{fn}`")
+    with c2:
+        st.markdown(f"**Defined in:** `{file_}`")
+
+    # Calls table (project-local, already filtered if your tool does it)
+    calls = result.get("calls") or []
+    if calls:
+        st.markdown("#### Direct callees")
+        # show only concise columns
+        rows = [{"name": c.get("name"), "defined_in": c.get("defined_in")} for c in calls]
+        st.table(rows)
+
+    # Graph (DOT)
+    _maybe_render_graph(result)
+    return True
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -248,6 +335,8 @@ def execute_plan(plan_steps: List[Dict[str, Any]]):
                 st.markdown(f"**File:** `{d['path']}`")
                 st.code(d["diff"] or "(no diff)", language="diff")
 
+            # Visualize call-graph payloads cleanly (if present)
+            _render_call_graph_payload(res)
             _maybe_render_graph(res)
 
             if show_raw_json:
@@ -293,7 +382,7 @@ if do_execute:
             log("💬 Running single-turn ask (agent.ask_once)...")
             answer = agent.ask_once(prompt, max_iters=int(max_iters))  # core loop uses OpenAI compat tools  :contentReference[oaicite:7]{index=7} :contentReference[oaicite:8]{index=8}
             st.markdown("### Assistant Response")
-            st.write(answer)
+            # st.write(answer) # Chandan
 
             # Try to extract tool JSON and render diffs
             parsed = _looks_like_tool_blob(answer)
@@ -304,13 +393,22 @@ if do_execute:
                     for d in diffs:
                         st.markdown(f"**File:** `{d['path']}`")
                         st.code(d["diff"] or "(no diff)", language="diff")
+                # If this looks like a call-graph payload, render nicely and suppress raw text
+                if not _render_call_graph_payload(parsed):
+                    # Fall back: not a call-graph – show parsed JSON only if requested
+                    if show_raw_json:
+                        with st.expander("Raw tool JSON"):
+                            st.code(_pretty(parsed), language="json")
+                # Also try rendering DOT if present (no-op if already shown)
                 _maybe_render_graph(parsed)
-                
                 if show_raw_json:
-                    with st.expander("Raw tool JSON"):
-                        st.code(_pretty(parsed), language="json")
+                     with st.expander("Raw tool JSON"):
+                         st.code(_pretty(parsed), language="json")
+
             else:
-                # For non-JSON, still show raw if requested
+                # No structured JSON — try to render DOT straight from text
+                if not _maybe_render_dot_from_text(answer):
+                    st.write(answer)
                 if show_raw_json:
                     with st.expander("Raw text"):
                         st.code(answer)

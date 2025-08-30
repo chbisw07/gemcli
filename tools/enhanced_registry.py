@@ -178,7 +178,9 @@ class EnhancedToolRegistry:
             lines.append("}")
             return "\n".join(lines)
 
-        def call_graph_for_function(function: str, subdir: str = "") -> dict:
+        def call_graph_for_function(function: str, subdir: str = "",
+                                    project_only: bool = True,
+                                    filter_noise: bool = True) -> dict:
             """
             Build a call graph rooted at `function`:
             - locate the file that defines `function`
@@ -203,11 +205,39 @@ class EnhancedToolRegistry:
             # 2) collect direct calls inside the function body
             callees = _calls_in_function(src, function)
 
-            # 3) attempt to resolve where callees are defined (best-effort scan by name)
+            # 3) resolve where callees are defined (best-effort scan by name)
             resolved = []
             for cal in sorted(set(callees)):
                 found_path = _find_function_definition(self.root, cal, subdir=subdir)
                 resolved.append({"name": cal, "defined_in": found_path})
+
+            # 3b) optionally filter out noise:
+            if filter_noise:
+                import builtins as _py_builtins
+                builtins_set = set(dir(_py_builtins))
+                # common method / logging / regex names we often don't want as “edges”
+                noisy = {
+                    # containers / dicts
+                    "get", "values", "items", "keys", "extend", "append", "sort",
+                    # strings
+                    "split", "strip", "isalpha", "lower", "upper", "format",
+                    # logging / prints
+                    "info", "warning", "debug", "error", "exception", "print",
+                    # regex match objects
+                    "group", "groups",
+                }
+                filtered = []
+                for c in resolved:
+                    name = c["name"]
+                    if project_only and not c["defined_in"]:
+                        # keep ONLY project-local functions that we could resolve
+                        continue
+                    if name in noisy or name in builtins_set:
+                        # drop builtins & common method noise
+                        if not c["defined_in"]:
+                            continue
+                    filtered.append(c)
+                resolved = filtered
 
             # 4) edges and DOT
             edges = [(function, c["name"]) for c in resolved]
