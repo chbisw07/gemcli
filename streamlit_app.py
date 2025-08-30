@@ -223,6 +223,10 @@ with st.sidebar:
     enhanced = st.checkbox("Enhanced mode (planning, extra tools)", value=True if ENHANCED_AVAILABLE else False, disabled=not ENHANCED_AVAILABLE)
     plan_mode = st.checkbox("Use planning for complex tasks", value=False, disabled=not ENHANCED_AVAILABLE)
     max_iters = st.number_input("Max tool iters (--max-iters)", min_value=1, max_value=20, value=5 if ENHANCED_AVAILABLE else 3, step=1)
+    callgraph_depth = st.number_input(
+        "Call graph depth (0 = full)", min_value=0, max_value=10, value=1, step=1
+    )
+    st.session_state["callgraph_depth"] = callgraph_depth
 
     # Build runtime objects (once)
     if "rt_built" not in st.session_state or st.session_state.get("rt_key") != (project_root, enhanced, enable_tools, chosen_model_name):
@@ -322,6 +326,10 @@ def execute_plan(plan_steps: List[Dict[str, Any]]):
 
         try:
             log(f"🛠️ Executing step {i}: **{tool_name}** with args `{args}`")
+            # Inject UI depth into call_graph_for_function
+            if tool_name == "call_graph_for_function":
+                args.setdefault("depth", st.session_state.get("callgraph_depth", 1))
+            
             res = tools.call(tool_name, **args)
             results.append({"step": i, "tool": tool_name, "args": args, "result": res, "success": True, "description": desc})
 
@@ -359,7 +367,7 @@ if do_plan:
     else:
         try:
             log("🧭 Creating plan...")
-            plan = agent.analyze_and_plan(prompt or "")  # JSON plan via model  :contentReference[oaicite:5]{index=5}
+            plan = agent.analyze_and_plan(prompt or "")
             st.session_state["last_plan"] = plan
             render_plan(plan)
         except Exception as e:
@@ -369,44 +377,61 @@ if do_execute:
     if prompt.strip():
         # Two modes:
         # 1) Enhanced + plan_mode → plan then execute plan (step-by-step visibility)
-        # 2) Standard/simple → call Agent.ask_once and try to render any diffs it returns
+        # 2) Standard/simple → intercept call-graph queries, otherwise ask_once
         if plan_mode and ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
             if not st.session_state.get("last_plan"):
                 log("🧭 Creating plan (no existing plan found)...")
-                st.session_state["last_plan"] = agent.analyze_and_plan(prompt)  # :contentReference[oaicite:6]{index=6}
+                st.session_state["last_plan"] = agent.analyze_and_plan(prompt)
             render_plan(st.session_state["last_plan"])
             st.markdown("---")
             log("🚀 Executing plan...")
             execute_plan(st.session_state["last_plan"])
         else:
-            log("💬 Running single-turn ask (agent.ask_once)...")
-            answer = agent.ask_once(prompt, max_iters=int(max_iters))  # core loop uses OpenAI compat tools  :contentReference[oaicite:7]{index=7} :contentReference[oaicite:8]{index=8}
-            st.markdown("### Assistant Response")
-            # st.write(answer) # Chandan
+            # 🔎 Intercept single-turn call-graph requests so we can honor UI depth
+            cg_match = re.search(r"(?:call\s*graph|callgraph).*(?:of|for)\s+([A-Za-z_]\w*)\s*\(\)?", prompt, re.IGNORECASE)
+            if cg_match:
+                fn = cg_match.group(1)
+                depth = st.session_state.get("callgraph_depth", 1)
+                log(f"🔎 Direct call graph for `{fn}` (depth={depth})")
+                try:
+                    res = tools.call("call_graph_for_function", function=fn, depth=depth)
+                    st.markdown("### Assistant Response")
+                    _render_call_graph_payload(res) or _maybe_render_graph(res)
+                    if show_raw_json:
+                        with st.expander("Raw tool JSON"):
+                            st.code(_pretty(res), language="json")
+                except Exception as e:
+                    st.error(f"call_graph_for_function failed: {e}")
+                st.stop()  # prevent falling through to ask_once
 
-            # Try to extract tool JSON and render diffs
+            # 💬 Fallback: standard single-turn ask
+            log("💬 Running single-turn ask (agent.ask_once)...")
+            answer = agent.ask_once(prompt, max_iters=int(max_iters))
+            st.markdown("### Assistant Response")
+
+            # Try to extract tool JSON and render diffs/graphs
             parsed = _looks_like_tool_blob(answer)
             if parsed is not None:
+                # If it's a tool call for call_graph_for_function, inject UI depth before rendering
+                if isinstance(parsed, dict) and parsed.get("tool") == "call_graph_for_function":
+                    parsed.setdefault("args", {}).setdefault("depth", st.session_state.get("callgraph_depth", 1))
+
                 diffs = _extract_diffs(parsed)
                 if diffs:
                     st.markdown("### Preview (diff)")
                     for d in diffs:
                         st.markdown(f"**File:** `{d['path']}`")
                         st.code(d["diff"] or "(no diff)", language="diff")
-                # If this looks like a call-graph payload, render nicely and suppress raw text
-                if not _render_call_graph_payload(parsed):
-                    # Fall back: not a call-graph – show parsed JSON only if requested
-                    if show_raw_json:
-                        with st.expander("Raw tool JSON"):
-                            st.code(_pretty(parsed), language="json")
-                # Also try rendering DOT if present (no-op if already shown)
-                _maybe_render_graph(parsed)
-                if show_raw_json:
-                     with st.expander("Raw tool JSON"):
-                         st.code(_pretty(parsed), language="json")
 
+                # Prefer the polished call-graph renderer; fall back to DOT if needed
+                if not _render_call_graph_payload(parsed):
+                    _maybe_render_graph(parsed)
+
+                if show_raw_json:
+                    with st.expander("Raw tool JSON"):
+                        st.code(_pretty(parsed), language="json")
             else:
-                # No structured JSON — try to render DOT straight from text
+                # No structured JSON — try to render a DOT block directly from text
                 if not _maybe_render_dot_from_text(answer):
                     st.write(answer)
                 if show_raw_json:

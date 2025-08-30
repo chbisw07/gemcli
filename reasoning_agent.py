@@ -80,8 +80,8 @@ class ReasoningAgent(Agent):
         },
         "call_graph_for_function": {
             "required": {"function"},
-            "allowed": {"function", "subdir"},
-            "defaults": {"subdir": ""},
+            "allowed": {"function", "subdir", "depth"},
+            "defaults": {"subdir": "", "depth": 1},
         },        
     }
 
@@ -98,7 +98,7 @@ class ReasoningAgent(Agent):
         "detect_errors": {"file": "path", "filename": "path", "files": "path"},
         "replace_in_file": {"filename": "path", "file": "path"},
         "bulk_edit": {},  # edits is already correct
-        "call_graph_for_function": {"name": "function"},
+        "call_graph_for_function": {"name": "function", "level": "depth"},
     }
 
     def __init__(self, model: LLMModel, tools: ToolRegistry, enable_tools: bool = True):
@@ -156,7 +156,7 @@ class ReasoningAgent(Agent):
     - analyze_code_structure(path)
     - find_related_files(main_file)
     - detect_errors(path)
-    - call_graph_for_function(function, subdir="")
+    - call_graph_for_function(function, subdir="", depth=1)
 
     OUTPUT FORMAT (strict JSON only):
     [

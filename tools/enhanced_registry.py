@@ -179,78 +179,79 @@ class EnhancedToolRegistry:
             return "\n".join(lines)
 
         def call_graph_for_function(function: str, subdir: str = "",
-                                    project_only: bool = True,
-                                    filter_noise: bool = True) -> dict:
+                            project_only: bool = True,
+                            filter_noise: bool = True,
+                            depth: int = 1) -> dict:
             """
             Build a call graph rooted at `function`:
             - locate the file that defines `function`
-            - parse the function body to collect direct calls
-            - try to resolve where those callees are defined
-            Returns: {
-              "function": "<name>",
-              "file": "<relative path>",
-              "calls": [{"name": "...", "defined_in": "<path>|None"}],
-              "edges": [["function", "callee"], ...],
-              "dot": "graphviz DOT string"
-            }
+            - parse the function body to collect calls
+            - recurse into callees up to `depth` levels
+            depth=1 → only direct calls
+            depth=N → recurse N levels
+            depth=0 → unlimited (until no new project-local callees found)
             """
-            # 1) find definition file
-            def_file = _find_function_definition(self.root, function, subdir=subdir)
-            if not def_file:
-                return {"error": f"Could not find definition for function '{function}'", "function": function}
+            visited = set()
+            edges = []
+            resolved_all = {}
 
-            p = self.root / def_file
-            src = p.read_text(encoding="utf-8", errors="ignore")
+            def expand(func: str, current_depth: int):
+                if func in visited:
+                    return
+                if depth != 0 and current_depth > depth:
+                    return
+                visited.add(func)
 
-            # 2) collect direct calls inside the function body
-            callees = _calls_in_function(src, function)
+                def_file = _find_function_definition(self.root, func, subdir=subdir)
+                if not def_file:
+                    return
+                p = self.root / def_file
+                try:
+                    src = p.read_text(encoding="utf-8", errors="ignore")
+                except Exception:
+                    return
 
-            # 3) resolve where callees are defined (best-effort scan by name)
-            resolved = []
-            for cal in sorted(set(callees)):
-                found_path = _find_function_definition(self.root, cal, subdir=subdir)
-                resolved.append({"name": cal, "defined_in": found_path})
+                callees = _calls_in_function(src, func)
+                resolved = []
+                for cal in sorted(set(callees)):
+                    found_path = _find_function_definition(self.root, cal, subdir=subdir)
+                    resolved.append({"name": cal, "defined_in": found_path})
 
-            # 3b) optionally filter out noise:
-            if filter_noise:
-                import builtins as _py_builtins
-                builtins_set = set(dir(_py_builtins))
-                # common method / logging / regex names we often don't want as “edges”
-                noisy = {
-                    # containers / dicts
-                    "get", "values", "items", "keys", "extend", "append", "sort",
-                    # strings
-                    "split", "strip", "isalpha", "lower", "upper", "format",
-                    # logging / prints
-                    "info", "warning", "debug", "error", "exception", "print",
-                    # regex match objects
-                    "group", "groups",
-                }
-                filtered = []
-                for c in resolved:
-                    name = c["name"]
-                    if project_only and not c["defined_in"]:
-                        # keep ONLY project-local functions that we could resolve
-                        continue
-                    if name in noisy or name in builtins_set:
-                        # drop builtins & common method noise
-                        if not c["defined_in"]:
+                if filter_noise:
+                    import builtins as _py_builtins
+                    builtins_set = set(dir(_py_builtins))
+                    noisy = {
+                        "get", "values", "items", "keys", "extend", "append", "sort",
+                        "split", "strip", "isalpha", "lower", "upper", "format",
+                        "info", "warning", "debug", "error", "exception", "print",
+                        "group", "groups",
+                    }
+                    filtered = []
+                    for c in resolved:
+                        name = c["name"]
+                        if project_only and not c["defined_in"]:
                             continue
-                    filtered.append(c)
-                resolved = filtered
+                        if name in noisy or name in builtins_set:
+                            if not c["defined_in"]:
+                                continue
+                        filtered.append(c)
+                    resolved = filtered
 
-            # 4) edges and DOT
-            edges = [(function, c["name"]) for c in resolved]
+                resolved_all[func] = resolved
+                for c in resolved:
+                    edges.append((func, c["name"]))
+                    expand(c["name"], current_depth + 1)
+
+            expand(function, 1)
             dot = _dot_from_edges(function, edges)
-
             return {
                 "function": function,
-                "file": def_file,
-                "calls": resolved,
+                "file": _find_function_definition(self.root, function, subdir=subdir),
+                "calls": resolved_all.get(function, []),
                 "edges": edges,
                 "dot": dot,
             }
-        
+
         # Register enhanced tools
         self.tools["analyze_code_structure"] = analyze_code_structure
         self.tools["find_related_files"] = find_related_files
