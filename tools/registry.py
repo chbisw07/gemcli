@@ -4,6 +4,7 @@ import difflib
 import json
 import shutil
 from pathlib import Path
+from functools import lru_cache
 from typing import Optional, Any, Callable, Iterable, List, Dict
 
 # Optional: direct command parser hook (safe to keep even if unused)
@@ -27,6 +28,45 @@ class ToolRegistry:
         self.tools: Dict[str, Callable[..., Any]] = {}
         self._register_builtin_tools()
 
+
+    # ----- same resolver pattern as Enhanced registry -----
+    def _rel(self, p: Path) -> str:
+        return str(p.resolve().relative_to(self.root))
+
+    @lru_cache(maxsize=4096)
+    def _all_files_named(self, name: str) -> list[Path]:
+        return [p for p in self.root.rglob(name)]
+
+    @lru_cache(maxsize=1)
+    def _all_py_files(self) -> list[Path]:
+        return [p for p in self.root.rglob("*.py")]
+
+    def _resolve_path(self, path: str, subdir: str = "") -> Optional[str]:
+        if not path:
+            return None
+        path = str(Path(path))
+        if subdir:
+            cand = (self.root / subdir / path)
+            if cand.exists():
+                return self._rel(cand)
+        cand = (self.root / path)
+        if cand.exists():
+            return self._rel(cand)
+        name = Path(path).name
+        matches = self._all_files_named(name)
+        if matches:
+            if subdir:
+                under = [p for p in matches if (self.root / subdir) in p.parents]
+                if under:
+                    return self._rel(under[0])
+            best = sorted(matches, key=lambda p: len(self._rel(p)))[0]
+            return self._rel(best)
+        tail = path.replace("\\", "/")
+        for p in self._all_py_files():
+            if str(p).replace("\\", "/").endswith(tail):
+                return self._rel(p)
+        return None
+    
     # ---------------- registration & dispatch ----------------
 
     def _register(self, name: str, fn: Callable):
@@ -128,7 +168,8 @@ class ToolRegistry:
             """
             Write text to a file. If backup=True and file exists, create <file>.bak first.
             """
-            p = self.root / path
+            resolved = self._resolve_path(path) or path
+            p = self.root / resolved
             p.parent.mkdir(parents=True, exist_ok=True)
             existed = p.exists()
             if existed and not overwrite:
@@ -156,9 +197,10 @@ class ToolRegistry:
             """
             Find/replace in a single file, return count + unified diff. Optionally write.
             """
-            p = self.root / path
-            if not p.exists():
-                raise FileNotFoundError(f"Not found: {path}")
+            resolved = self._resolve_path(path)
+            if not resolved:
+                return {"error": f"File not found under {self.root}: {path}", "path": path}
+            p = self.root / resolved
             original = p.read_text(encoding="utf-8", errors="ignore")
             pattern = find if regex else re.escape(find)
             matches = list(re.finditer(pattern, original))

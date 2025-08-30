@@ -223,6 +223,7 @@ with st.sidebar:
     enhanced = st.checkbox("Enhanced mode (planning, extra tools)", value=True if ENHANCED_AVAILABLE else False, disabled=not ENHANCED_AVAILABLE)
     plan_mode = st.checkbox("Use planning for complex tasks", value=False, disabled=not ENHANCED_AVAILABLE)
     max_iters = st.number_input("Max tool iters (--max-iters)", min_value=1, max_value=20, value=5 if ENHANCED_AVAILABLE else 3, step=1)
+    analysis_only = st.checkbox("Analysis-only (no writes)", value=True)
     callgraph_depth = st.number_input(
         "Call graph depth (0 = full)", min_value=0, max_value=10, value=1, step=1
     )
@@ -288,12 +289,14 @@ def render_plan(plan_steps: List[Dict[str, Any]]):
         with st.expander(f"Step {i}: {step.get('tool','(no tool)')} — {step.get('description','')}", expanded=False):
             st.code(_pretty(step), language="json")
 
-def execute_plan(plan_steps: List[Dict[str, Any]]):
+def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
     """
     Execute planned steps and collect previews/diffs for edits.
     """
     results = []
     applied_payloads = []  # track {tool,args} for potentially-applicable edits
+    # When analysis-only is ON, we force preview for edit tools even if the UI toggle is off
+    effective_preview = preview_only or analysis_only
 
     for i, step in enumerate(plan_steps, 1):
         if "error" in step:
@@ -305,8 +308,8 @@ def execute_plan(plan_steps: List[Dict[str, Any]]):
         args = dict(step.get("args", {}))
         desc = step.get("description", "")
 
-        # Impose preview_only when tool is an edit-capable one
-        if preview_only and tool_name in EDIT_TOOLS:
+        # Impose preview for edit-capable tools (either UI "Force preview" OR analysis-only mode)
+        if effective_preview and tool_name in EDIT_TOOLS:
             # normalize common dry_run switches
             if tool_name == "replace_in_file":
                 args.setdefault("dry_run", True)
@@ -323,6 +326,9 @@ def execute_plan(plan_steps: List[Dict[str, Any]]):
             elif tool_name == "write_file":
                 # write_file has no diff; still allow preview by setting overwrite=False when file exists
                 pass
+            if analysis_only:
+                # Surface that this was blocked from writing
+                args["_analysis_only_blocked"] = True
 
         try:
             log(f"🛠️ Executing step {i}: **{tool_name}** with args `{args}`")
@@ -334,7 +340,8 @@ def execute_plan(plan_steps: List[Dict[str, Any]]):
             results.append({"step": i, "tool": tool_name, "args": args, "result": res, "success": True, "description": desc})
 
             # If this step is an edit-capable tool and we ran in preview, record payload for later Apply
-            if tool_name in EDIT_TOOLS:
+            # In analysis-only mode we *do not* queue applies.
+            if tool_name in EDIT_TOOLS and not analysis_only:
                 applied_payloads.append({"tool": tool_name, "args": args})
 
             # Stream diffs if present
@@ -385,7 +392,41 @@ if do_execute:
             render_plan(st.session_state["last_plan"])
             st.markdown("---")
             log("🚀 Executing plan...")
-            execute_plan(st.session_state["last_plan"])
+            results = execute_plan(st.session_state["last_plan"], analysis_only=analysis_only)
+
+            # ---------- Final Report (natural language) ----------
+            # Prefer the agent-appended summary (from execute_plan in analysis-only mode).
+            final_report = None
+            if isinstance(results, list):
+                for rec in reversed(results):
+                    if isinstance(rec, dict) and rec.get("tool") == "_summarize" and "report" in rec:
+                        final_report = rec["report"]
+                        break
+            
+            if final_report:
+                st.markdown("### Final Report")
+                st.write(final_report)  
+
+            # If the agent didn't add one (e.g., analysis_only off), synthesize here.
+            if not final_report and ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):
+                try:
+                    synth_prompt = (
+                        "Synthesize a concise, actionable report from these execution results.\n"
+                        "Focus strictly on:\n"
+                        "1) Root cause(s)\n"
+                        "2) Supporting evidence with file/line where possible\n"
+                        "3) Risks/unknowns\n"
+                        "4) Recommended fix steps (do NOT write or apply code)\n\n"
+                        f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
+                    )
+                    # Use one LLM call; avoid tools in this path.
+                    final_report = agent.ask_once(synth_prompt, max_iters=0)
+                except Exception as e:
+                    final_report = f"(Failed to synthesize final report: {e})"
+
+            if final_report:
+                st.markdown("### Final Report")
+                st.write(final_report)
         else:
             # 🔎 Intercept single-turn call-graph requests so we can honor UI depth
             cg_match = re.search(r"(?:call\s*graph|callgraph).*(?:of|for)\s+([A-Za-z_]\w*)\s*\(\)?", prompt, re.IGNORECASE)
@@ -406,7 +447,11 @@ if do_execute:
 
             # 💬 Fallback: standard single-turn ask
             log("💬 Running single-turn ask (agent.ask_once)...")
-            answer = agent.ask_once(prompt, max_iters=int(max_iters))
+            # Single-turn path: still respect analysis-only for internal direct actions
+            if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent) and plan_mode:
+                answer = agent.ask_with_planning(prompt, max_iters=int(max_iters), analysis_only=analysis_only)
+            else:
+                answer = agent.ask_once(prompt, max_iters=int(max_iters))
             st.markdown("### Assistant Response")
 
             # Try to extract tool JSON and render diffs/graphs
@@ -444,34 +489,44 @@ if do_execute:
 st.markdown("---")
 st.markdown("### Approve & Apply Changes")
 st.caption("This will re-run edit tools with `dry_run=False`. Only enable after reviewing diffs above.")
+if analysis_only:
+    st.info("Analysis-only is ON — edits are previewed and cannot be applied. Turn this off in the sidebar to enable writes.")
 
 apply_cols = st.columns([1,1,3])
 with apply_cols[0]:
-    do_apply = st.button("Apply all pending edits", type="primary", use_container_width=True)
+    do_apply = st.button(
+        "Apply all pending edits",
+        type="primary",
+        use_container_width=True,
+        disabled=analysis_only,  # 🚫 block when analysis-only
+    )
 with apply_cols[1]:
     do_refresh = st.button("Refresh file list", use_container_width=True)
 
 if do_apply:
-    payloads = st.session_state.get("last_edit_payloads", [])
-    if not payloads:
-        st.info("No pending preview edits to apply.")
+    if analysis_only:
+        st.warning("Analysis-only mode is enabled. Disable it in the sidebar to apply edits.")
     else:
-        applied = []
-        for p in payloads:
-            name = p["tool"]
-            args = dict(p["args"])
-            # flip preview → apply
-            if "dry_run" in args:
-                args["dry_run"] = False
-            try:
-                log(f"✅ Applying {name} with args: {args}")
-                res = tools.call(name, **args)  # write happens here via ToolRegistry  :contentReference[oaicite:9]{index=9}
-                applied.append({"tool": name, "args": args, "result": res})
-            except Exception as e:
-                applied.append({"tool": name, "args": args, "error": str(e)})
-                log(f"❌ Apply {name} failed: {e}")
-        with st.expander("Apply Results", expanded=True):
-            st.code(_pretty(applied), language="json")
+        payloads = st.session_state.get("last_edit_payloads", [])
+        if not payloads:
+            st.info("No pending preview edits to apply.")
+        else:
+            applied = []
+            for p in payloads:
+                name = p["tool"]
+                args = dict(p["args"])
+                # flip preview → apply
+                if "dry_run" in args:
+                    args["dry_run"] = False
+                try:
+                    log(f"✅ Applying {name} with args: {args}")
+                    res = tools.call(name, **args)  # write happens here via ToolRegistry
+                    applied.append({"tool": name, "args": args, "result": res})
+                except Exception as e:
+                    applied.append({"tool": name, "args": args, "error": str(e)})
+                    log(f"❌ Apply {name} failed: {e}")
+            with st.expander("Apply Results", expanded=True):
+                st.code(_pretty(applied), language="json")
 
 if do_refresh:
     # Example: show Python files under project root quickly

@@ -65,8 +65,8 @@ class ReasoningAgent(Agent):
         # enhanced_registry.py tools
         "analyze_code_structure": {
             "required": {"path"},
-            "allowed": {"path"},
-            "defaults": {},
+            "allowed": {"path", "subdir"},
+            "defaults": {"subdir": ""},
         },
         "find_related_files": {
             "required": {"main_file"},
@@ -75,13 +75,13 @@ class ReasoningAgent(Agent):
         },
         "detect_errors": {
             "required": {"path"},
-            "allowed": {"path"},
-            "defaults": {},
+            "allowed": {"path", "subdir"},
+            "defaults": {"subdir": ""},
         },
         "call_graph_for_function": {
             "required": {"function"},
             "allowed": {"function", "subdir", "depth"},
-            "defaults": {"subdir": "", "depth": 1},
+            "defaults": {"subdir": "", "depth": 3},
         },        
     }
 
@@ -100,6 +100,14 @@ class ReasoningAgent(Agent):
         "bulk_edit": {},  # edits is already correct
         "call_graph_for_function": {"name": "function", "level": "depth"},
     }
+
+
+    # Tools that mutate files and must be blocked (or dry-run) in analysis-only mode
+    _EDIT_TOOLS = {
+        "write_file", "replace_in_file", "bulk_edit",
+        "rewrite_naive_open", "format_python_files"
+    }
+
 
     def __init__(self, model: LLMModel, tools: ToolRegistry, enable_tools: bool = True):
         super().__init__(model, tools, enable_tools)
@@ -153,10 +161,10 @@ class ReasoningAgent(Agent):
     - format_python_files(subdir="", line_length=88, dry_run=False)
     - bulk_edit(edits, dry_run=True, backup=True)
     - rewrite_naive_open(dir=".", exts=[".py"], dry_run=True, backup=True)
-    - analyze_code_structure(path)
+    - analyze_code_structure(path, subdir="")
     - find_related_files(main_file)
-    - detect_errors(path)
-    - call_graph_for_function(function, subdir="", depth=1)
+    - detect_errors(path, subdir="")
+    - call_graph_for_function(function, subdir="", depth=3)
 
     OUTPUT FORMAT (strict JSON only):
     [
@@ -259,10 +267,13 @@ class ReasoningAgent(Agent):
             return ("previous_step" in val.lower()) or val.startswith("<") or "identified" in val.lower()
         return False
 
-    def execute_plan(self, plan: list, max_iters: int = 10) -> str:
+    def execute_plan(self, plan: list, max_iters: int = 10, analysis_only: bool = False) -> str:
         """
         Execute an LLM-generated plan step-by-step with safety checks
         and clear, streamlit-friendly results.
+
+        If analysis_only=True, any edit-capable tool is run in preview mode
+        (dry-run when supported) and labelled as blocked-from-write.
 
         Contract of each plan step:
         {
@@ -316,9 +327,9 @@ class ReasoningAgent(Agent):
             "format_python_files": {"subdir": "", "line_length": 88, "dry_run": False},
             "bulk_edit": {"dry_run": True, "backup": True},
             "rewrite_naive_open": {"dir": ".", "exts": [".py"], "dry_run": True, "backup": True},
-            "analyze_code_structure": {},
+            "analyze_code_structure": {"subdir": ""},
             "find_related_files": {},
-            "detect_errors": {},
+            "detect_errors": {"subdir": ""},
         }
 
         if not isinstance(plan, list):
@@ -343,6 +354,18 @@ class ReasoningAgent(Agent):
             args = step.get("args", {}) or {}
             desc = step.get("description", "")
             critical = step.get("critical", True)
+
+            # Enforce analysis-only: force preview for edit tools
+            if analysis_only and tool in self._EDIT_TOOLS:
+                # best-effort: standardize the common dry_run/backup flags
+                if tool in {"replace_in_file", "bulk_edit", "rewrite_naive_open"}:
+                    args.setdefault("dry_run", True)
+                    args.setdefault("backup", True)
+                elif tool == "format_python_files":
+                    args.setdefault("dry_run", True)
+                # write_file has no dry_run — we just mark it as blocked below
+                args["_analysis_only_blocked"] = True
+
 
             # tool must exist in the registry
             if not tool or not hasattr(self.tools, "tools") or tool not in self.tools.tools:
@@ -406,14 +429,18 @@ class ReasoningAgent(Agent):
             # call the tool
             try:
                 out = self.tools.call(tool, **fixed_args)  # executes registered function  
-                results.append({
+                rec = {
                     "step": idx,
                     "tool": tool,
                     "description": desc,
                     "args": fixed_args,
                     "result": out,
                     "success": True
-                })
+                }
+                # Surface the analysis-only block marker if present
+                if analysis_only and args.get("_analysis_only_blocked"):
+                    rec["warning"] = "edit tool blocked by analysis-only mode (executed as preview if applicable)"
+                results.append(rec)
             except Exception as e:
                 results.append({
                     "step": idx,
@@ -426,12 +453,41 @@ class ReasoningAgent(Agent):
                 if critical:
                     break
 
-        return json.dumps(results, indent=2)
+        # ---------------- final summarization (Part-1) ----------------
+        # In analysis-only mode, produce a unified, natural-language report
+        # over all collected step results. We append it as a final step so
+        # the return type remains a list for existing UI code.
+        try:
+            if analysis_only:
+                summary_prompt = (
+                    "Synthesize a concise, actionable report from these execution results.\n"
+                    f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
+                    "Focus on:\n"
+                    "1) Root cause(s)\n"
+                    "2) Supporting evidence with file/line where possible\n"
+                    "3) Risks/unknowns\n"
+                    "4) Recommended fix steps (do NOT write or apply code)\n\n"                    
+                )
+                resp = self.adapter.chat([
+                    {"role": "system", "content": "You are a precise code analyst. Be concrete and terse."},
+                    {"role": "user", "content": summary_prompt},
+                ])
+                content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+                results.append({
+                    "step": "final",
+                    "tool": "_summarize",
+                    "report": content,
+                    "success": True
+                })
+        except Exception as _e:
+            # Do not fail the whole run if the summarizer errors; just skip it.
+            pass
 
+        return json.dumps(results, indent=2)
 
     # ---------------- main entry ----------------
 
-    def ask_with_planning(self, query: str, max_iters: int = 10) -> str:
+    def ask_with_planning(self, query: str, max_iters: int = 10, analysis_only: bool = False) -> str:
         """
         High-level: try fast-path direct actions; else plan + execute.
         """
@@ -440,4 +496,4 @@ class ReasoningAgent(Agent):
             return direct
 
         plan = self.analyze_and_plan(query)
-        return self.execute_plan(plan, max_iters)
+        return self.execute_plan(plan, max_iters, analysis_only=analysis_only)

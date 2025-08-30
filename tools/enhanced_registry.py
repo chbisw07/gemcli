@@ -2,6 +2,7 @@
 import ast
 import re
 from pathlib import Path
+from functools import lru_cache
 from typing import List, Dict, Any, Optional
 
 class EnhancedToolRegistry:
@@ -14,7 +15,60 @@ class EnhancedToolRegistry:
         self.root = self.tool_registry.root
         self.tools = self.tool_registry.tools
         self._register_enhanced_tools()
-    
+
+
+    # ---------- Robust path resolving (search from project root) ----------
+    def _rel(self, p: Path) -> str:
+        return str(p.resolve().relative_to(self.root))
+
+    @lru_cache(maxsize=4096)
+    def _all_files_named(self, name: str) -> list[Path]:
+        return [p for p in self.root.rglob(name)]
+
+    @lru_cache(maxsize=1)
+    def _all_py_files(self) -> list[Path]:
+        return [p for p in self.root.rglob("*.py")]
+
+    def _resolve_path(self, path: str, subdir: str = "") -> Optional[str]:
+        """
+        Resolve 'path' relative to project root, with best-effort search.
+        Strategy:
+          1) Try subdir/path if subdir is provided.
+          2) Try root/path as-is.
+          3) If only a filename was given, rglob by filename.
+          4) As a fallback, match any file whose tail endswith the provided path.
+        Returns a *relative* path from self.root, or None if not found.
+        """
+        if not path:
+            return None
+        path = str(Path(path))  # normalize separators
+        # 1) subdir + path
+        if subdir:
+            cand = (self.root / subdir / path)
+            if cand.exists():
+                return self._rel(cand)
+        # 2) root + path
+        cand = (self.root / path)
+        if cand.exists():
+            return self._rel(cand)
+        # 3) filename match
+        name = Path(path).name
+        matches = self._all_files_named(name)
+        if matches:
+            # prefer matches under subdir, else the shortest relative path
+            if subdir:
+                under = [p for p in matches if (self.root / subdir) in p.parents]
+                if under:
+                    return self._rel(under[0])
+            best = sorted(matches, key=lambda p: len(self._rel(p)))[0]
+            return self._rel(best)
+        # 4) endswith match among python files (e.g., "app/rag/retriever.py")
+        tail = path.replace("\\", "/")
+        for p in self._all_py_files():
+            if str(p).replace("\\", "/").endswith(tail):
+                return self._rel(p)
+        return None
+        
     def call(self, name: str, **kwargs):
         """Delegate to the underlying tool registry"""
         return self.tool_registry.call(name, **kwargs)
@@ -23,11 +77,12 @@ class EnhancedToolRegistry:
         """Register enhanced code analysis tools"""
         import ast
         
-        def analyze_code_structure(path: str) -> dict:
+        def analyze_code_structure(path: str, subdir: str = ""):
             """Analyze code structure and dependencies"""
-            p = self.root / path
-            if not p.exists():
-                raise FileNotFoundError(f"File not found: {path}")
+            resolved = self._resolve_path(path, subdir=subdir or "")
+            if not resolved:
+                return {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
+            p = self.root / resolved
             
             content = p.read_text()
             try:
@@ -87,10 +142,11 @@ class EnhancedToolRegistry:
         
         def detect_errors(path: str) -> list:
             """Static analysis to detect potential errors"""
-            p = self.root / path
-            if not p.exists():
-                return [{'error': f"File not found: {path}"}]
-            
+            resolved = self._resolve_path(path, subdir=subdir)
+            if not resolved:
+                return {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
+            p = self.root / resolved
+
             content = p.read_text()
             errors = []
             
@@ -181,7 +237,7 @@ class EnhancedToolRegistry:
         def call_graph_for_function(function: str, subdir: str = "",
                             project_only: bool = True,
                             filter_noise: bool = True,
-                            depth: int = 1) -> dict:
+                            depth: int = 3) -> dict:
             """
             Build a call graph rooted at `function`:
             - locate the file that defines `function`
