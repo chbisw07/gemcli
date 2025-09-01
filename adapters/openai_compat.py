@@ -50,7 +50,7 @@ class OpenAICompatAdapter:
             payload["tools"] = schemas
             payload["tool_choice"] = tool_choice_override or "auto"
 
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=90)
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=180) #CB
         try:
             resp.raise_for_status()
             return resp.json()

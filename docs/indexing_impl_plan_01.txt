@@ -1,0 +1,15 @@
+exactly this is what i want - "boost by adding symbolic (AST-based) chunking + semantic embeddings, then retrieving via Chroma before you ask the model to “think.”
+
+shall i create a dir "indexing" within gemcli?
+i think if we have separate implementations for symbolic and semantic indexing. again for semantic indexing, i think it is good if we have separate chunkers for file types such as .py, .pdf etc.
+
+let's use chroma db as the vector db.
+let's pick/select embedding models from models.json.
+
+we can have rag.json for various rag settings for indexing/chunking, retrieval etc.
+since a project has lot of files, including folders/files meant for different purposes like for example .git etc., so i would like to have a rag setting that allows files for indexing, some setting that rejects some files or folders.
+for example (you may think or create in better way):
+"supported_file_types": [".py", ".txt", ".pdf"]
+"ignore_dir": ["__pycache__", "tmp"]
+"ignore_ext": [".pyc"]
+"ignore_files": ["abc.txt", "__init__.py"]

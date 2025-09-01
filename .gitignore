@@ -17,6 +17,8 @@ data/*
 !data/models.json
 *.ods
 
+/.chroma/
+
 # Streamlit state
 gemcli_ui/.streamlit/
 gemcli_ui/__pycache__/

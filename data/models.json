@@ -99,6 +99,74 @@
       "tags": ["general", "large", "tools"],
       "group": ["free"]
     }
-  ]
+  ],
+  "embedding_models": [
+    {
+      "name": "text-embedding-ada-002",
+      "label": "OpenAI Ada-002",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1/embeddings",
+      "embedding": true,
+      "model_type": "embedding",
+      "overview": "OpenAI's fastest and most widely used embedding model. Use for code, docs, search, and retrieval.",
+      "dimension": 1536,
+      "api_key_reqd": true,
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["embedding", "openai"],
+      "icon": "openai-embeddings",
+      "group": ["paid"],
+      "max_input_tokens": 8192,
+      "safety_margin_tokens": 512
+    },
+    {
+      "name": "text-embedding-nomic-embed-code",
+      "label": "Nomic Embed Code v1.5",
+      "provider": "nomic-ai",
+      "endpoint": "http://192.168.1.8:1234",
+      "embedding": true,
+      "model_type": "embedding",
+      "overview": "Nomic AI's code embedding v1.5 — fast, open-source, state-of-the-art embeddings for code and semantic search.",
+      "dimension": 3584,
+      "api_key_reqd": false,
+      "tags": ["embedding", "nomic", "open-source", "code"],
+      "icon": "nomic-ai-embeddings",
+      "group": ["free", "open-source"],
+      "max_input_tokens": 8192,
+      "safety_margin_tokens": 512
+    },
+    {
+      "name": "nomic-embed-text-v1.5",
+      "label": "Nomic Embed Text v1.5",
+      "provider": "nomic-ai",
+      "endpoint": "http://127.0.0.1:1234/v1/embeddings",
+      "embedding": true,
+      "model_type": "embedding",
+      "overview": "Nomic AI's text embedding v1.5 — fast, open-source, state-of-the-art embeddings for semantic search and RAG.",
+      "dimension": 768,
+      "api_key_reqd": false,
+      "tags": ["embedding", "nomic", "open-source", "text"],
+      "icon": "nomic-ai-embeddings",
+      "group": ["free", "open-source"],
+      "max_input_tokens": 8192,
+      "safety_margin_tokens": 512
+    },
+    {
+      "name": "text-embedding-qwen3-embedding-4b",
+      "label": "Qwen3 Embedding 4B",
+      "provider": "openai",
+      "endpoint": "http://192.168.1.8:1234",
+      "embedding": true,
+      "model_type": "embedding",
+      "overview": "Qwen3 4B multilingual embedding model — 1024-dimensional, high-performance open-source embedder for English, Chinese, and more.",
+      "dimension": 1024,
+      "api_key_reqd": false,
+      "tags": ["embedding", "qwen", "multilingual", "open-source"],
+      "icon": "qwen",
+      "group": ["free", "open-source"],
+      "max_input_tokens": 8192,
+      "safety_margin_tokens": 512
+    }
+  ],
+  "default_embedding_model": "text-embedding-qwen3-embedding-4b"
 }
 

@@ -1,0 +1,71 @@
+Perfect 👍 — here’s a curated list of **stress-test prompts** you can use with your code assistant in **Part-1 (analysis-only)** mode.
+These are designed to force the agent to **break tasks down**, use read/inspect tools (`search_code`, `analyze_code_structure`, `call_graph_for_function`, etc.), and then synthesize findings without writing code.
+
+---
+
+# 🔍 Example Prompts for Validation
+
+### Call Graph & Dependency Analysis
+
+1. **“Find the call graph of `semantic_retrieve()` and explain why the caller/callee information is incomplete in the current implementation.”**
+   → Should plan: locate `semantic_retrieve`, run `call_graph_for_function(depth=2)`, compare with `_extract_symbol_for_callgraph_local`, summarize missing linkages.
+
+2. **“Trace the execution flow from `adaptive_semantic_retrieve()` to any functions in `tabular_search.py`. Explain which parts of the graph are missing or mis-classified.”**
+
+3. **“List all functions that call `get_embeddings()` across the backend and show their call graph up to depth 2.”**
+
+---
+
+### Error & Bug Investigation
+
+4. **“In `symbol_graph.py`, analyze why some function nodes are created with `file_ext = null`. What’s the root cause?”**
+   → Should search for node creation logic, inspect upsert, detect missing metadata.
+
+5. **“Why do we sometimes see ‘encoding without a string argument’ errors during symbol graph upserts? Show the failing code path.”**
+
+6. **“Check for potential cyclic dependencies in the call graph generation. Show how the code prevents or fails to prevent cycles.”**
+
+---
+
+### Structural / Design-Level
+
+7. **“Compare how code vs document chunkers handle metadata population. Explain inconsistencies in fields like `file_path` or `chunk_type`.”**
+
+8. **“Look at how `_merge_function_node` is defined and used. Explain why it appears unused in the code, and whether it should be integrated.”**
+
+9. **“List all chunking algorithms registered in `chunking_dispatcher.py` and analyze if any are unused or redundant.”**
+
+---
+
+### Cross-Module Analysis
+
+10. **“Find all references to `adaptive_semantic_retrieve` across the backend. Show how caller functions use its return value, and why this may cause incomplete context in RAG.”**
+
+11. **“Trace how embeddings are passed from `embedding.py` into `retriever.py`. Identify gaps or transformations that are undocumented.”**
+
+12. **“Inspect all error handlers (try/except) in `indexer.py`. Summarize which errors are swallowed and which are re-raised, and explain risks.”**
+
+---
+
+### Configuration & Settings
+
+13. **“How is `rag_settings.json` parsed and merged with defaults in `model_config.json`? Show if any keys are ignored or normalized incorrectly.”**
+
+14. **“Check how `call_graph_for_function` treats builtins/logging calls. Is filtering working consistently for all cases?”**
+
+---
+
+# ✅ What to expect
+
+* For each prompt, the assistant should:
+
+  1. Generate a multi-step plan (search → analyze → graph → detect → summarize).
+  2. Execute read-only tools.
+  3. Collect evidence (snippets, function lists, graphs).
+  4. Produce a final **root cause + supporting findings + recommended fix outline**.
+* **No writes/edits** will be attempted (they’ll be blocked by analysis-only mode).
+
+---
+
+👉 Do you want me to also prepare **expected example outputs** (what a “good” answer would look like for a couple of these prompts), so you can benchmark whether your assistant is reasoning at the right depth?
+    

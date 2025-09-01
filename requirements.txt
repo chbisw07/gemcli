@@ -5,6 +5,11 @@ black>=24.3.0  # optional: used by format_python_files
 graphviz
 
 # Optional future extensions:
-# openai
+openai
 # google-generativeai
 # deepseek
+
+chroma-hnswlib
+chromadb
+sentence-transformers
+pypdf
