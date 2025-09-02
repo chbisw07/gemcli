@@ -1,19 +1,30 @@
 import re
 from typing import Optional
+from loguru import logger
+
 
 def _detect_intent(user_prompt: str) -> str:
-    p = user_prompt.lower()
+    p = (user_prompt or "").lower()
+    intent = "general"
+    matched = None
+
     if any(k in p for k in ["refactor", "restructure", "clean up", "simplify"]):
-        return "refactor"
-    if any(k in p for k in ["optimize", "performance", "speed up", "latency", "throughput"]):
-        return "optimize"
-    if any(k in p for k in ["compare", "vs", "versus", "advantages", "disadvantages", "tradeoff"]):
-        return "compare"
-    if any(k in p for k in ["root cause", "bug", "issue", "failure", "why failing", "diagnose"]):
-        return "rca"
-    if any(k in p for k in ["design", "architecture", "propose", "plan", "roadmap"]):
-        return "design"
-    return "general"
+        intent, matched = "refactor", "refactor|restructure|clean up|simplify"
+    elif any(k in p for k in ["optimize", "performance", "speed up", "latency", "throughput"]):
+        intent, matched = "optimize", "optimize|performance|speed up|latency|throughput"
+    elif any(k in p for k in ["compare", "vs", "versus", "advantages", "disadvantages", "tradeoff"]):
+        intent, matched = "compare", "compare|vs|versus|advantages|disadvantages|tradeoff"
+    elif any(k in p for k in ["root cause", "bug", "issue", "failure", "why failing", "diagnose"]):
+        intent, matched = "rca", "root cause|bug|issue|failure|why failing|diagnose"
+    elif any(k in p for k in ["design", "architecture", "propose", "plan", "roadmap"]):
+        intent, matched = "design", "design|architecture|propose|plan|roadmap"
+
+    logger.debug(
+        "intents._detect_intent → intent='{}' matched='{}' prompt='{}...'",
+        intent, matched, (p[:160] + ("…" if len(p) > 160 else "")),
+    )
+    return intent
+
 
 _SYNTH_TEMPLATES = {
     "rca": """You are a precise code analyst. Produce a concise Root Cause Analysis grounded in the given execution results.
@@ -76,11 +87,16 @@ RESULTS JSON:
 """,
 }
 
+
 def _build_synth_prompt(user_prompt: str, results_json: str, extra_context: Optional[str] = None) -> str:
     intent = _detect_intent(user_prompt)
     tmpl = _SYNTH_TEMPLATES.get(intent, _SYNTH_TEMPLATES["general"])
-    # Add a small header to bind the model to the user task
     header = f"USER PROMPT:\n{user_prompt.strip()}\n"
     if extra_context and extra_context.strip():
         header += f"\nADDITIONAL CONTEXT:\n{extra_context.strip()}\n"
-    return header + "\n" + tmpl.format(results=results_json)
+    out = header + "\n" + tmpl.format(results=results_json)
+    logger.debug(
+        "intents._build_synth_prompt → intent='{}' results_len={} extra_context={}",
+        intent, len(results_json or ""), bool(extra_context and extra_context.strip())
+    )
+    return out

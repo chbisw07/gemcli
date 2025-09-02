@@ -1,8 +1,13 @@
 # adapters/openai_compat.py
+from __future__ import annotations
+
 import os
+import time
 import requests
 import json
 from typing import List, Dict, Optional
+from loguru import logger
+
 from models import LLMModel
 from tools.registry import ToolRegistry
 
@@ -11,29 +16,36 @@ class OpenAICompatAdapter:
     def __init__(self, model: LLMModel, tools: ToolRegistry):
         self.model = model
         self.tools = tools
+        logger.info(
+            "OpenAICompatAdapter init → name='{}' provider='{}' endpoint='{}' tools={}",
+            model.name, model.provider, model.endpoint, len(getattr(tools, "tools", {}))
+        )
 
     def _headers(self) -> Dict[str, str]:
         headers = {"Content-Type": "application/json"}
         if self.model.api_key_reqd:
             if not self.model.api_key_env:
-                raise RuntimeError(
-                    f"Model '{self.model.name}' requires API key but 'api_key_env' is not set in config."
-                )
+                msg = f"Model '{self.model.name}' requires API key but 'api_key_env' is not set in config."
+                logger.error("_headers: {}", msg)
+                raise RuntimeError(msg)
             key = os.getenv(self.model.api_key_env)
             if not key:
-                raise RuntimeError(
-                    f"API key env '{self.model.api_key_env}' not found in environment. "
-                    f"Did you add it to your .env?"
-                )
+                msg = (f"API key env '{self.model.api_key_env}' not found in environment. "
+                       f"Did you add it to your .env?")
+                logger.error("_headers: {}", msg)
+                raise RuntimeError(msg)
             headers["Authorization"] = f"Bearer {key}"
+            logger.debug("_headers: using env '{}'", self.model.api_key_env)
         return headers
 
     def _tool_schemas(self):
-        # If your registry exposes schemas_openai(), use it; else no tools
         if hasattr(self.tools, "schemas_openai"):
             try:
-                return self.tools.schemas_openai()
-            except Exception:
+                schemas = self.tools.schemas_openai()
+                logger.debug("_tool_schemas: {} schema(s)", len(schemas or []))
+                return schemas
+            except Exception as e:
+                logger.warning("_tool_schemas failed: {}", e)
                 return []
         return []
 
@@ -50,30 +62,45 @@ class OpenAICompatAdapter:
             payload["tools"] = schemas
             payload["tool_choice"] = tool_choice_override or "auto"
 
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=180) #CB
+        logger.info("openai_compat.chat → url='{}' model='{}' tools={} override={}",
+                    url, payload["model"], len(schemas or []), bool(tool_choice_override))
+        t0 = time.time()
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=300)  # CB
+        dt = (time.time() - t0) * 1000.0
+        logger.info("openai_compat.chat ← status={} time_ms≈{:.0f}", resp.status_code, dt)
         try:
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+            tool_calls = msg.get("tool_calls") or []
+            logger.debug("openai_compat.chat: content_len={} tool_calls={}",
+                         len(msg.get("content") or ""), len(tool_calls))
+            return data
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             server_text = getattr(resp, "text", "")
             if status == 401:
+                logger.error("openai_compat.chat: 401 Unauthorized")
                 raise RuntimeError("401 Unauthorized. Ensure the required API key env is set, or use a local model.") from e
             if status == 400 and schemas:
+                logger.error("openai_compat.chat: 400 with tools enabled: {}", server_text[:500])
                 raise RuntimeError(f"OpenAI 400 via /chat/completions (tools enabled): {server_text}") from e
+            logger.error("openai_compat.chat: HTTP {} {}", status, server_text[:500])
             raise RuntimeError(f"OpenAI error {status}: {server_text}") from e
 
     def tool_loop(self, messages: List[Dict], max_iters: int = 3) -> str:
-        for _ in range(max_iters):
+        logger.info("openai_compat.tool_loop: max_iters={}", max_iters)
+        for it in range(max_iters):
             resp = self.chat(messages)
             msg = (resp.get("choices") or [{}])[0].get("message", {}) or {}
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
-
             if tool_calls or content:
                 messages.append(msg)
+            logger.debug("tool_loop iter {}: tool_calls={} content_len={}", it + 1, len(tool_calls), len(content or ""))
 
             if not tool_calls:
+                logger.info("tool_loop: returning final content (len={})", len(content or ""))
                 return content or "(no content)"
 
             for tc in tool_calls:
@@ -83,6 +110,7 @@ class OpenAICompatAdapter:
                     args = json.loads(args_str)
                 except Exception:
                     args = {}
+                logger.info("tool_loop → call '{}' args_keys={}", fn, list(args.keys()))
                 try:
                     result = self.tools.call(fn, **args)
                     tool_msg = {
@@ -91,6 +119,7 @@ class OpenAICompatAdapter:
                         "name": fn,
                         "content": json.dumps(result)
                     }
+                    logger.info("tool_loop ✓ '{}'", fn)
                 except Exception as e:
                     tool_msg = {
                         "role": "tool",
@@ -98,6 +127,8 @@ class OpenAICompatAdapter:
                         "name": fn,
                         "content": json.dumps({"error": str(e)})
                     }
+                    logger.error("tool_loop ✗ '{}': {}", fn, e)
                 messages.append(tool_msg)
 
+        logger.warning("tool_loop: exhausted after {} iterations", max_iters)
         return "[tool loop exhausted]"

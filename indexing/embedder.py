@@ -16,6 +16,7 @@ import json
 import requests
 from pathlib import Path
 from typing import List, Dict, Optional, Any
+from loguru import logger
 
 # Optional: auto-load .env so API keys are available when running outside Streamlit
 try:
@@ -29,8 +30,11 @@ except Exception:  # pragma: no cover
 def _load_models_json(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            data = json.load(f)
+            logger.debug("embedder: loaded models.json from '{}'", path)
+            return data
+    except Exception as e:
+        logger.error("embedder: failed to load models.json '{}': {}", path, e)
         return {}
 
 def _select_embedder(models_cfg: Dict[str, Any], rag_cfg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -42,19 +46,26 @@ def _select_embedder(models_cfg: Dict[str, Any], rag_cfg: Dict[str, Any]) -> Opt
     if selected:
         for e in embs:
             if e.get("name") == selected:
+                logger.info("embedder: selected='{}' via rag_cfg", selected)
                 return e
 
     default_name = models_cfg.get("default_embedding_model")
     if default_name:
         for e in embs:
             if e.get("name") == default_name:
+                logger.info("embedder: using default_embedding_model='{}'", default_name)
                 return e
 
+    if embs:
+        logger.info("embedder: using first entry='{}'", embs[0].get("name"))
+    else:
+        logger.error("embedder: no entries found in models.json")
     return embs[0] if embs else None
 
 def _load_env(models_json_path: str) -> None:
     """Load .env from common spots without overriding existing env vars."""
     if load_dotenv is None:
+        logger.debug("embedder: python-dotenv not available; skipping .env load")
         return
     try:
         mj = Path(models_json_path).resolve()
@@ -64,16 +75,17 @@ def _load_env(models_json_path: str) -> None:
     candidates = []
     if mj:
         # If models.json is <project_root>/data/models.json, try project_root/.env and data/.env
-        candidates.append(mj.parent.parent / ".env")
-        candidates.append(mj.parent / ".env")
-    candidates.append(Path.cwd() / ".env")  # current working dir
+        candidates.append(mj.parent.parent / ".env")  # <project_root>/.env
+        candidates.append(mj.parent / ".env")         # <project_root>/data/.env
+    candidates.append(Path.cwd() / ".env")            # CWD/.env
 
     for p in candidates:
         try:
             if p and p.exists():
                 load_dotenv(p, override=False)
-        except Exception:
-            continue
+                logger.debug("embedder: loaded env from '{}'", str(p))
+        except Exception as e:
+            logger.debug("embedder: failed to load env from '{}': {}", str(p), e)
 
 def _norm_embeddings_url(endpoint: str) -> str:
     ep = endpoint.rstrip("/")
@@ -87,21 +99,19 @@ def _headers(entry: Dict[str, Any]) -> Dict[str, str]:
     """Build headers. If api_key_reqd, read from env[api_key_env]."""
     headers = {
         "Content-Type": "application/json",
-        "Accept-Encoding": "identity",   # avoid large compressed responses
+        "Accept-Encoding": "identity",
         "Connection": "close",
         "User-Agent": "gemcli-embedder/1.0",
     }
     if entry.get("api_key_reqd"):
-        key_env = entry.get("api_key_env")
-        if not key_env:
-            # Keep it simple: default to OPENAI_API_KEY if not provided
-            key_env = "OPENAI_API_KEY"
+        key_env = entry.get("api_key_env") or "OPENAI_API_KEY"
         key = os.getenv(key_env)
         if not key:
-            raise RuntimeError(
-                f"Embedding '{entry.get('name')}' requires API key env '{key_env}' but it is not set."
-            )
+            msg = f"Embedding '{entry.get('name')}' requires API key env '{key_env}' but it is not set."
+            logger.error("embedder: {}", msg)
+            raise RuntimeError(msg)
         headers["Authorization"] = f"Bearer {key}"
+        logger.debug("embedder: auth via env '{}'", key_env)
     return headers
 
 def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
@@ -110,10 +120,11 @@ def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
     any response means it's up. Pure connection errors/timeouts → unreachable.
     """
     try:
-        # Some servers may not support GET here; we still only care about connectivity.
         requests.get(url, timeout=timeout)
+        logger.debug("embedder: endpoint reachable '{}'", url)
         return True
-    except requests.RequestException:
+    except requests.RequestException as e:
+        logger.debug("embedder: endpoint unreachable '{}': {}", url, e)
         return False
 
 
@@ -129,6 +140,10 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
       - If entry has 'endpoint' → use OpenAI-compatible POST /v1/embeddings.
       - Else fall back to local sentence-transformers (if installed), else error.
     """
+    logger.info("resolve_embedder: models='{}' selected='{}'",
+                models_json_path,
+                (rag_cfg.get('embedder') or {}).get('selected_name') or (rag_cfg.get('embedder') or {}).get('model_key'))
+
     _load_env(models_json_path)
 
     models_cfg = _load_models_json(models_json_path)
@@ -143,6 +158,7 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
         headers = _headers(entry)
         model_name = entry.get("model") or entry.get("name") or "embedding-model"
         microbatch = int(rag_cfg.get("embedding_batch_size") or 8)
+        logger.info("embedder: remote OpenAI-compatible url='{}' model='{}' microbatch={}", url, model_name, microbatch)
 
         # Only fail early if we can't connect at all.
         if not _endpoint_reachable(url, timeout=2.0):
@@ -157,6 +173,7 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
             out: List[List[float]] = []
             for i in range(0, len(texts), microbatch):
                 batch = texts[i:i + microbatch]
+                logger.debug("embedder: POST batch [{}:{}] (size={})", i, i + len(batch), len(batch))
                 resp = requests.post(
                     url,
                     headers=headers,
@@ -174,6 +191,7 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
                     out.extend(rows)
                 else:
                     # Defensive message if the server returns an unexpected schema
+                    logger.error("embedder: unexpected response schema (keys={})", list(data.keys()))
                     raise RuntimeError("Embedding endpoint returned an unexpected response schema.")
             return out
 
@@ -183,12 +201,14 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
     except Exception as e:  # pragma: no cover
+        logger.error("embedder: no endpoint and no sentence-transformers installed")
         raise RuntimeError(
             "No 'endpoint' specified for the selected embedder and 'sentence-transformers' "
             "is not installed for local embeddings."
         ) from e
 
     local_name = entry.get("model") or entry.get("name") or "all-MiniLM-L6-v2"
+    logger.info("embedder: local SentenceTransformer='{}'", local_name)
     st_model = SentenceTransformer(local_name)
 
     def _local_embed(texts: List[str]) -> List[List[float]]:

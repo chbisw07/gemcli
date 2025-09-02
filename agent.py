@@ -3,6 +3,8 @@ import json
 import re
 from typing import List, Dict, Optional, Any
 
+from loguru import logger
+
 from models import LLMModel
 from tools.registry import ToolRegistry
 from adapters.openai_compat import OpenAICompatAdapter
@@ -26,10 +28,18 @@ class Agent:
 
         if model.is_openai_compat():
             self.adapter = OpenAICompatAdapter(model, tools)
+            adapter_name = "OpenAICompatAdapter"
         elif model.is_gemini():
             self.adapter = GeminiAdapter(model, tools)
+            adapter_name = "GeminiAdapter"
         else:
             self.adapter = OpenAICompatAdapter(model, tools)
+            adapter_name = "OpenAICompatAdapter"
+
+        logger.info(
+            "Agent.__init__ → model='{}' provider='{}' endpoint='{}' tools_enabled={} adapter={}",
+            model.name, model.provider, model.endpoint, enable_tools, adapter_name
+        )
 
     # --------------------------- Prompt ---------------------------
 
@@ -41,6 +51,7 @@ class Agent:
         prompt = self.model.system_prompt or "You are a helpful coding assistant."
         if self.model.supports_thinking():
             prompt += "\nThink step-by-step internally, then provide a concise final answer."
+            logger.debug("system_prompt: thinking mode enabled for '{}'", self.model.name)
 
         if self.enable_tools:
             if self.model.is_openai_compat():
@@ -58,6 +69,7 @@ class Agent:
                     "Preferred flow: scan_relevant_files → analyze_files → propose & apply edits (dry_run first). "
                     "NEVER dump large file blobs; summarize and use the tools."
                 )
+        logger.debug("system_prompt built (len={})", len(prompt))
         return prompt
 
     # --------------------------- Public API ---------------------------
@@ -69,35 +81,42 @@ class Agent:
         - Otherwise, if assistant content is a JSON tool request, execute it (textual protocol).
         - Deterministic parsers + search intent filter act as safety hatches.
         """
+        logger.info("Agent.ask_once → prompt='{}...'", (query or "")[:200])
         # Deterministic / intent fast-paths (no LLM needed)
         direct = self._try_direct_actions(query)
         if direct is not None:
+            logger.info("ask_once → satisfied via direct path")
             return direct
 
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self.system_prompt()},
             {"role": "user", "content": query},
         ]
+        logger.debug("ask_once: tools_enabled={} max_iters={}", self.enable_tools, max_iters)
 
         if not self.enable_tools:
             resp = self.adapter.chat(messages)
-            return (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+            content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+            logger.info("ask_once (no tools) → {} chars", len(content or ""))
+            return content
 
-        # Tooling enabled
         tool_choice_override = self._route_tool_call(query)  # hint for first hop
+        if tool_choice_override:
+            logger.debug("ask_once: tool_choice_override={}", tool_choice_override)
 
-        for _ in range(max_iters):
+        for it in range(max_iters):
             try:
                 resp = self.adapter.chat(messages, tool_choice_override=tool_choice_override)
             except Exception as e:
+                logger.exception("adapter.chat failed on iter {}: {}", it + 1, e)
                 return f"[error] chat failed: {e}"
 
             msg = (resp.get("choices") or [{}])[0].get("message", {}) or {}
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+            logger.debug("iter {}: tool_calls={} content_len={}", it + 1, len(tool_calls), len(content or ""))
 
             if tool_calls:
-                # ✅ Correct order: assistant with tool_calls, then tool replies (one per id)
                 messages.append(msg)
                 for tc in tool_calls:
                     fn = (tc.get("function") or {}).get("name")
@@ -106,6 +125,7 @@ class Agent:
                         args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
                     except Exception:
                         args = {}
+                    logger.info("→ tool_call '{}' args_keys={}", fn, list(args.keys()))
                     try:
                         result = self.tools.call(fn, **args)
                         tool_msg = {
@@ -114,6 +134,7 @@ class Agent:
                             "name": fn,
                             "content": json.dumps(result),
                         }
+                        logger.info("✓ tool '{}' executed", fn)
                     except Exception as e:
                         tool_msg = {
                             "role": "tool",
@@ -121,56 +142,59 @@ class Agent:
                             "name": fn,
                             "content": json.dumps({"error": str(e)}),
                         }
+                        logger.error("✗ tool '{}' failed: {}", fn, e)
                     messages.append(tool_msg)
 
-                # after first hop, let the model decide next steps
                 tool_choice_override = None
-                continue  # loop again with tool results in context
+                continue
 
-            # No native tool_calls → textual JSON tool protocol fallback for non-OpenAI models
+            # Textual JSON tool protocol (for non-OpenAI models)
             if content and not self.model.is_openai_compat():
                 ran, tool_msg = self._maybe_run_textual_tool(content)
                 if ran:
                     messages.append({"role": "assistant", "content": content})
                     messages.append(tool_msg)
+                    logger.info("Executed textual tool request: {}", tool_msg.get("name"))
                     tool_choice_override = None
-                    continue  # loop again with tool result
+                    continue
 
-            # If OpenAI-compatible model responded with prose instead of calling tools,
-            # provide a very small safety net for common "scan/search" prompts.
+            # Safety net: if model failed to call tools
             if content and self.model.is_openai_compat():
                 if self._looks_like_scan_search(query) and not tool_calls:
                     try:
-                        res = self.tools.call("search_code", query=self._extract_search_term(query) or query.strip(), subdir=self._guess_subdir_from_prompt(query))
+                        term = self._extract_search_term(query) or query.strip()
+                        subdir = self._guess_subdir_from_prompt(query)
+                        res = self.tools.call("search_code", query=term, subdir=subdir)
+                        logger.info("search_code fallback executed (term='{}', subdir='{}')", term, subdir)
                         return f"search_code -> {json.dumps(res, indent=2)}"
                     except Exception as e:
+                        logger.error("search_code fallback failed: {}", e)
                         return f"[error] search_code failed: {e}"
 
             # Final answer
             if content:
-                # If the "content" itself is a JSON tool ask, run it once as a last resort
                 ran, result_or_text = self._maybe_run_textual_tool(content)
                 if ran:
-                    return result_or_text["content"]  # show tool result JSON
+                    logger.info("Final textual tool execution returned")
+                    return result_or_text["content"]
+                logger.info("ask_once → returning assistant content ({} chars)", len(content or ""))
                 return content
 
-            # No content and no tools? Stop.
-            break
+            logger.debug("ask_once: no content and no tool_calls on iter {}", it + 1)
 
+        logger.warning("ask_once → tool loop exhausted after {} iteration(s)", max_iters)
         return "[tool loop exhausted]"
 
     # --------------------------- JSON-tool fallback ---------------------------
 
     def _maybe_run_textual_tool(self, content: str):
-        """
-        If assistant content looks like {"tool":"...", "arguments":{...}}, execute it and
-        return (True, tool_message_dict). Otherwise (False, original_content).
-        """
+        """If assistant content looks like {\"tool\":\"...\",\"arguments\":{...}}, execute it."""
         try:
             obj = json.loads(content)
             if isinstance(obj, dict) and "tool" in obj and "arguments" in obj:
                 name = obj["tool"]
                 args = obj.get("arguments") or {}
+                logger.info("textual_tool → '{}'", name)
                 result = self.tools.call(name, **args)
                 return True, {
                     "role": "tool",
@@ -185,11 +209,7 @@ class Agent:
     # --------------------------- Router ---------------------------
 
     def _route_tool_call(self, query: str) -> Optional[Dict[str, Any]]:
-        """
-        Heuristic router that maps a natural-language prompt to the most likely tool.
-        It only returns a tool_choice override; the model will still supply arguments.
-        Priority matters: match specific intents first.
-        """
+        """Heuristic router that maps a natural-language prompt to the most likely tool."""
         q = (query or "").lower()
 
         def choose(name: str) -> Dict[str, Any]:
@@ -197,40 +217,51 @@ class Agent:
 
         # Edits / replacements
         if any(k in q for k in ("bulk edit", "bulk change", "multiple files", "across the repo", "across the project")):
+            logger.debug("_route_tool_call → bulk_edit")
             return choose("bulk_edit")
         if any(k in q for k in ("replace", "substitute", "find and replace", "search and replace", "swap text")):
+            logger.debug("_route_tool_call → replace_in_file")
             return choose("replace_in_file")
-        if any(k in q for k in ("rewrite open(", "fix open()", "context manager", "with open", "file leak", "not close", "don’t close", "doesn't close", "doesnt close")):
+        if any(k in q for k in ("rewrite open(", "fix open()", "with open", "context manager", "with  open", "doesn't close", "doesnt close")):
+            logger.debug("_route_tool_call → rewrite_naive_open")
             return choose("rewrite_naive_open")
 
         # Write/create files
         if any(k in q for k in ("write file", "create file", "new file", "make file", "save file")):
+            logger.debug("_route_tool_call → write_file")
             return choose("write_file")
 
         # Formatting / cleanup
         if any(k in q for k in ("format python", "run black", "reformat", "auto format", "auto-format", "code style", "pep8")):
+            logger.debug("_route_tool_call → format_python_files")
             return choose("format_python_files")
 
         # Scan → Analyze flow
         if any(k in q for k in ("scan for", "find relevant files", "which files are relevant", "search repo for", "locate files", "discover files")):
+            logger.debug("_route_tool_call → scan_relevant_files")
             return choose("scan_relevant_files")
         if any(k in q for k in ("analyze files", "analyze these files", "summarize files", "quick analysis", "file signals", "show preview", "line counts")):
+            logger.debug("_route_tool_call → analyze_files")
             return choose("analyze_files")
 
         # Listing
         if ("list" in q or "show" in q) and ("file" in q or "files" in q):
+            logger.debug("_route_tool_call → list_files")
             return choose("list_files")
 
         # Searching
         if any(k in q for k in ("search", "find", "grep", "look for", "scan")) and any(
             k in q for k in ("code", "function", "class", "def ", ".py", ".js", ".ts", ".jsx", ".tsx")
         ):
+            logger.debug("_route_tool_call → search_code")
             return choose("search_code")
 
         # Reading
         if any(k in q for k in ("read", "open", "show contents", "view file", "print file")):
+            logger.debug("_route_tool_call → read_file")
             return choose("read_file")
 
+        logger.debug("_route_tool_call → none")
         return None
 
     # --------------------------- REPL ---------------------------
@@ -259,41 +290,28 @@ class Agent:
         return bool(re.search(r"(?i)\b(search|scan|find)\b", q or ""))
 
     def _extract_search_term(self, q: str) -> Optional[str]:
-        # prefer quoted
         m = re.search(r"""['"]([^'"]+)['"]""", q or "")
         if m and m.group(1).strip():
             return m.group(1).strip()
-        # next: code-ish token (json.loads, ClassName, snake_case)
         m = re.search(r"([A-Za-z_][A-Za-z0-9_\.\-]+)", q or "")
         if m:
             return m.group(1).strip()
-        # fallback: last word
         parts = re.findall(r"[A-Za-z0-9_\.\-]+", q or "")
         return parts[-1] if parts else None
 
     def _guess_subdir_from_prompt(self, q: str) -> str:
-        """
-        Heuristically pick the best-matching directory from user text by scoring
-        tokens against actual directories under repo root. Case-insensitive partials.
-        """
         root = getattr(self.tools, "root", None)
         if root is None:
             return ""
-
-        # candidate tokens after 'in|under|inside|within' or just all words
         m = re.search(r"(?i)\b(in|under|inside|within)\b\s+(.*)$", q or "")
         tail = m.group(2) if m else (q or "")
         raw_tokens = re.findall(r"[A-Za-z0-9_\-/.]+", tail.lower())
-
-        # common noise words to ignore
         stop = {"the", "this", "that", "these", "those", "folder", "dir", "directory",
                 "module", "modules", "pkg", "package", "project", "repo", "code",
                 "inside", "within", "under", "in"}
         tokens = [t.strip("/.") for t in raw_tokens if t not in stop and t.strip("/.")]
         if not tokens:
             return ""
-
-        # build a directory list (relative paths)
         dirs = []
         for p in root.rglob("*"):
             if p.is_dir():
@@ -304,8 +322,6 @@ class Agent:
                 if rel == ".":
                     continue
                 dirs.append(rel)
-
-        # score: +2 for exact segment match, +1 for substring match
         best_dir = ""
         best_score = 0
         for d in dirs:
@@ -320,11 +336,9 @@ class Agent:
                     score += 1
             if score > best_score:
                 best_dir, best_score = d, score
-
         return best_dir if best_score > 0 else ""
 
-    # --------------------------- Helpers: legacy parsers (safety hatches) ---------------------------
-
+    # (legacy parsers unchanged)
     def _unquote(self, m) -> str:
         return m.group(1) if m.group(1) is not None else m.group(2)
 
@@ -484,89 +498,94 @@ class Agent:
     # --------------------------- Direct executor ---------------------------
 
     def _try_direct_actions(self, query: str) -> Optional[str]:
-        """
-        Deterministic fast-paths & robust intent filter for search.
-        """
+        """Deterministic fast-paths & robust intent filter for search."""
         q = (query or "").strip()
         if not q:
             return None
 
-        # 0) Intent filter: normalize search-like prompts -> search_code(query, subdir)
         if self._is_search_intent(q):
             term = self._extract_search_term(q)
             if term:
-                subdir = self._guess_subdir_from_prompt(q)  # "" if none matched
+                subdir = self._guess_subdir_from_prompt(q)
                 try:
                     res = self.tools.call("search_code", query=term, subdir=subdir)
+                    logger.info("direct_action search_code(term='{}', subdir='{}')", term, subdir)
                     return f"search_code -> {json.dumps(res, indent=2)}"
                 except Exception as e:
+                    logger.error("direct_action search_code failed: {}", e)
                     return f"[error] search_code failed: {e}"
 
-        # 1) Replace in file
         rep = self._parse_replace(q)
         if rep:
             try:
                 res = self.tools.call(rep["tool"], **rep["args"])
+                logger.info("direct_action replace_in_file")
                 return f"{rep['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action replace_in_file failed: {}", e)
                 return f"[error] {rep['tool']} failed: {e}"
 
-        # 2) Write/Create file
         wf = self._parse_writefile(q)
         if wf:
             try:
                 res = self.tools.call(wf["tool"], **wf["args"])
+                logger.info("direct_action write_file")
                 return f"{wf['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action write_file failed: {}", e)
                 return f"[error] {wf['tool']} failed: {e}"
 
-        # 3) List python files
         lf = self._parse_list_files(q)
         if lf:
             try:
                 res = self.tools.call(lf["tool"], **lf["args"])
+                logger.info("direct_action list_files")
                 return f"{lf['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action list_files failed: {}", e)
                 return f"[error] {lf['tool']} failed: {e}"
 
-        # 4) legacy search parser (rarely used now)
         srch = self._parse_search(q)
         if srch:
             try:
                 res = self.tools.call(srch["tool"], **srch["args"])
+                logger.info("direct_action search_code (legacy)")
                 return f"{srch['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action legacy search_code failed: {}", e)
                 return f"[error] {srch['tool']} failed: {e}"
 
-        # 5) Format Python files
         fmt = self._parse_format_python(q)
         if fmt:
             try:
                 res = self.tools.call(fmt["tool"], **fmt["args"])
+                logger.info("direct_action format_python_files")
                 return f"{fmt['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action format_python_files failed: {}", e)
                 return f"[error] {fmt['tool']} failed: {e}"
 
-        # 6) Rewrite naive open()
         rno = self._parse_rewrite_open(q)
         if rno:
             try:
                 res = self.tools.call(rno["tool"], **rno["args"])
+                logger.info("direct_action rewrite_naive_open")
                 return f"{rno['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action rewrite_naive_open failed: {}", e)
                 return f"[error] {rno['tool']} failed: {e}"
 
-        # 7) Bulk edit
         be = self._parse_bulk_edit(q)
         if be:
             try:
                 res = self.tools.call(be["tool"], **be["args"])
                 prefix = "" if "warning" not in be else "[warn] " + be["warning"] + "\n"
+                logger.info("direct_action bulk_edit")
                 return f"{prefix}{be['tool']} -> {json.dumps(res, indent=2)}"
             except Exception as e:
+                logger.error("direct_action bulk_edit failed: {}", e)
                 return f"[error] {be['tool']} failed: {e}"
 
-        # Nothing matched
         return None
 
     # --------------------------- Tiny nudge helpers ---------------------------

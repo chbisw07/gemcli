@@ -1,9 +1,13 @@
 # tools/enhanced_registry.py
+from __future__ import annotations
+
 import ast
 import re
 from pathlib import Path
 from functools import lru_cache
 from typing import List, Dict, Any, Optional
+from loguru import logger
+from logging_decorators import log_call
 
 class EnhancedToolRegistry:
     """
@@ -14,8 +18,8 @@ class EnhancedToolRegistry:
         self.tool_registry = ToolRegistry(project_root)
         self.root = self.tool_registry.root
         self.tools = self.tool_registry.tools
+        logger.info("EnhancedToolRegistry init → root='{}' tools={}", str(self.root), len(self.tools))
         self._register_enhanced_tools()
-
 
     # ---------- Robust path resolving (search from project root) ----------
     def _rel(self, p: Path) -> str:
@@ -23,11 +27,15 @@ class EnhancedToolRegistry:
 
     @lru_cache(maxsize=4096)
     def _all_files_named(self, name: str) -> list[Path]:
-        return [p for p in self.root.rglob(name)]
+        matches = [p for p in self.root.rglob(name)]
+        logger.debug("_all_files_named('{}') → {} match(es)", name, len(matches))
+        return matches
 
     @lru_cache(maxsize=1)
     def _all_py_files(self) -> list[Path]:
-        return [p for p in self.root.rglob("*.py")]
+        files = [p for p in self.root.rglob("*.py")]
+        logger.debug("_all_py_files() → {} file(s)", len(files))
+        return files
 
     def _resolve_path(self, path: str, subdir: str = "") -> Optional[str]:
         """
@@ -40,18 +48,24 @@ class EnhancedToolRegistry:
         Returns a *relative* path from self.root, or None if not found.
         """
         if not path:
+            logger.debug("_resolve_path: empty path")
             return None
         path = str(Path(path))  # normalize separators
         # 1) subdir + path
         if subdir:
             cand = (self.root / subdir / path)
             if cand.exists():
-                return self._rel(cand)
+                rel = self._rel(cand)
+                logger.debug("_resolve_path: subdir hit → {}", rel)
+                return rel
+
         # 2) root + path
         cand = (self.root / path)
         if cand.exists():
-            return self._rel(cand)
-        # 3) filename match
+            rel = self._rel(cand)
+            logger.debug("_resolve_path: direct hit → {}", rel)
+            return rel
+
         name = Path(path).name
         matches = self._all_files_named(name)
         if matches:
@@ -59,41 +73,48 @@ class EnhancedToolRegistry:
             if subdir:
                 under = [p for p in matches if (self.root / subdir) in p.parents]
                 if under:
-                    return self._rel(under[0])
+                    rel = self._rel(under[0])
+                    logger.debug("_resolve_path: filename hit under subdir → {}", rel)
+                    return rel
             best = sorted(matches, key=lambda p: len(self._rel(p)))[0]
-            return self._rel(best)
+            rel = self._rel(best)
+            logger.debug("_resolve_path: filename hit → {}", rel)
+            return rel
+
         # 4) endswith match among python files (e.g., "app/rag/retriever.py")
         tail = path.replace("\\", "/")
         for p in self._all_py_files():
             if str(p).replace("\\", "/").endswith(tail):
-                return self._rel(p)
+                rel = self._rel(p)
+                logger.debug("_resolve_path: endswith hit → {}", rel)
+                return rel
+
+        logger.debug("_resolve_path: not found path='{}' subdir='{}'", path, subdir)
         return None
-        
+
     def call(self, name: str, **kwargs):
         """Delegate to the underlying tool registry"""
+        logger.info("EnhancedToolRegistry.call('{}') args_keys={}", name, list(kwargs.keys()))
         return self.tool_registry.call(name, **kwargs)
-    
+
     def _register_enhanced_tools(self):
         """Register enhanced code analysis tools"""
-        import ast
-        
+        logger.info("Registering enhanced tools…")
+
         def analyze_code_structure(path: str, subdir: str = ""):
             """Analyze code structure and dependencies"""
             resolved = self._resolve_path(path, subdir=subdir or "")
             if not resolved:
-                return {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
+                msg = {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
+                logger.error("analyze_code_structure: {}", msg["error"])
+                return msg
             p = self.root / resolved
-            
-            content = p.read_text()
+            logger.debug("analyze_code_structure: file='{}'", resolved)
+
+            content = p.read_text(encoding="utf-8", errors="ignore")
             try:
                 tree = ast.parse(content)
-                analysis = {
-                    'imports': [],
-                    'functions': [],
-                    'classes': [],
-                    'dependencies': set()
-                }
-                
+                analysis = {'imports': [], 'functions': [], 'classes': [], 'dependencies': set()}
                 for node in ast.walk(tree):
                     if isinstance(node, ast.Import):
                         for n in node.names:
@@ -105,69 +126,64 @@ class EnhancedToolRegistry:
                             analysis['dependencies'].add(node.module.split('.')[0])
                     elif isinstance(node, ast.FunctionDef):
                         analysis['functions'].append({
-                            'name': node.name,
-                            'line': node.lineno,
-                            'args': [arg.arg for arg in node.args.args]
+                            'name': node.name, 'line': node.lineno, 'args': [arg.arg for arg in node.args.args]
                         })
                     elif isinstance(node, ast.ClassDef):
-                        analysis['classes'].append({
-                            'name': node.name,
-                            'line': node.lineno
-                        })
-                
+                        analysis['classes'].append({'name': node.name, 'line': node.lineno})
                 analysis['dependencies'] = list(analysis['dependencies'])
+                logger.info("analyze_code_structure: imports={} funcs={} classes={}",
+                            len(analysis['imports']), len(analysis['functions']), len(analysis['classes']))
                 return analysis
             except Exception as e:
+                logger.exception("analyze_code_structure failed: {}", e)
                 return {'error': str(e)}
-        
+
         def find_related_files(main_file: str) -> list:
             """Find files related to the given file through imports"""
             try:
                 analysis = analyze_code_structure(main_file)
                 dependencies = analysis.get('dependencies', [])
-                
+                logger.info("find_related_files: deps={} for '{}'", len(dependencies), main_file)
+
                 related_files = []
                 for dep in dependencies:
                     # Look for files that might implement this dependency
                     search_results = self.call('search_code', query=dep, regex=False, case_sensitive=False)
-                    
+                    logger.debug("find_related_files: dep='{}' hits={}", dep, len(search_results))
                     for result in search_results:
                         file_path = result['file']
                         if file_path not in related_files and file_path != main_file:
                             related_files.append(file_path)
-                
+                logger.info("find_related_files: related={}", len(related_files))
                 return related_files
             except Exception as e:
+                logger.exception("find_related_files failed: {}", e)
                 return [{'error': str(e)}]
-        
+
         def detect_errors(path: str, subdir: str = "") -> list:
             """Static analysis to detect potential errors"""
             resolved = self._resolve_path(path, subdir=subdir or "")
             if not resolved:
-                return {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
+                msg = {"error": f"File not found under {self.root}: {path}", "path": path, "subdir": subdir}
+                logger.error("detect_errors: {}", msg["error"])
+                return msg
             p = self.root / resolved
-
-            content = p.read_text()
+            content = p.read_text(encoding="utf-8", errors="ignore")
             errors = []
-            
             # Check for common issues
+
             if 'open(' in content and 'with open(' not in content:
-                errors.append({
-                    'type': 'potential_resource_leak',
-                    'message': 'File opened without context manager',
-                    'line': None  # Would need more sophisticated parsing
-                })
-            
+                errors.append({'type': 'potential_resource_leak',
+                               'message': 'File opened without context manager',
+                               'line': None})
             # Check for broad exception handling
             if 'except:' in content or 'except Exception:' in content:
-                errors.append({
-                    'type': 'broad_exception',
-                    'message': 'Overly broad exception handling',
-                    'line': None
-                })
-            
+                errors.append({'type': 'broad_exception',
+                               'message': 'Overly broad exception handling',
+                               'line': None})
+            logger.info("detect_errors: {} issue(s) in '{}'", len(errors), resolved)
             return errors
-        
+
         def _find_function_definition(root: Path, func_name: str, subdir: str = "") -> Optional[str]:
             base = root / (subdir or "")
             for p in sorted(base.rglob("*.py")):
@@ -176,9 +192,12 @@ class EnhancedToolRegistry:
                     tree = ast.parse(src)
                     for node in ast.walk(tree):
                         if isinstance(node, ast.FunctionDef) and node.name == func_name:
-                            return str(p.relative_to(root))
+                            rel = str(p.relative_to(root))
+                            logger.debug("_find_function_definition: '{}' → {}", func_name, rel)
+                            return rel
                 except Exception:
                     continue
+            logger.debug("_find_function_definition: '{}' not found", func_name)
             return None
 
         def _calls_in_function(src: str, func_name: str) -> List[str]:
@@ -186,6 +205,7 @@ class EnhancedToolRegistry:
             try:
                 tree = ast.parse(src)
             except Exception:
+                logger.debug("_calls_in_function: parse failed for '{}'", func_name)
                 return calls
 
             class _Visitor(ast.NodeVisitor):
@@ -217,6 +237,7 @@ class EnhancedToolRegistry:
                     self.generic_visit(node)
 
             _Visitor().visit(tree)
+            logger.debug("_calls_in_function('{}'): {} call(s)", func_name, len(calls))
             return calls
 
         def _dot_from_edges(center: str, edges: List[tuple]) -> str:
@@ -235,11 +256,11 @@ class EnhancedToolRegistry:
             return "\n".join(lines)
 
         def call_graph_for_function(function: str, subdir: str = "",
-                            project_only: bool = True,
-                            filter_noise: bool = True,
-                            depth: int = 3) -> dict:
+                                    project_only: bool = True,
+                                    filter_noise: bool = True,
+                                    depth: int = 3, **_ignore) -> dict:
             """
-            Build a call graph rooted at `function`:
+            Build a call graph rooted at `function`.
             - locate the file that defines `function`
             - parse the function body to collect calls
             - recurse into callees up to `depth` levels
@@ -247,6 +268,7 @@ class EnhancedToolRegistry:
             depth=N → recurse N levels
             depth=0 → unlimited (until no new project-local callees found)
             """
+            logger.info("call_graph_for_function('{}', subdir='{}', depth={})", function, subdir, depth)
             visited = set()
             edges = []
             resolved_all = {}
@@ -300,6 +322,7 @@ class EnhancedToolRegistry:
 
             expand(function, 1)
             dot = _dot_from_edges(function, edges)
+            logger.info("call_graph_for_function: nodes={} edges={}", len(resolved_all), len(edges))
             return {
                 "function": function,
                 "file": _find_function_definition(self.root, function, subdir=subdir),
@@ -308,9 +331,15 @@ class EnhancedToolRegistry:
                 "dot": dot,
             }
 
-        # Register enhanced tools
-        self.tools["analyze_code_structure"] = analyze_code_structure
-        self.tools["find_related_files"] = find_related_files
-        self.tools["detect_errors"] = detect_errors
+        # Optional alias to match common planner wording
+        def analyze_function(function: str, subdir: str = "", depth: int = 3, **_ignore):
+            return call_graph_for_function(function=function, subdir=subdir, depth=depth)
 
-        self.tools["call_graph_for_function"] = call_graph_for_function
+        # Register enhanced tools
+        self.tools["analyze_code_structure"]  = log_call("analyze_code_structure")(analyze_code_structure)
+        self.tools["find_related_files"]      = log_call("find_related_files")(find_related_files)
+        self.tools["detect_errors"]           = log_call("detect_errors")(detect_errors)
+        self.tools["call_graph_for_function"] = log_call("call_graph_for_function", slow_ms=1500)(call_graph_for_function)
+        self.tools["analyze_function"]        = log_call("analyze_function")(analyze_function)
+
+        logger.info("Enhanced tools registered: {}", list(self.tools.keys()))

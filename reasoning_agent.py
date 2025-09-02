@@ -2,6 +2,7 @@
 import json
 import re
 from typing import List, Dict, Any, Optional
+from loguru import logger
 
 from agent import Agent
 from models import LLMModel
@@ -101,6 +102,10 @@ class ReasoningAgent(Agent):
         "call_graph_for_function": {"name": "function", "level": "depth"},
     }
 
+    # Map common synonyms → real tool names
+    _TOOL_REDIRECT = {
+        "analyze_function": "call_graph_for_function",
+    }
 
     # Tools that mutate files and must be blocked (or dry-run) in analysis-only mode
     _EDIT_TOOLS = {
@@ -108,24 +113,19 @@ class ReasoningAgent(Agent):
         "rewrite_naive_open", "format_python_files"
     }
 
-
     def __init__(self, model: LLMModel, tools: ToolRegistry, enable_tools: bool = True):
         super().__init__(model, tools, enable_tools)
+        logger.info("ReasoningAgent initialized (tools_enabled={})", enable_tools)
 
     def _try_direct_actions(self, query: str) -> Optional[str]:
-        """
-        Handle call graph queries directly without planning for faster response.
-        """
-        q = query.lower().strip()
-        # Check for call graph intent
+        """Handle call graph queries directly without planning for faster response."""
+        q = (query or "").lower().strip()
         if "call graph" in q or "callgraph" in q:
-            # Extract function name using regex
-            match = re.search(r'of\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)?', q)
-            if not match:
-                # Try alternative patterns
-                match = re.search(r'for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)?', q)
+            match = re.search(r'of\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)?', q) or \
+                    re.search(r'for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)?', q)
             if match:
                 function_name = match.group(1)
+                logger.info("ReasoningAgent direct call_graph_for_function('{}')", function_name)
                 try:
                     # Check if the tool is available
                     if hasattr(self.tools, 'tools') and "call_graph_for_function" in self.tools.tools:
@@ -134,12 +134,12 @@ class ReasoningAgent(Agent):
                     else:
                         return "[error] call_graph_for_function tool not available"
                 except Exception as e:
+                    logger.error("Direct call_graph_for_function failed: {}", e)
                     return f"[error] call_graph_for_function failed: {e}"
         
         # Fall back to parent's direct actions for other queries
         return super()._try_direct_actions(query)
 
-    # ---------------- planning ----------------
     # ---------------- Planning: strict, grounded, example-driven ----------------
     _PLAN_SYSTEM = (
         "You are a careful *code* planner. Produce a small sequence of TOOL calls that are:\n"
@@ -184,6 +184,7 @@ Return JSON array like:
         def _looks_placeholder(p: str) -> bool:
             return not p or "path/to" in p or p.strip() in {"<>", "<file>", "<path>","<BIND>"}
 
+        logger.debug("critique_and_fix_plan: input steps={}", len(plan or []))
         for step in plan or []:
             s = dict(step or {})
             args = dict(s.get("args") or {})
@@ -199,8 +200,7 @@ Return JSON array like:
             if tool == "call_graph_for_function":
                 args.setdefault("depth", 3)
 
-            # Heuristic binding: if search_code happened earlier, remember a discovered file
-            # Expect the registry to return a list of candidate files — we bind later in the executor too.
+            # Placeholder binding hinting
             if tool == "search_code":
                 # we can't know the result now; mark intention for binding
                 s["_expects_files"] = True
@@ -212,11 +212,7 @@ Return JSON array like:
             s["args"] = args
             fixed.append(s)
 
-            # Lightweight hinting for later steps: if a previous step will yield a file list, note it
-            if tool == "search_code":
-                # The real binding happens after step 1 executes; we also try to rebind in the UI executor.
-                pass
-
+        logger.debug("critique_and_fix_plan: output steps={}", len(fixed))
         return fixed
     
     def analyze_and_plan(self, query: str) -> list:
@@ -237,6 +233,7 @@ Return JSON array like:
             {"role": "user", "content": user_msg},
         ]
         try:
+            logger.info("ReasoningAgent.analyze_and_plan → planning for prompt='{}...'", (query or "")[:160])
             resp = self.adapter.chat(messages)
             content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
             # Allow fenced JSON
@@ -244,7 +241,9 @@ Return JSON array like:
             if m:
                 content = m.group(1)
             plan = json.loads(content)
-        except Exception:
+            logger.info("Plan generated with {} step(s)", len(plan or []))
+        except Exception as e:
+            logger.warning("Planner failed: {}. Falling back to discovery-first plan.", e)
             # Fallback: minimal discovery-first plan so executor can proceed
             plan = [
                 {
@@ -263,7 +262,9 @@ Return JSON array like:
             allowed = ", ".join(sorted(spec["allowed"]))
             required = ", ".join(sorted(spec["required"])) if spec["required"] else "(none)"
             lines.append(f'- {name}({allowed})  REQUIRED: {required}')
-        return "\n".join(lines)
+        out = "\n".join(lines)
+        logger.debug("render_tool_spec_for_prompt len={}", len(out))
+        return out
 
     def _normalize_step_args(self, tool: str, args: Dict[str, Any]) -> (bool, Dict[str, Any], Optional[str]):
         """
@@ -271,6 +272,7 @@ Return JSON array like:
         """
         spec = self._TOOL_SPECS.get(tool)
         if not spec:
+            logger.error("normalize_step_args: unknown tool '{}'", tool)
             return False, {}, f"Unknown tool '{tool}'."
         allowed = set(spec["allowed"])
         required = set(spec["required"])
@@ -291,36 +293,29 @@ Return JSON array like:
             cleaned.setdefault(k, v)
 
         # 4) special coercions
-        if tool == "analyze_files":
-            # paths must be a list[str]
-            if "paths" in cleaned and isinstance(cleaned["paths"], str):
-                cleaned["paths"] = [cleaned["paths"]]
+        if tool == "analyze_files" and isinstance(cleaned.get("paths"), str):
+            cleaned["paths"] = [cleaned["paths"]]
         if tool == "detect_errors":
-            # ensure 'path' is scalar (pick first if list was provided)
             v = cleaned.get("path")
             if isinstance(v, list) and v:
                 cleaned["path"] = v[0]
-        if tool in {"format_python_files"}:
-            # guard line_length int
-            if "line_length" in cleaned:
-                try:
-                    cleaned["line_length"] = int(cleaned["line_length"])
-                except Exception:
-                    return False, {}, "line_length must be an integer"
+        if tool in {"format_python_files"} and "line_length" in cleaned:
+            try:
+                cleaned["line_length"] = int(cleaned["line_length"])
+            except Exception:
+                logger.error("normalize_step_args: line_length must be an integer")
+                return False, {}, "line_length must be an integer"
 
         # 5) required checks
         missing = required - set(cleaned.keys())
         if missing:
+            logger.error("normalize_step_args: missing required args for {}: {}", tool, sorted(missing))
             return False, {}, f"Missing required args for {tool}: {sorted(missing)}"
 
+        logger.debug("normalize_step_args OK for tool='{}' keys={}", tool, list(cleaned.keys()))
         return True, cleaned, None
 
     # ---------------- execution ----------------
-
-    def _looks_like_placeholder(val: Any) -> bool:
-        if isinstance(val, str):
-            return ("previous_step" in val.lower()) or val.startswith("<") or "identified" in val.lower()
-        return False
 
     def execute_plan(self, plan: list, max_iters: int = 10, analysis_only: bool = False) -> str:
         """
@@ -339,8 +334,10 @@ Return JSON array like:
         }
         """
         import json
-
         results = []
+        last_by_tool: dict[str, Any] = {}  # keep outputs for {{BIND:...}} usage
+
+        logger.info("ReasoningAgent.execute_plan begin: steps={} analysis_only={}", len(plan or []), analysis_only)
 
         # quick recursive placeholder detector
         def _looks_like_placeholder(v) -> bool:
@@ -369,7 +366,7 @@ Return JSON array like:
             "find_related_files": {"file": "main_file", "filename": "main_file"},
             "detect_errors": {"file": "path", "filename": "path", "files": "path"},
             "replace_in_file": {"filename": "path", "file": "path"},
-            "bulk_edit": {},  # edits already correct
+            "bulk_edit": {},
         }
 
         # default values for a few tools (mirrors tools/registry.py)
@@ -388,20 +385,18 @@ Return JSON array like:
         }
 
         if not isinstance(plan, list):
-            return json.dumps(
-                [{"error": "Plan must be a JSON array of steps.", "success": False}],
-                indent=2
-            )
+            msg = "Plan must be a JSON array of steps."
+            logger.error("execute_plan: {}", msg)
+            return json.dumps([{"error": msg, "success": False}], indent=2)
 
         for idx, step in enumerate(plan[:max_iters], start=1):
-            # pass through pre-existing planner errors
             if isinstance(step, dict) and "error" in step and "tool" not in step:
+                logger.error("execute_plan: planner error at step {}: {}", idx, step.get("error"))
                 results.append({"step": idx, **step, "success": False})
-                # if a pure planning error appears here, treat as critical and stop
                 break
 
-            # validate basic shape
             if not isinstance(step, dict):
+                logger.error("execute_plan: invalid step type {} at {}", type(step), idx)
                 results.append({"step": idx, "error": f"Invalid step type: {type(step)}", "success": False})
                 break
 
@@ -409,26 +404,18 @@ Return JSON array like:
             args = step.get("args", {}) or {}
             desc = step.get("description", "")
             critical = step.get("critical", True)
+            logger.info("execute_plan: step {} tool='{}' critical={} desc='{}'", idx, tool, critical, desc)
 
-            # Enforce analysis-only: force preview for edit tools
-            if analysis_only and tool in self._EDIT_TOOLS:
-                # best-effort: standardize the common dry_run/backup flags
-                if tool in {"replace_in_file", "bulk_edit", "rewrite_naive_open"}:
-                    args.setdefault("dry_run", True)
-                    args.setdefault("backup", True)
-                elif tool == "format_python_files":
-                    args.setdefault("dry_run", True)
-                # write_file has no dry_run — we just mark it as blocked below
-                args["_analysis_only_blocked"] = True
+            # Redirect synonyms first
+            target_tool = self._TOOL_REDIRECT.get(tool, tool)
 
-
-            # tool must exist in the registry
-            if not tool or not hasattr(self.tools, "tools") or tool not in self.tools.tools:
+            if not target_tool or not hasattr(self.tools, "tools") or target_tool not in self.tools.tools:
+                logger.error("execute_plan: unknown/unregistered tool '{}'", tool)
                 results.append({
                     "step": idx,
-                    "tool": tool,
+                    "tool": target_tool,
                     "description": desc,
-                    "error": f"Unknown or unregistered tool: {tool}",
+                    "error": f"Unknown or unregistered tool: {target_tool}",
                     "success": False
                 })
                 if critical:
@@ -437,6 +424,7 @@ Return JSON array like:
 
             # block placeholders
             if _looks_like_placeholder(args):
+                logger.error("execute_plan: placeholder argument at step {}: {}", idx, args)
                 results.append({
                     "step": idx,
                     "tool": tool,
@@ -448,12 +436,41 @@ Return JSON array like:
                     break
                 continue
 
-            # apply simple alias fixes
-            alias_map = ARG_ALIASES.get(tool, {})
-            fixed_args = {}
-            for k, v in args.items():
-                k2 = alias_map.get(k, k)
-                fixed_args[k2] = v
+            # --------- BIND placeholders: {{BIND:search_code.file0}} ----------
+            def _bind_value(v):
+                if isinstance(v, str):
+                    import re
+                    # support {{BIND:tool.fieldN}}  OR  <BIND:tool.fieldN>
+                    m = re.match(r"^\{\{BIND:(\w+)\.([A-Za-z_]+)(\d+)\}\}$", v) \
+                        or re.match(r"^<BIND:(\w+)\.([A-Za-z_]+)(\d+)>$", v)
+                    if m:
+                        tname, field, idx = m.group(1), m.group(2), int(m.group(3))
+                        src = last_by_tool.get(tname)
+                        if isinstance(src, list) and 0 <= idx < len(src) and isinstance(src[idx], dict):
+                            return src[idx].get(field, v)
+                return v
+            def _bind_obj(obj):
+                if isinstance(obj, dict):
+                    return {k: _bind_obj(_bind_value(v)) for k, v in obj.items()}
+                if isinstance(obj, list):
+                    return [_bind_obj(_bind_value(x)) for x in obj]
+                return _bind_value(obj)
+            args = _bind_obj(args)
+
+            # --------- Normalize args strictly against tool spec ----------
+            ok, fixed_args, err = self._normalize_step_args(target_tool, args)
+            if not ok:
+                results.append({
+                    "step": idx,
+                    "tool": target_tool,
+                    "description": desc,
+                    "error": err,
+                    "success": False
+                })
+                logger.error("execute_plan: normalization failed for '{}' at step {}: {}", target_tool, idx, err)
+                if critical:
+                    break
+                continue
 
             # coerce some expected shapes
             if tool == "analyze_files" and isinstance(fixed_args.get("paths"), str):
@@ -466,6 +483,7 @@ Return JSON array like:
                 try:
                     fixed_args["line_length"] = int(fixed_args["line_length"])
                 except Exception:
+                    logger.error("execute_plan: line_length must be an integer (step {})", idx)
                     results.append({
                         "step": idx,
                         "tool": tool,
@@ -483,28 +501,28 @@ Return JSON array like:
 
             # call the tool
             try:
-                out = self.tools.call(tool, **fixed_args)  # executes registered function  
+                out = self.tools.call(target_tool, **fixed_args)
                 rec = {
                     "step": idx,
-                    "tool": tool,
+                    "tool": target_tool,
                     "description": desc,
                     "args": fixed_args,
                     "result": out,
                     "success": True
                 }
-                # Surface the analysis-only block marker if present
-                if analysis_only and args.get("_analysis_only_blocked"):
-                    rec["warning"] = "edit tool blocked by analysis-only mode (executed as preview if applicable)"
                 results.append(rec)
+                logger.info("execute_plan: tool '{}' OK (step {})", target_tool, idx)
+                last_by_tool[target_tool] = out
             except Exception as e:
                 results.append({
                     "step": idx,
-                    "tool": tool,
+                    "tool": target_tool,
                     "description": desc,
                     "args": fixed_args,
                     "error": str(e),
                     "success": False
                 })
+                logger.exception("execute_plan: tool '{}' failed at step {}: {}", target_tool, idx, e)
                 if critical:
                     break
 
@@ -534,21 +552,27 @@ Return JSON array like:
                     "report": content,
                     "success": True
                 })
+                logger.info("execute_plan: summarization appended (len={})", len(content or ""))
         except Exception as _e:
-            # Do not fail the whole run if the summarizer errors; just skip it.
-            pass
+            logger.warning("execute_plan: summarizer failed (ignored): {}", _e)
 
-        return json.dumps(results, indent=2)
+        out_json = json.dumps(results, indent=2)
+        logger.info("ReasoningAgent.execute_plan end: steps={} ok={} fail={}",
+                    len(results),
+                    sum(1 for r in results if r.get("success")),
+                    sum(1 for r in results if not r.get("success")))
+        logger.debug("execute_plan: results json size={} bytes", len(out_json.encode("utf-8")))
+        return out_json
 
     # ---------------- main entry ----------------
 
     def ask_with_planning(self, query: str, max_iters: int = 10, analysis_only: bool = False) -> str:
-        """
-        High-level: try fast-path direct actions; else plan + execute.
-        """
+        """High-level: try fast-path direct actions; else plan + execute."""
         direct = self._try_direct_actions(query)
         if direct is not None:
+            logger.info("ask_with_planning → served via direct path")
             return direct
 
         plan = self.analyze_and_plan(query)
+        logger.debug("ask_with_planning: executing plan of {} step(s)", len(plan or []))
         return self.execute_plan(plan, max_iters, analysis_only=analysis_only)

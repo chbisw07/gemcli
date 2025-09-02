@@ -1,4 +1,6 @@
 # tools/registry.py
+from __future__ import annotations
+
 import re
 import difflib
 import json
@@ -6,6 +8,8 @@ import shutil
 from pathlib import Path
 from functools import lru_cache
 from typing import Optional, Any, Callable, Iterable, List, Dict
+from loguru import logger
+from logging_decorators import log_call
 
 # Optional: direct command parser hook (safe to keep even if unused)
 try:
@@ -26,8 +30,9 @@ class ToolRegistry:
     def __init__(self, project_root: str):
         self.root = Path(project_root).resolve()
         self.tools: Dict[str, Callable[..., Any]] = {}
+        logger.info("ToolRegistry init → root='{}'", str(self.root))
         self._register_builtin_tools()
-
+        logger.info("ToolRegistry ready with {} tool(s)", len(self.tools))
 
     # ----- same resolver pattern as Enhanced registry -----
     def _rel(self, p: Path) -> str:
@@ -35,11 +40,15 @@ class ToolRegistry:
 
     @lru_cache(maxsize=4096)
     def _all_files_named(self, name: str) -> list[Path]:
-        return [p for p in self.root.rglob(name)]
+        matches = [p for p in self.root.rglob(name)]
+        logger.debug("_all_files_named('{}') → {} match(es)", name, len(matches))
+        return matches
 
     @lru_cache(maxsize=1)
     def _all_py_files(self) -> list[Path]:
-        return [p for p in self.root.rglob("*.py")]
+        files = [p for p in self.root.rglob("*.py")]
+        logger.debug("_all_py_files() → {} file(s)", len(files))
+        return files
 
     def _resolve_path(self, path: str, subdir: str = "") -> Optional[str]:
         if not path:
@@ -48,37 +57,71 @@ class ToolRegistry:
         if subdir:
             cand = (self.root / subdir / path)
             if cand.exists():
-                return self._rel(cand)
+                rel = self._rel(cand)
+                logger.debug("_resolve_path: subdir hit → {}", rel)
+                return rel
         cand = (self.root / path)
         if cand.exists():
-            return self._rel(cand)
+            rel = self._rel(cand)
+            logger.debug("_resolve_path: direct hit → {}", rel)
+            return rel
         name = Path(path).name
         matches = self._all_files_named(name)
         if matches:
             if subdir:
                 under = [p for p in matches if (self.root / subdir) in p.parents]
                 if under:
-                    return self._rel(under[0])
+                    rel = self._rel(under[0])
+                    logger.debug("_resolve_path: filename hit under subdir → {}", rel)
+                    return rel
             best = sorted(matches, key=lambda p: len(self._rel(p)))[0]
-            return self._rel(best)
+            rel = self._rel(best)
+            logger.debug("_resolve_path: filename hit → {}", rel)
+            return rel
         tail = path.replace("\\", "/")
         for p in self._all_py_files():
             if str(p).replace("\\", "/").endswith(tail):
-                return self._rel(p)
+                rel = self._rel(p)
+                logger.debug("_resolve_path: endswith hit → {}", rel)
+                return rel
+        logger.debug("_resolve_path: not found '{}'", path)
         return None
-    
+
     # ---------------- registration & dispatch ----------------
 
     def _register(self, name: str, fn: Callable):
-        self.tools[name] = fn
+        # optional per-tool summaries for cleaner logs
+        summarize = None
+        if name == "search_code":
+            summarize = lambda ret: {"hits": len(ret) if isinstance(ret, list) else None}
+        elif name == "replace_in_file":
+            summarize = lambda ret: {"replacements": ret.get("replacements")} if isinstance(ret, dict) else {}
+        elif name == "format_python_files":
+            summarize = lambda ret: {"changed_files": len(ret.get("changed", {}))} if isinstance(ret, dict) else {}
 
+        wrapped = log_call(
+            name,
+            slow_ms=1000,
+            redact={"api_key", "authorization"},
+            summarize=summarize
+        )(fn)
+        self.tools[name] = wrapped
+        logger.debug("Registered tool '{}'", name)
+    
     def call(self, name: str, **kwargs) -> Any:
         if name not in self.tools:
+            logger.error("call: tool '{}' not registered", name)
             raise ValueError(f"Tool '{name}' is not registered.")
+        logger.info("call('{}') args_keys={}", name, list(kwargs.keys()))
         return self.tools[name](**kwargs)
 
     def try_direct(self, query: str) -> Optional[dict]:
-        return try_direct_actions(query, self.root)
+        res = try_direct_actions(query, self.root)
+        if res:
+            logger.info("try_direct matched → {}", res.get("tool"))
+        else:
+            logger.debug("try_direct: no match")
+        return res
 
     # -------------------- built-in tools ---------------------
 
@@ -87,8 +130,11 @@ class ToolRegistry:
         def read_file(path: str) -> str:
             p = self.root / path
             if not p.exists() or not p.is_file():
+                logger.error("read_file: not found '{}'", path)
                 raise FileNotFoundError(f"Not found: {path}")
-            return p.read_text(encoding="utf-8", errors="ignore")
+            text = p.read_text(encoding="utf-8", errors="ignore")
+            logger.info("read_file: '{}' bytes={}", path, len(text.encode("utf-8")))
+            return text
 
         # ---------- list_files ----------
         def list_files(
@@ -103,6 +149,7 @@ class ToolRegistry:
             """
             target = self.root / (subdir or "")
             if not target.exists():
+                logger.debug("list_files: subdir not found '{}'", subdir)
                 return []
             if exts is None:
                 exts = [".py"]
@@ -117,6 +164,7 @@ class ToolRegistry:
                     continue
                 if p.suffix in exts:
                     out.append(rel)
+            logger.info("list_files: subdir='{}' exts={} → {}", subdir, list(exts), len(out))
             return sorted(out)
 
         # ---------- search_code ----------
@@ -133,6 +181,7 @@ class ToolRegistry:
             """
             target = self.root / (subdir or "")
             if not target.exists():
+                logger.debug("search_code: subdir not found '{}'", subdir)
                 return []
             if exts is None:
                 exts = [".py"]
@@ -155,7 +204,10 @@ class ToolRegistry:
                         if (query if case_sensitive else query.lower()) in (line if case_sensitive else line.lower()):
                             results.append({"file": str(path.relative_to(self.root)), "line": i, "text": line.rstrip()})
                     if len(results) >= max_results:
+                        logger.info("search_code: capped at max_results={} (more hits exist)", max_results)
                         return results
+            logger.info("search_code: '{}' hits={} subdir='{}' regex={} case_sensitive={}",
+                        query, len(results), subdir, regex, case_sensitive)
             return results
 
         # ---------- write_file ----------
@@ -173,17 +225,20 @@ class ToolRegistry:
             p.parent.mkdir(parents=True, exist_ok=True)
             existed = p.exists()
             if existed and not overwrite:
+                logger.error("write_file: exists and overwrite=False '{}'", path)
                 raise FileExistsError(f"File exists: {path}")
             if existed and backup:
                 bak = p.with_suffix(p.suffix + ".bak")
                 shutil.copyfile(p, bak)
             p.write_text(content, encoding="utf-8")
-            return {
+            res = {
                 "path": str(p.relative_to(self.root)),
                 "bytes_written": len(content.encode("utf-8")),
                 "overwrote": existed,
                 "backup": bool(existed and backup),
             }
+            logger.info("write_file: {}", res)
+            return res
 
         # ---------- replace_in_file ----------
         def replace_in_file(
@@ -199,7 +254,9 @@ class ToolRegistry:
             """
             resolved = self._resolve_path(path)
             if not resolved:
-                return {"error": f"File not found under {self.root}: {path}", "path": path}
+                msg = {"error": f"File not found under {self.root}: {path}", "path": path}
+                logger.error("replace_in_file: {}", msg["error"])
+                return msg
             p = self.root / resolved
             original = p.read_text(encoding="utf-8", errors="ignore")
             pattern = find if regex else re.escape(find)
@@ -218,12 +275,14 @@ class ToolRegistry:
                     bak = p.with_suffix(p.suffix + ".bak")
                     bak.write_text(original, encoding="utf-8")
                 p.write_text(new_text, encoding="utf-8")
-            return {
+            res = {
                 "path": str(p.relative_to(self.root)),
                 "replacements": len(matches),
                 "dry_run": bool(dry_run),
                 "diff": diff,
             }
+            logger.info("replace_in_file: path='{}' replacements={} dry_run={}", res["path"], res["replacements"], res["dry_run"])
+            return res
 
         # ---------- format_python_files ----------
         def format_python_files(
@@ -238,9 +297,11 @@ class ToolRegistry:
             try:
                 import black  # type: ignore
             except Exception:
+                logger.error("format_python_files: Black not installed")
                 raise RuntimeError("Black is not installed. `pip install black` to use format_python_files.")
             target = self.root / (subdir or "")
             if not target.exists():
+                logger.debug("format_python_files: subdir not found '{}'", subdir)
                 return {}
             changed: Dict[str, dict] = {}
             mode = black.Mode(line_length=line_length)
@@ -267,6 +328,7 @@ class ToolRegistry:
                             )
                         )
                     }
+            logger.info("format_python_files: changed={} dry_run={} subdir='{}'", len(changed), dry_run, subdir)
             return changed
 
         # ---------- scan_relevant_files ----------
@@ -281,6 +343,7 @@ class ToolRegistry:
             """
             base = self.root / (path or "")
             if not base.exists():
+                logger.debug("scan_relevant_files: base not found '{}'", path)
                 return []
             if exts is None:
                 exts = [".py"]
@@ -302,7 +365,9 @@ class ToolRegistry:
                 if score > 0:
                     hits.append({"path": str(p.relative_to(self.root)), "score": score})
             hits.sort(key=lambda x: (-x["score"], x["path"]))
-            return hits[:max_results]
+            out = hits[:max_results]
+            logger.info("scan_relevant_files: terms={} hits={} path='{}'", len(terms), len(out), path)
+            return out
 
         # ---------- analyze_files ----------
         def analyze_files(paths: List[str], max_bytes: int = 8000) -> List[dict]:
@@ -328,6 +393,7 @@ class ToolRegistry:
                         "tail": tail[: max_bytes // 2],
                     }
                 )
+            logger.info("analyze_files: {} file(s)", len(out))
             return out
 
         # ---------- bulk_edit ----------
@@ -341,10 +407,12 @@ class ToolRegistry:
             Returns a list of {path, replacements, dry_run, diff, [error]}.
             """
             results: List[dict] = []
+            ok = fail = 0
             for e in edits or []:
                 rel = e.get("path")
                 if not rel:
                     results.append({"path": rel or "", "error": "missing path"})
+                    fail += 1
                     continue
                 try:
                     res = replace_in_file(
@@ -356,8 +424,12 @@ class ToolRegistry:
                         backup=backup,
                     )
                     results.append(res)
+                    ok += 1 if "error" not in res else 0
+                    fail += 1 if "error" in res else 0
                 except Exception as ex:
                     results.append({"path": rel, "error": str(ex), "dry_run": dry_run})
+                    fail += 1
+            logger.info("bulk_edit: edits={} ok={} fail={} dry_run={}", len(edits or []), ok, fail, dry_run)
             return results
 
         # ---------- rewrite_naive_open ----------
@@ -379,15 +451,14 @@ class ToolRegistry:
             exts = tuple(exts)
             base = self.root / (dir or ".")
             if not base.exists():
+                logger.debug("rewrite_naive_open: base not found '{}'", dir)
                 return []
 
             results: List[dict] = []
-            # Regex to catch '<var> = open(...)' allowing inline comments
-            open_re = re.compile(
-                r"""^\s*(?P<var>[A-Za-z_]\w*)\s*=\s*open\((?P<args>.+)\)\s*(#.*)?$"""
-            )
+            open_re = re.compile(r"""^\s*(?P<var>[A-Za-z_]\w*)\s*=\s*open\((?P<args>.+)\)\s*(#.*)?$""")
             close_re_tpl = r"""^\s*{var}\.close\(\)\s*(#.*)?$"""
 
+            changed_files = 0
             for p in sorted(base.rglob("*")):
                 if not p.is_file() or p.suffix not in exts:
                     continue
@@ -456,10 +527,11 @@ class ToolRegistry:
                         "diff": diff,
                     }
                 )
+                changed_files += 1
+            logger.info("rewrite_naive_open: changed_files={} dir='{}' dry_run={}", changed_files, dir, dry_run)
             return results
 
         # -------------------- register everything --------------------
-
         self._register("read_file", read_file)
         self._register("list_files", list_files)
         self._register("search_code", search_code)
@@ -474,21 +546,14 @@ class ToolRegistry:
     # --------------- OpenAI tool schema (function-calling) ---------------
 
     def schemas_openai(self) -> List[dict]:
-        """
-        Advertise tools in OpenAI function-calling format so compatible models
-        can emit native tool_calls. This mirrors names/params in this registry.
-        """
-        return [
+        """Expose tools for OpenAI function-calling models."""
+        schemas = [
             {
                 "type": "function",
                 "function": {
                     "name": "read_file",
                     "description": "Read a text file at a relative path.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {"path": {"type": "string"}},
-                        "required": ["path"],
-                    },
+                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
                 },
             },
             {
@@ -569,11 +634,7 @@ class ToolRegistry:
                     "description": "Run Black formatter over Python files.",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "subdir": {"type": "string"},
-                            "line_length": {"type": "integer"},
-                            "dry_run": {"type": "boolean"},
-                        },
+                        "properties": {"subdir": {"type": "string"}, "line_length": {"type": "integer"}, "dry_run": {"type": "boolean"}},
                         "required": [],
                     },
                 },
@@ -585,12 +646,7 @@ class ToolRegistry:
                     "description": "Heuristically score files relevant to a prompt.",
                     "parameters": {
                         "type": "object",
-                        "properties": {
-                            "prompt": {"type": "string"},
-                            "path": {"type": "string"},
-                            "max_results": {"type": "integer"},
-                            "exts": {"type": "array", "items": {"type": "string"}},
-                        },
+                        "properties": {"prompt": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}, "exts": {"type": "array", "items": {"type": "string"}}},
                         "required": [],
                     },
                 },
@@ -600,14 +656,7 @@ class ToolRegistry:
                 "function": {
                     "name": "analyze_files",
                     "description": "Summarize basic stats and small snippets for specific files.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "paths": {"type": "array", "items": {"type": "string"}},
-                            "max_bytes": {"type": "integer"},
-                        },
-                        "required": ["paths"],
-                    },
+                    "parameters": {"type": "object", "properties": {"paths": {"type": "array", "items": {"type": "string"}}, "max_bytes": {"type": "integer"}}, "required": ["paths"]},
                 },
             },
             {
@@ -615,15 +664,7 @@ class ToolRegistry:
                 "function": {
                     "name": "bulk_edit",
                     "description": "Apply multiple find/replace edits across files.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "edits": {"type": "array", "items": {"type": "object"}},
-                            "dry_run": {"type": "boolean"},
-                            "backup": {"type": "boolean"},
-                        },
-                        "required": ["edits"],
-                    },
+                    "parameters": {"type": "object", "properties": {"edits": {"type": "array", "items": {"type": "object"}}, "dry_run": {"type": "boolean"}, "backup": {"type": "boolean"}}, "required": ["edits"]},
                 },
             },
             {
@@ -631,16 +672,9 @@ class ToolRegistry:
                 "function": {
                     "name": "rewrite_naive_open",
                     "description": "Convert simple open()/close() pairs into with-open blocks.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "dir": {"type": "string"},
-                            "exts": {"type": "array", "items": {"type": "string"}},
-                            "dry_run": {"type": "boolean"},
-                            "backup": {"type": "boolean"},
-                        },
-                        "required": [],
-                    },
+                    "parameters": {"type": "object", "properties": {"dir": {"type": "string"}, "exts": {"type": "array", "items": {"type": "string"}}, "dry_run": {"type": "boolean"}, "backup": {"type": "boolean"}}, "required": []},
                 },
             },
         ]
+        logger.debug("schemas_openai: {} tool schema(s)", len(schemas))
+        return schemas

@@ -1,7 +1,11 @@
+# indexing/chunkers/text.py
 import os, hashlib
+from loguru import logger
+
 def _sha(s: str): import hashlib; return hashlib.sha1(s.encode("utf-8","ignore")).hexdigest()
 
 def chunk(file_path: str, cfg: dict):
+    logger.debug("text.chunk: begin '{}'", file_path)
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         t = f.read()
     maxc = int(cfg["chunking"]["text"]["max_chars"])
@@ -16,4 +20,5 @@ def chunk(file_path: str, cfg: dict):
             "metadata": {"file_path": rel, "symbol_kind": "text", "qualified_name": f"{rel}:chunk@{i}"}
         })
         i += max(1, maxc - ov)
+    logger.debug("text.chunk: done chars={} chunks={} maxc={} overlap={}", len(t), len(out), maxc, ov)
     return out

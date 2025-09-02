@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 
+# --- Logging (global) ---
+import logging_setup  # NEW
+from loguru import logger
+logging_setup.configure_logging()  # default INFO (can flip via env or UI below)
+
 import streamlit as st
 import graphviz  # pip install graphviz
 
@@ -21,32 +26,35 @@ try:
     from config_home import project_rag_dir, GLOBAL_RAG_PATH, UI_SETTINGS_PATH  # already present if you used my file
     from indexing.settings import load as load_rag, save as save_rag
     from indexing.indexer import full_reindex, delta_index
-except Exception:
+except Exception as e:
     # Soft fallback if helper not yet present; keeps app runnable
     HOME = Path(os.path.expanduser("~")) / ".gencli"
     HOME.mkdir(parents=True, exist_ok=True)
     UI_SETTINGS_PATH = HOME / "ui_settings.json"
     GLOBAL_RAG_PATH = HOME / "rag.json"
+    logger.warning("Config/import fallback enabled: {}", e)
 
 # --- Import your existing modules (unchanged) ---
-from models import ModelRegistry  # :contentReference[oaicite:4]{index=4}
+from models import ModelRegistry
 from tools.registry import ToolRegistry
 from agent import Agent
 
 # Enhanced (optional)
 try:
-    from tools.enhanced_registry import EnhancedToolRegistry  # :contentReference[oaicite:5]{index=5}
+    from tools.enhanced_registry import EnhancedToolRegistry
     from reasoning_agent import ReasoningAgent
     ENHANCED_AVAILABLE = True
-except Exception:
+except Exception as e:
     ENHANCED_AVAILABLE = False
     EnhancedToolRegistry = None
     ReasoningAgent = None  # type: ignore
+    logger.info("Enhanced toolchain unavailable: {}", e)
 
 import intents
 
 # Force load from gemcli/.env no matter where you launch from
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+logger.info("Environment loaded from .env at {}", str((Path(__file__).parent / ".env").resolve()))
 
 # ---------- Small helpers ----------
 APP_TITLE = "gemcli — Code Assistant"
@@ -61,17 +69,31 @@ EDIT_TOOLS = {
 
 
 def _load_models(config_path: str):
+    logger.info("Loading models from config='{}'", config_path)
     registry = ModelRegistry(config_path)  # reads models.json
-    return registry, registry.list()
+    models = registry.list()
+    logger.info("Models loaded: {} (default='{}')", len(models), registry.default_name)
+    for m in models:
+        logger.debug(
+            "Model: name='{}' provider='{}' endpoint='{}' model='{}' tags={}",
+            m.name, m.provider, m.endpoint, m.model, m.tags
+        )
+    return registry, models
 
 
 def _make_tools(project_root: str, enhanced: bool):
+    logger.info("Building ToolRegistry (enhanced={}): root='{}'", enhanced, project_root)
     if enhanced and ENHANCED_AVAILABLE:
         return EnhancedToolRegistry(project_root)  # wraps ToolRegistry under the hood
     return ToolRegistry(project_root)
 
 
 def _make_agent(model, tools, enhanced: bool, enable_tools: bool):
+    logger.info(
+        "Creating agent: class='{}' tools_enabled={} enhanced={}",
+        "ReasoningAgent" if (enhanced and ENHANCED_AVAILABLE) else "Agent",
+        enable_tools, enhanced
+    )
     if enhanced and ENHANCED_AVAILABLE:
         return ReasoningAgent(model, tools, enable_tools=enable_tools)
     return Agent(model, tools, enable_tools=enable_tools)
@@ -91,7 +113,10 @@ def _ensure_index_ready(project_root: str, rag_path: str, embedder_name: Optiona
       - Else -> delta_index
     """
     if not auto:
+        logger.info("Auto-index disabled; skipping index preflight")
         return
+
+    logger.info("Auto-index preflight: project_root='{}' rag_path='{}' embedder='{}'", project_root, rag_path, embedder_name)
 
     # 1) Mirror embedder into rag.json so indexer resolves the same embedder the UI shows
     try:
@@ -100,26 +125,35 @@ def _ensure_index_ready(project_root: str, rag_path: str, embedder_name: Optiona
         if embedder_name:
             cfg["embedder"]["selected_name"] = embedder_name
         save_rag(rag_path, cfg)
+        logger.info("Mirrored embedder into rag.json: selected_name='{}'", embedder_name)
     except Exception as e:
+        logger.error("RAG config sync failed: {}", e)
         st.warning(f"RAG config sync failed: {e}")
 
     # 2) Decide: full vs delta based on per-project RAG dir contents
     rag_dir = project_rag_dir(project_root)
     try:
         exists_and_has_files = rag_dir.exists() and any(rag_dir.iterdir())
-    except Exception:
+        logger.debug("RAG dir='{}' exists_and_has_files={}", str(rag_dir), exists_and_has_files)
+    except Exception as e:
         exists_and_has_files = False
+        logger.warning("Failed to inspect RAG dir='{}': {}", str(rag_dir), e)
 
     try:
         if not exists_and_has_files:
+            logger.info("Auto-index → full_reindex() starting…")
             with st.spinner("Auto-index: creating fresh index…"):
                 res = full_reindex(project_root, rag_path)
-                st.caption({"auto_index_full": res})
+            logger.info("Auto-index full completed: {}", res)
+            st.caption({"auto_index_full": res})
         else:
+            logger.info("Auto-index → delta_index() starting…")
             with st.spinner("Auto-index: updating index (delta)…"):
                 res = delta_index(project_root, rag_path)
-                st.caption({"auto_index_delta": res})
+            logger.info("Auto-index delta completed: {}", res)
+            st.caption({"auto_index_delta": res})
     except Exception as e:
+        logger.exception("Auto-index preflight failed: {}", e)
         st.warning(f"Auto-index preflight failed: {e}")
 
 def _extract_diffs(tool_result: Any) -> List[Dict[str, str]]:
@@ -142,6 +176,7 @@ def _extract_diffs(tool_result: Any) -> List[Dict[str, str]]:
         for item in tool_result:
             if isinstance(item, dict) and "diff" in item:
                 diffs.append({"path": item.get("path", ""), "diff": item.get("diff", "")})
+    logger.debug("Extracted {} diff(s) from tool result", len(diffs))
     return diffs
 
 
@@ -167,7 +202,9 @@ def _looks_like_tool_blob(text: str):
 
     # 3) Try direct JSON
     try:
-        return json.loads(right)
+        obj = json.loads(right)
+        logger.debug("Parsed tool blob via json.loads")
+        return obj
     except Exception:
         pass
 
@@ -178,14 +215,19 @@ def _looks_like_tool_blob(text: str):
 
         # 4a) JSON first
         try:
-            return json.loads(candidate)
+            obj = json.loads(candidate)
+            logger.debug("Parsed embedded JSON block from assistant content")
+            return obj
         except Exception:
             pass
 
         # 4b) Last resort: Python literal (handles single quotes/None/etc.)
         try:
-            return ast.literal_eval(candidate)
+            obj = ast.literal_eval(candidate)
+            logger.debug("Parsed tool blob via ast.literal_eval fallback")
+            return obj
         except Exception:
+            logger.debug("Failed to parse assistant content as tool blob")
             return None
 
     return None
@@ -214,8 +256,10 @@ def _maybe_render_dot_from_text(text: str) -> bool:
 
     try:
         st.graphviz_chart(dot)  # streamlit renderer
+        logger.debug("Rendered DOT graph from assistant text")
         return True
-    except Exception:
+    except Exception as e:
+        logger.warning("Graph render failed from text: {}", e)
         return False
 
 
@@ -227,8 +271,9 @@ def _maybe_render_graph(result: Any):
         if isinstance(result, dict) and "dot" in result and isinstance(result["dot"], str):
             st.markdown("### Call Graph")
             st.graphviz_chart(result["dot"])
+            logger.debug("Rendered DOT graph from tool result")
     except Exception as e:
-        st.warning(f"Graph render failed: {e}")
+        logger.warning("Graph render failed from tool result: {}", e)
 
 
 # Nice visualizer for call-graph payloads
@@ -261,6 +306,7 @@ def _render_call_graph_payload(result: Any) -> bool:
         st.markdown("#### Direct callees")
         rows = [{"name": c.get("name"), "defined_in": c.get("defined_in")} for c in calls]
         st.table(rows)
+        logger.debug("Rendered call graph table with {} rows", len(rows))
 
     # Graph (DOT)
     _maybe_render_graph(result)
@@ -270,29 +316,41 @@ def _render_call_graph_payload(result: Any) -> bool:
 # ---------- UI settings (global) ----------
 def _load_ui_settings() -> dict:
     try:
-        return json.loads(UI_SETTINGS_PATH.read_text(encoding="utf-8"))
-    except Exception:
+        d = json.loads(UI_SETTINGS_PATH.read_text(encoding="utf-8"))
+        logger.debug("Loaded UI settings from '{}'", str(UI_SETTINGS_PATH))
+        return d
+    except Exception as e:
+        logger.info("UI settings load failed (will use defaults): {}", e)
         return {}
 
 
 def _save_ui_settings(d: dict) -> None:
     try:
         UI_SETTINGS_PATH.write_text(json.dumps(d, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+        logger.debug("Saved UI settings to '{}'", str(UI_SETTINGS_PATH))
+    except Exception as e:
+        logger.warning("Failed to save UI settings: {}", e)
 
 
 # ---------- Streamlit UI ----------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
+logger.info("Streamlit app started: {}", APP_TITLE)
 
 with st.sidebar:
     st.subheader("Configuration")
+
+    # ---- Log level control (UI) ----
+    log_level = st.selectbox("Log level", ["INFO", "DEBUG", "WARNING", "ERROR"], index=0, help="Affects both console and file sinks.")
+    logging_setup.set_level(log_level)
+    logger.info("Log level set via UI → {}", log_level)
+
     ui = _load_ui_settings()
 
     # Paths
     default_root = str(Path.cwd().parent / "scv2" / "backend")
     project_root = st.text_input("Project root (--root)", value=default_root)
+    logger.info("Project root selected: '{}'", project_root)
 
     # -----------------------------
     # RAG / Indexing controls (global rag.json)
@@ -309,6 +367,7 @@ with st.sidebar:
         key="rag_auto_index",
     )
     ui["rag_auto_index"] = st.session_state["rag_auto_index"]
+    logger.info("Auto indexing: {}", bool(ui["rag_auto_index"]))
 
     # Manual full reindex
     if st.button("Reindex now (full)"):
@@ -321,20 +380,25 @@ with st.sidebar:
                 if emb_name:
                     cfg["embedder"]["selected_name"] = emb_name
                 save_rag(RAG_PATH, cfg)
+                logger.info("Manual full reindex triggered (embedder='{}')", emb_name)
 
                 res = full_reindex(project_root, RAG_PATH)
                 st.success(f"Reindex complete. Added chunks: {res.get('added')}")
                 st.caption(res)
+                logger.info("Manual full reindex completed: {}", res)
             except Exception as e:
                 st.error(f"Reindex failed: {e}")
+                logger.exception("Manual full reindex failed: {}", e)
 
     # Edit RAG settings (global)
     with st.expander("Edit RAG settings (global)", expanded=False):
         try:
             cfg = load_rag(RAG_PATH)
+            logger.debug("Loaded rag.json from '{}'", RAG_PATH)
         except Exception as e:
             cfg = None
             st.error(f"Failed to load rag.json: {e}")
+            logger.error("Failed to load rag.json: {}", e)
         if cfg is not None:
             st.caption(f"Path: `{RAG_PATH}`")
             rag_text = st.text_area(
@@ -346,15 +410,19 @@ with st.sidebar:
                     try:
                         save_rag(RAG_PATH, json.loads(rag_text))
                         st.success("Saved. Re-run app to apply.")
+                        logger.info("rag.json saved")
                     except Exception as e:
                         st.error(f"Invalid JSON: {e}")
+                        logger.error("rag.json save failed: {}", e)
             with colB:
                 if st.button("Reload from disk"):
+                    logger.info("Rerun requested (reload rag.json)")
                     st.experimental_rerun()
 
     # Model config file
     default_cfg = str(Path("data") / "models.json")
     models_config = st.text_input("Model config (--config)", value=default_cfg)
+    logger.info("Model config path selected: '{}'", models_config)
 
     # Load LLM models (from models.json) and select one
     try:
@@ -375,8 +443,13 @@ with st.sidebar:
         ui["llm_model"] = chosen_model_name
         model = model_registry.get(chosen_model_name)
         st.caption(f"Provider: {model.provider}  •  Endpoint: {model.endpoint}")
+        logger.info(
+            "Model selected: name='{}' provider='{}' endpoint='{}' resolved='{}'",
+            model.name, model.provider, model.endpoint, model.resolved_model()
+        )
     except Exception as e:
         st.error(f"Failed to load models: {e}")
+        logger.exception("Failed to load models: {}", e)
         st.stop()
 
     # Embedding selector (from data/models.json → embedding_models)
@@ -390,8 +463,9 @@ with st.sidebar:
             or _models_cfg.get("default_embedding_model")
             or (emb_names[0] if emb_names else "")
         )
-    except Exception:
+    except Exception as e:
         emb_list, emb_names, default_emb_name = [], [], ""
+        logger.warning("Embedding models not found in '{}': {}", models_config, e)
 
     if emb_names:
         chosen_emb_name = st.selectbox(
@@ -410,19 +484,21 @@ with st.sidebar:
             cfg.setdefault("embedder", {})
             cfg["embedder"]["selected_name"] = chosen_emb_name
             save_rag(RAG_PATH, cfg)
+            logger.info("Embedder selected: '{}'", chosen_emb_name)
+            try:
+                emb_entry = next(e for e in emb_list if e["name"] == chosen_emb_name)
+                logger.info(
+                    "Embedder details: provider='{}' endpoint='{}'",
+                    emb_entry.get('provider','?'), emb_entry.get('endpoint','?')
+                )
+            except Exception:
+                pass
         except Exception as _e:
-            pass
-
-        # Quick details
-        try:
-            emb_entry = next(e for e in emb_list if e["name"] == chosen_emb_name)
-            st.caption(
-                f"Embedder → Provider: {emb_entry.get('provider','?')} • Endpoint: {emb_entry.get('endpoint','?')}"
-            )
-        except Exception:
+            logger.error("Failed to mirror embedder into rag.json: {}", _e)
             pass
     else:
         st.info("No embedding models found in models.json.")
+        logger.info("No embedding models available in config")
 
     # Flags
     enable_tools = st.checkbox("Enable tools (default on)", value=True)
@@ -436,6 +512,8 @@ with st.sidebar:
         value=False,
         disabled=not ENHANCED_AVAILABLE,
     )
+    logger.info("Flags: enable_tools={} enhanced={} plan_mode={}", enable_tools, enhanced, plan_mode)
+
     max_iters = st.number_input(
         "Max tool iters (--max-iters)",
         min_value=1,
@@ -445,12 +523,14 @@ with st.sidebar:
     )
     analysis_only = st.checkbox("Analysis-only (no writes)", value=bool(ui.get("analysis_only", True)))
     ui["analysis_only"] = analysis_only
+    logger.info("Execution params: max_iters={} analysis_only={}", max_iters, analysis_only)
 
     callgraph_depth = st.number_input(
         "Call graph depth (0 = full)", min_value=0, max_value=10, value=int(ui.get("callgraph_depth", 3)), step=1
     )
     st.session_state["callgraph_depth"] = callgraph_depth
     ui["callgraph_depth"] = callgraph_depth
+    logger.info("Call graph depth set to {}", callgraph_depth)
 
     # Persist UI choices
     _save_ui_settings(ui)
@@ -458,6 +538,7 @@ with st.sidebar:
     # Build runtime objects (once)
     rt_key = (project_root, enhanced, enable_tools, chosen_model_name)
     if "rt_built" not in st.session_state or st.session_state.get("rt_key") != rt_key:
+        logger.info("Building runtime objects (new session key={})", rt_key)
         tools = _make_tools(project_root, enhanced)
         agent = _make_agent(model, tools, enhanced, enable_tools)
         st.session_state["tools"] = tools
@@ -496,6 +577,7 @@ with colR:
 st.markdown("### Activity / Thinking")
 if clear_log:
     st.session_state["log_lines"] = []
+    logger.info("UI log cleared by user")
 log_container = st.container(border=True)
 with log_container:
     for line in st.session_state["log_lines"]:
@@ -506,6 +588,8 @@ def log(line: str):
     st.session_state["log_lines"].append(line)
     with log_container:
         st.markdown(line)
+    # Mirror to Loguru as well:
+    logger.info("[UI] {}", line)
 
 
 # ------------ Planning ------------
@@ -517,7 +601,9 @@ def render_plan(plan_steps: List[Dict[str, Any]]):
     st.markdown("### Execution Plan")
     if not plan_steps:
         st.info("No plan.")
+        logger.info("No plan generated")
         return
+    logger.info("Rendering plan with {} step(s)", len(plan_steps))
     for i, step in enumerate(plan_steps, 1):
         with st.expander(
             f"Step {i}: {step.get('tool','(no tool)')} — {step.get('description','')}",
@@ -534,16 +620,20 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
     applied_payloads = []  # track {tool,args} for potential Apply
     discovered_files: List[str] = []  # accumulate file paths from discovery steps
     effective_preview = preview_only or analysis_only  # force dry-run if analysis_only
+    logger.info("Executing plan: steps={} analysis_only={} preview={}", len(plan_steps or []), analysis_only, effective_preview)
 
     for i, step in enumerate(plan_steps, 1):
         if "error" in step:
-            log(f"❌ Plan step {i} error: {step['error']}")
+            msg = f"❌ Plan step {i} error: {step['error']}"
+            log(msg)
+            logger.error("Plan step {} error: {}", i, step["error"])
             results.append({"step": i, "error": step["error"], "success": False})
             continue
 
         tool_name = step.get("tool")
         args = dict(step.get("args", {}))
         desc = step.get("description", "")
+        logger.info("Plan step {}: tool='{}' desc='{}' args={}", i, tool_name, desc, args)
 
         # Impose preview for edit-capable tools
         if effective_preview and tool_name in EDIT_TOOLS:
@@ -562,6 +652,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
                 pass
             if analysis_only:
                 args["_analysis_only_blocked"] = True
+            logger.debug("Preview enforced for edit tool='{}' args={}", tool_name, args)
 
         try:
             log(f"🛠️ Executing step {i}: **{tool_name}** with args `{args}`")
@@ -569,8 +660,9 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
             # Inject UI depth into call_graph_for_function
             if tool_name == "call_graph_for_function":
                 args.setdefault("depth", st.session_state.get("callgraph_depth", 3))
+                logger.debug("call_graph depth set to {}", args["depth"])
 
-            # Opportunistic binding: if analyze/detect_errors has a placeholder path, patch it
+            # Opportunistic binding for analyze/detect_errors
             if tool_name in {"analyze_code_structure", "detect_errors"}:
                 p = args.get("path")
                 if isinstance(p, str) and (
@@ -580,6 +672,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
                 ):
                     if discovered_files:
                         args["path"] = discovered_files[0]
+                        logger.debug("Bound analyze/detect path to '{}'", args["path"])
 
             res = tools.call(tool_name, **args)
             results.append(
@@ -592,6 +685,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
                     "description": desc,
                 }
             )
+            logger.info("Tool '{}' executed OK (step {})", tool_name, i)
 
             # Collect discovered files from search results (best-effort)
             if tool_name == "search_code" and isinstance(res, list):
@@ -599,6 +693,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
                     f = r.get("file") if isinstance(r, dict) else None
                     if isinstance(f, str):
                         discovered_files.append(f)
+                logger.debug("Discovered {} file(s) from search_code", len(discovered_files))
 
             # Record applicable edits (for later Apply), but not in analysis-only mode
             if tool_name in EDIT_TOOLS and not analysis_only:
@@ -620,6 +715,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
 
         except Exception as e:
             log(f"❌ Step {i} failed: {e}")
+            logger.exception("Step {} failed: {}", i, e)
             results.append(
                 {
                     "step": i,
@@ -633,15 +729,21 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
 
     st.session_state["last_results"] = results
     st.session_state["last_edit_payloads"] = applied_payloads
+    logger.info("Plan execution finished: steps={} success={} fail={}",
+                len(results),
+                sum(1 for r in results if r.get("success")),
+                sum(1 for r in results if not r.get("success")))
     return results
 
 
 # ------------ Main actions ------------
 if do_execute:
     if prompt.strip():
+        logger.info("Run clicked: prompt='{}' plan_mode={} enhanced={} analysis_only={}",
+                    prompt.strip()[:200], bool(st.session_state.get("rag_auto_index", True)) and False,  # placeholder
+                    ENHANCED_AVAILABLE, bool(st.session_state.get("analysis_only", True)))
         # Before planning/asking, make sure index is ready if user enabled auto indexing
         try:
-            # Use your selected project root and global rag.json (for now)
             _ensure_index_ready(
                 project_root=project_root,
                 rag_path=str(GLOBAL_RAG_PATH),
@@ -649,6 +751,7 @@ if do_execute:
                 auto=bool(st.session_state.get("rag_auto_index", True)),
             )
         except Exception as e:
+            logger.warning("Auto-index preflight skipped due to error: {}", e)
             st.warning(f"Auto-index preflight skipped due to error: {e}")
 
         # Two modes:
@@ -657,55 +760,29 @@ if do_execute:
         if plan_mode and ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
             if not st.session_state.get("last_plan"):
                 log("🧭 Creating plan (no existing plan found)...")
+                logger.info("Planning…")
                 st.session_state["last_plan"] = agent.analyze_and_plan(prompt)
             render_plan(st.session_state["last_plan"])
             st.markdown("---")
             log("🚀 Executing plan...")
+            logger.info("Executing planned steps…")
             results = execute_plan(st.session_state["last_plan"], analysis_only=analysis_only)
 
             # ---------- Final Report (natural language) ----------
-            # Prefer agent-side summarization if you later add it; otherwise synthesize here
             report_text = None
             try:
-                # synth_prompt = (
-                #     "Synthesize a concise, actionable report from these execution results.\n"
-                #     "Focus strictly on:\n"
-                #     "1) Root cause(s)\n"
-                #     "2) Supporting evidence with file/line where possible\n"
-                #     "3) Risks/unknowns\n"
-                #     "4) Recommended fix steps (do NOT write or apply code)\n\n"
-                #     f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
-                # )
-
                 results_json = json.dumps(results, indent=2)
                 synth_prompt = intents._build_synth_prompt(prompt, results_json)
+                logger.debug("Synth prompt intent='{}'", intents._detect_intent(prompt))
                 resp = agent.adapter.chat([
                     {"role": "system", "content": "Be concrete, cite code (file:line) with short excerpts. No tool calls."},
                     {"role": "user", "content": synth_prompt},
                 ])
                 report_text = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "").strip()
-
-                # snips_text = "\n\n".join(
-                #     f"{s['path']}:{s.get('lineno','?')}-{s.get('end_lineno','?')}\n{s['text']}"
-                #     for s in top_snippets  # however you collect them
-                # )
-                # synth_prompt = intents._build_synth_prompt(prompt, results_json, extra_context=snips_text)
-
-                # # Use the model adapter directly to ensure plain text (OpenAI-compat) :contentReference[oaicite:6]{index=6}
-                # resp = agent.adapter.chat(
-                #     [
-                #         {
-                #             "role": "system",
-                #             "content": "You are a precise code analyst. Be concrete and terse.",
-                #         },
-                #         {"role": "user", "content": synth_prompt},
-                #     ]
-                # )
-                # report_text = (
-                #     (resp.get("choices") or [{}])[0].get("message", {}) or {}
-                # ).get("content", "")
+                logger.info("Final report synthesized (chars={})", len(report_text or ""))
             except Exception as e:
                 report_text = f"(Failed to synthesize final report: {e})"
+                logger.error("Final report synthesis failed: {}", e)
 
             if isinstance(report_text, str) and report_text.strip():
                 st.markdown("### Final Report")
@@ -722,6 +799,7 @@ if do_execute:
                 fn = cg_match.group(1)
                 depth = st.session_state.get("callgraph_depth", 3)
                 log(f"🔎 Direct call graph for `{fn}` (depth={depth})")
+                logger.info("Direct call_graph_for_function: function='{}' depth={}", fn, depth)
                 try:
                     res = tools.call("call_graph_for_function", function=fn, depth=depth)
                     st.markdown("### Assistant Response")
@@ -731,20 +809,27 @@ if do_execute:
                             st.code(_pretty(res), language="json")
                 except Exception as e:
                     st.error(f"call_graph_for_function failed: {e}")
+                    logger.exception("call_graph_for_function failed: {}", e)
                 st.stop()  # prevent falling through to ask_once
 
             # 💬 Fallback: standard single-turn ask
             log("💬 Running single-turn ask (agent.ask_once)...")
-            if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent) and plan_mode:
-                answer = agent.ask_with_planning(
-                    prompt, max_iters=int(max_iters), analysis_only=analysis_only
-                )
-            else:
-                answer = agent.ask_once(prompt, max_iters=int(max_iters))
+            logger.info("ask_once starting… model='{}'", model.resolved_model())
+            try:
+                if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent) and plan_mode:
+                    answer = agent.ask_with_planning(
+                        prompt, max_iters=int(max_iters), analysis_only=analysis_only
+                    )
+                else:
+                    answer = agent.ask_once(prompt, max_iters=int(max_iters))
+            except Exception as e:
+                logger.exception("ask_once failed: {}", e)
+                answer = f"[error] {e}"
             st.markdown("### Assistant Response")
 
             parsed = _looks_like_tool_blob(answer)
             if parsed is not None:
+                logger.debug("Assistant responded with tool JSON; rendering specialized view")
                 # If it's a tool call for call_graph_for_function, inject UI depth before rendering
                 if isinstance(parsed, dict) and parsed.get("tool") == "call_graph_for_function":
                     parsed.setdefault("args", {}).setdefault(
@@ -772,5 +857,6 @@ if do_execute:
                         st.code(answer)
     else:
         st.warning("Please enter a prompt.")
+        logger.info("Run clicked without a prompt")
 
 # (end)

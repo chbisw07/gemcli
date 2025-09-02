@@ -1,14 +1,18 @@
+# indexing/chunkers/py_ast.py
 import ast, os, hashlib
+from loguru import logger
 
 def _sha(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
 def chunk(file_path: str, cfg: dict):
+    logger.debug("py_ast.chunk: begin '{}'", file_path)
     with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
         src = fh.read()
     try:
         tree = ast.parse(src)
-    except SyntaxError:
+    except SyntaxError as e:
+        logger.warning("py_ast.chunk: SyntaxError in '{}': {}", file_path, e)
         return []
     lines = src.splitlines()
     chunks = []
@@ -60,4 +64,5 @@ def chunk(file_path: str, cfg: dict):
         def visit_AsyncFunctionDef(self, node): self.visit_FunctionDef(node)
 
     V().visit(tree)
+    logger.debug("py_ast.chunk: done defs={} chunks={}", sum(1 for _ in ast.walk(tree) if isinstance(_, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))), len(chunks))
     return chunks
