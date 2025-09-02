@@ -43,6 +43,8 @@ except Exception:
     EnhancedToolRegistry = None
     ReasoningAgent = None  # type: ignore
 
+import intents
+
 # Force load from gemcli/.env no matter where you launch from
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
@@ -665,28 +667,43 @@ if do_execute:
             # Prefer agent-side summarization if you later add it; otherwise synthesize here
             report_text = None
             try:
-                synth_prompt = (
-                    "Synthesize a concise, actionable report from these execution results.\n"
-                    "Focus strictly on:\n"
-                    "1) Root cause(s)\n"
-                    "2) Supporting evidence with file/line where possible\n"
-                    "3) Risks/unknowns\n"
-                    "4) Recommended fix steps (do NOT write or apply code)\n\n"
-                    f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
-                )
-                # Use the model adapter directly to ensure plain text (OpenAI-compat) :contentReference[oaicite:6]{index=6}
-                resp = agent.adapter.chat(
-                    [
-                        {
-                            "role": "system",
-                            "content": "You are a precise code analyst. Be concrete and terse.",
-                        },
-                        {"role": "user", "content": synth_prompt},
-                    ]
-                )
-                report_text = (
-                    (resp.get("choices") or [{}])[0].get("message", {}) or {}
-                ).get("content", "")
+                # synth_prompt = (
+                #     "Synthesize a concise, actionable report from these execution results.\n"
+                #     "Focus strictly on:\n"
+                #     "1) Root cause(s)\n"
+                #     "2) Supporting evidence with file/line where possible\n"
+                #     "3) Risks/unknowns\n"
+                #     "4) Recommended fix steps (do NOT write or apply code)\n\n"
+                #     f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
+                # )
+
+                results_json = json.dumps(results, indent=2)
+                synth_prompt = intents._build_synth_prompt(prompt, results_json)
+                resp = agent.adapter.chat([
+                    {"role": "system", "content": "Be concrete, cite code (file:line) with short excerpts. No tool calls."},
+                    {"role": "user", "content": synth_prompt},
+                ])
+                report_text = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "").strip()
+
+                # snips_text = "\n\n".join(
+                #     f"{s['path']}:{s.get('lineno','?')}-{s.get('end_lineno','?')}\n{s['text']}"
+                #     for s in top_snippets  # however you collect them
+                # )
+                # synth_prompt = intents._build_synth_prompt(prompt, results_json, extra_context=snips_text)
+
+                # # Use the model adapter directly to ensure plain text (OpenAI-compat) :contentReference[oaicite:6]{index=6}
+                # resp = agent.adapter.chat(
+                #     [
+                #         {
+                #             "role": "system",
+                #             "content": "You are a precise code analyst. Be concrete and terse.",
+                #         },
+                #         {"role": "user", "content": synth_prompt},
+                #     ]
+                # )
+                # report_text = (
+                #     (resp.get("choices") or [{}])[0].get("message", {}) or {}
+                # ).get("content", "")
             except Exception as e:
                 report_text = f"(Failed to synthesize final report: {e})"
 
