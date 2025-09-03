@@ -105,6 +105,132 @@ def _pretty(obj: Any) -> str:
     except Exception:
         return str(obj)
 
+def _sanitize_latex_text(text: str) -> str:
+    """
+    Normalize unicode super/subscripts to LaTeX-ish, but
+    DO NOT modify math delimiters ($...$, $$...$$, \(...\), \[...\]).
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    # Map superscripts / subscripts (common ones)
+    SUP = {
+        "⁰":"^{0}","¹":"^{1}","²":"^{2}","³":"^{3}","⁴":"^{4}",
+        "⁵":"^{5}","⁶":"^{6}","⁷":"^{7}","⁸":"^{8}","⁹":"^{9}",
+        "⁺":"^{+}","⁻":"^{-}","⁽":"^{(}","⁾":"^{)}","ⁿ":"^{n}"
+    }
+    SUB = {
+        "₀":"_{0}","₁":"_{1}","₂":"_{2}","₃":"_{3}","₄":"_{4}",
+        "₅":"_{5}","₆":"_{6}","₇":"_{7}","₈":"_{8}","₉":"_{9}",
+        "₊":"_{+}","₋":"_{-}","₍":"_{(}","₎":"_{)}"
+    }
+    return "".join(SUP.get(ch, SUB.get(ch, ch)) for ch in text)
+
+def _fix_common_latex_typos(text: str) -> str:
+    """
+    Repair frequent model artifacts so MathJax renders cleanly:
+      • unicode minus/en-dash → hyphen
+      • '\left$' / '\right$' → '\left(' / '\right)'
+      • collapse spaces after '^' / '_' (e.g., '^ 2' → '^2')
+      • specific '\left$\\frac' → '\left(\\frac', and ensure exponent braces
+    """
+    if not text:
+        return text
+    s = text
+    # minus/dash normalization
+    s = s.replace("−", "-").replace("–", "-")
+    # illegal \left$ … \right$
+    s = s.replace(r"\left$", r"\left(").replace(r"\right$", r"\right)")
+    # common variant: \left$\frac …  → \left(\frac …
+    s = re.sub(r"\\left\$(\\frac|\\sqrt)", r"\\left(\1", s)
+    # tighten '^ 2' / '_ 3'
+    s = re.sub(r"\^\s+", "^", s)
+    s = re.sub(r"_\s+", "_", s)
+    # ensure braces on exponents of \frac{…}{…}
+    s = re.sub(r"(\\frac\{[^}]+\}\{[^}]+\})\s*\^\s*(\d+)", r"\1^{\2}", s)
+    return s
+
+def _wrap_naked_tex(text: str) -> str:
+    """
+    Wrap obvious TeX sequences that lack delimiters.
+    Heuristics:
+      • a whole short paragraph that contains TeX tokens → $$…$$
+      • otherwise, short TeX-y spans in-line → $…$
+    Avoids touching code fences.
+    """
+    if not text:
+        return text
+    blocks = re.split(r"(```[\s\S]*?```)", text)
+    out = []
+    for b in blocks:
+        if b.startswith("```"):
+            out.append(b); continue
+        def _wrap_para(p: str) -> str:
+            ps = p.strip()
+            if not ps or ("$" in ps) or (r"\[" in ps) or (r"\(" in ps):
+                return p
+            if re.search(r"\\(frac|sqrt|sum|int|lim|tan|sin|cos|log|theta|pi|alpha|beta|gamma)", ps):
+                # short “mathy” line → display; longer → inline
+                return f"$${ps}$$" if len(ps.split()) <= 12 else f"${ps}$"
+            return p
+        out.append("\n".join(_wrap_para(x) for x in b.split("\n")))
+    return "".join(out)
+
+def _normalize_math_delimiters(text: str) -> str:
+    """
+    Make model output renderable by Streamlit/MathJax:
+      - \\[ ... \\]  -> $$ ... $$
+      - \\( ... \\)  -> $ ... $
+      - [  ...  ]    -> $$ ... $$   (only if content looks like TeX)
+      - (  ...  )    -> $  ...  $   (only if content looks like TeX and short)
+    """
+    if not text:
+        return text
+    s = text
+    # canonical LaTeX delimiters first
+    s = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", s, flags=re.DOTALL)   # \[...\] -> $$...$$
+    s = re.sub(r"\\\((.*?)\\\)", r"$\1$",   s, flags=re.DOTALL)   # \(...\) -> $...$
+
+    # square brackets containing TeX (heuristic: starts with backslash after optional space)
+    def _bracket_to_display(m):
+        inner = m.group(1)
+        if re.match(r"^\s*\\[A-Za-z]", inner):
+            return "$$" + inner.strip() + "$$"
+        return "[" + inner + "]"
+    s = re.sub(r"\[(.*?)\]", _bracket_to_display, s, flags=re.DOTALL)
+
+    # parentheses containing TeX (heuristic: starts with backslash; keep short to avoid over-capture)
+    def _paren_to_inline(m):
+        inner = m.group(1)
+        if len(inner) <= 180 and re.match(r"^\s*\\[A-Za-z]", inner):
+            return "$" + inner.strip() + "$"
+        return "(" + inner + ")"
+    s = re.sub(r"\((.*?)\)", _paren_to_inline, s, flags=re.DOTALL)
+    return s
+
+# NOTE: Removed the KaTeX injector; Streamlit ships MathJax by default.
+
+def render_response_with_latex(text: str):
+    """
+    Minimal, robust renderer:
+      • Let Streamlit markdown render normally.
+      • KaTeX auto-render turns $...$, $$...$$, \\(\\), \\[\\] into math (inline/block) without extra newlines.
+      • Additionally, if a display block is multi-line, show a LaTeX code block beneath for readability.
+    """
+    import re
+    from textwrap import dedent
+    if not isinstance(text, str) or not text.strip():
+        return
+    s = _sanitize_latex_text(dedent(text))
+    s = _fix_common_latex_typos(s)
+    s = _normalize_math_delimiters(s)
+    # 1) Render all content as normal markdown (Streamlit's MathJax handles $ / $$)
+    st.markdown(s)
+    # 2) For multi-line display equations, show LaTeX source as a code block (optional)
+    for m in re.finditer(r"\$\$([\s\S]*?)\$\$", s, flags=re.DOTALL):
+        expr = m.group(1) or m.group(2) or ""
+        if ("\n" in expr) or ("\\\\" in expr) or ("\\begin{" in expr):
+            st.code(expr.strip(), language="latex")
+
 def _ensure_index_ready(project_root: str, rag_path: str, embedder_name: Optional[str], auto: bool):
     """
     If auto is True:
@@ -850,7 +976,7 @@ if do_execute:
 
             if isinstance(report_text, str) and report_text.strip():
                 st.markdown("### Final Report")
-                st.write(report_text.strip())
+                render_response_with_latex(report_text.strip())
 
         else:
             # 🔎 Intercept single-turn call-graph requests so we can honor UI depth
@@ -915,7 +1041,7 @@ if do_execute:
                         st.code(_pretty(parsed), language="json")
             else:
                 if not _maybe_render_dot_from_text(answer):
-                    st.write(answer)
+                    render_response_with_latex(answer)
                 if show_raw_json:
                     with st.expander("Raw text"):
                         st.code(answer)
