@@ -121,13 +121,14 @@ def _rekey(chunks: List[dict], project_root: str, root: str, fp: str) -> List[di
 
 # ----------------------------- chroma collection ------------------------------
 
-def _chroma(root: str, cfg: dict):
+def _chroma(project_root: str, cfg: dict):
     """
     Create/get a Chroma collection for this project.
     IMPORTANT: Do NOT pass an embedding_function here.
                We embed client-side and pass vectors explicitly.
+    The RAG store path is anchored to the *project root* for consistency with the app.
     """
-    rag_dir = project_rag_dir(root)
+    rag_dir = project_rag_dir(project_root)
     rag_dir.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(rag_dir))
     coll_name = _collection_name_for(cfg)
@@ -208,7 +209,7 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     root = os.path.join(project_root, cfg["index_root"])
     logger.info("Index root: '{}'", root)
 
-    coll = _chroma(root, cfg)
+    coll = _chroma(project_root, cfg)
     models_path = _resolve_models_json_path(project_root)
     logger.info("models.json resolved: '{}'", models_path)
     embed_fn = resolve_embedder(models_path, cfg)
@@ -250,10 +251,11 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
         logger.debug("Indexed '{}': {} chunk(s)", rel, len(chunks))
 
     # Stamp for delta indexing
-    stamp_path = project_rag_dir(root) / ".last_index.json"
+    # Stamp lives under the project root alongside the DB
+    stamp_path = project_rag_dir(project_root) / ".last_index.json"
     try:
-        os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
-        with open(stamp_path, "w") as f:
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        with stamp_path.open("w") as f:
             json.dump({"ts": time.time()}, f)
         logger.info("Index stamp updated at '{}'", str(stamp_path))
     except Exception as e:
@@ -277,14 +279,15 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
     root = os.path.join(project_root, cfg["index_root"])
     logger.info("Index root: '{}'", root)
 
-    coll = _chroma(root, cfg)
+    coll = _chroma(project_root, cfg)
     models_path = _resolve_models_json_path(project_root)
     logger.info("models.json resolved: '{}'", models_path)
     embed_fn = resolve_embedder(models_path, cfg)
     logger.info("Embedder resolved for selected='{}'", (cfg.get("embedder") or {}).get("selected_name") or (cfg.get("embedder") or {}).get("model_key"))
 
     # Read last stamp
-    stamp_path = project_rag_dir(root) / ".last_index.json"
+    # Read the stamp co-located with the project-level DB
+    stamp_path = project_rag_dir(project_root) / ".last_index.json"
     last = 0.0
     if os.path.exists(stamp_path):
         try:
@@ -339,12 +342,12 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
 
     # Update stamp
     try:
-        os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
-        with open(stamp_path, "w") as f:
+        stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        with stamp_path.open("w") as f:
             json.dump({"ts": now}, f)
         logger.info("Index stamp updated at '{}'", str(stamp_path))
     except Exception as e:
         logger.warning("Failed to write index stamp '{}': {}", str(stamp_path), e)
-
+        
     logger.info("delta_index: done added={} changed_files={}", added, len(changed))
     return {"ok": True, "added": added, "changed_files": changed}

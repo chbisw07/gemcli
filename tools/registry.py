@@ -18,6 +18,11 @@ except Exception:  # pragma: no cover
     def try_direct_actions(*_, **__):
         return None
 
+from tools.edu_intents import detect_edu_intent
+from tools.edu_tools import (
+    edu_similar_questions, edu_question_paper, edu_explain, edu_extract_tables
+)
+from tools.web_tools import web_search, web_fetch
 
 class ToolRegistry:
     """
@@ -335,28 +340,31 @@ class ToolRegistry:
         def scan_relevant_files(
             prompt: str = "",
             path: str = "",
+            subdir: str = "",
             max_results: int = 200,
             exts: Iterable[str] | None = None,
         ) -> List[dict]:
             """
             Heuristic scan: score files by whether prompt terms appear in path/content.
             """
-            base = self.root / (path or "")
+            # Resolve path relative to project root (works for file OR directory)
+            resolved = self._resolve_path(path, subdir=subdir or "") if path else None
+            base = (self.root / resolved) if resolved else (self.root / (subdir or ""))
             if not base.exists():
-                logger.debug("scan_relevant_files: base not found '{}'", path)
+                logger.debug("scan_relevant_files: base not found path='{}' subdir='{}'", path, subdir)
                 return []
             if exts is None:
                 exts = [".py"]
             exts = tuple(exts)
             terms = [t.lower() for t in re.split(r"[^A-Za-z0-9_.:/-]+", prompt or "") if t]
             hits: List[dict] = []
-            for p in base.rglob("*"):
+            def _score_file(p: Path):
                 if not p.is_file() or p.suffix not in exts:
-                    continue
+                    return
                 try:
                     text = p.read_text(encoding="utf-8", errors="ignore").lower()
                 except Exception:
-                    continue
+                    return
                 score = 0
                 hay = (str(p.relative_to(self.root)).lower() + " " + text)
                 for t in terms:
@@ -364,9 +372,17 @@ class ToolRegistry:
                         score += 1
                 if score > 0:
                     hits.append({"path": str(p.relative_to(self.root)), "score": score})
+
+            if base.is_file():
+                _score_file(base)
+            else:
+                for p in base.rglob("*"):
+                    _score_file(p)
+
             hits.sort(key=lambda x: (-x["score"], x["path"]))
             out = hits[:max_results]
-            logger.info("scan_relevant_files: terms={} hits={} path='{}'", len(terms), len(out), path)
+            logger.info("scan_relevant_files: terms={} hits={} path='{}' subdir='{}'",
+                        len(terms), len(out), path, subdir)
             return out
 
         # ---------- analyze_files ----------
@@ -542,6 +558,15 @@ class ToolRegistry:
         self._register("analyze_files", analyze_files)
         self._register("bulk_edit", bulk_edit)
         self._register("rewrite_naive_open", rewrite_naive_open)
+        # Education-focused tools
+        self._register("edu_detect_intent", detect_edu_intent)
+        self._register("edu_similar_questions", edu_similar_questions)
+        self._register("edu_question_paper", edu_question_paper)
+        self._register("edu_explain", edu_explain)
+        self._register("edu_extract_tables", edu_extract_tables)
+        self._register("web_search", web_search)
+        self._register("web_fetch", web_fetch)
+
 
     # --------------- OpenAI tool schema (function-calling) ---------------
 
@@ -646,7 +671,8 @@ class ToolRegistry:
                     "description": "Heuristically score files relevant to a prompt.",
                     "parameters": {
                         "type": "object",
-                        "properties": {"prompt": {"type": "string"}, "path": {"type": "string"}, "max_results": {"type": "integer"}, "exts": {"type": "array", "items": {"type": "string"}}},
+                        "properties": {"prompt": {"type": "string"}, "path": {"type": "string"}, "subdir": {"type": "string"},
+                                       "max_results": {"type": "integer"}, "exts": {"type": "array", "items": {"type": "string"}}},
                         "required": [],
                     },
                 },
@@ -676,5 +702,122 @@ class ToolRegistry:
                 },
             },
         ]
+        schemas += [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_detect_intent",
+                    "description": "Detect education-specific intent and slots from a user prompt.",
+                    "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}, "required": ["prompt"]},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_similar_questions",
+                    "description": "Build generation messages for book-style similar questions.",
+                    "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project_root": {"type": "string"},
+                        "rag_path": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "chapter": {"type": "string"},
+                        "count": {"type": "integer"},
+                        "difficulty": {"type": "string"},
+                        "scope": {"type": "string"},
+                        "top_k": {"type": "integer"}
+                    },
+                    "required": ["project_root", "rag_path"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_question_paper",
+                    "description": "Build generation messages for a full question paper with solutions.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "project_root": {"type": "string"},
+                            "rag_path": {"type": "string"},
+                            "chapter": {"type": "string"},
+                            "topics": {"type": "array", "items": {"type": "string"}},
+                            "count": {"type": "integer"},
+                            "mix": {"type": "object"},
+                            "difficulty": {"type": "string"},
+                            "scope": {"type": "string"},
+                            "top_k": {"type": "integer"}
+                        },
+                        "required": ["project_root", "rag_path"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_explain",
+                    "description": "Build messages to explain a topic/question grounded in the book excerpts.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "project_root": {"type": "string"},
+                            "rag_path": {"type": "string"},
+                            "question_or_topic": {"type": "string"},
+                            "scope": {"type": "string"},
+                            "top_k": {"type": "integer"}
+                        },
+                        "required": ["project_root", "rag_path", "question_or_topic"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_extract_tables",
+                    "description": "Retrieve table chunks (no model call).",
+                    "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "project_root": {"type": "string"},
+                        "rag_path": {"type": "string"},
+                        "chapter": {"type": "string"},
+                        "topic": {"type": "string"},
+                        "scope": {"type": "string"},
+                        "top_k": {"type": "integer"}
+                    },
+                    "required": ["project_root", "rag_path"]
+                    },
+                },
+            },
+        ]
+        schemas += [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for pages related to a query (DuckDuckGo).",
+                    "parameters": {"type":"object","properties":{
+                        "query":{"type":"string"},
+                        "max_results":{"type":"integer"},
+                        "site":{"type":"string"},
+                        "recency_days":{"type":"integer"}
+                    },"required":["query"]}
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_fetch",
+                    "description": "Fetch and extract main text from a web page for grounding.",
+                    "parameters": {"type":"object","properties":{
+                        "url":{"type":"string"},
+                        "max_chars":{"type":"integer"}
+                    },"required":["url"]}
+                }
+            },
+        ]
+        
         logger.debug("schemas_openai: {} tool schema(s)", len(schemas))
         return schemas

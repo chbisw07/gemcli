@@ -622,6 +622,24 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
     effective_preview = preview_only or analysis_only  # force dry-run if analysis_only
     logger.info("Executing plan: steps={} analysis_only={} preview={}", len(plan_steps or []), analysis_only, effective_preview)
 
+    # --- execution-time web fallback (UI runner) ---
+    def _grounding_signal_from(out: Any) -> dict:
+        pdf = tot = 0
+        chunks = out.get("chunks") if isinstance(out, dict) else None
+        if isinstance(chunks, list):
+            for c in chunks:
+                md = (c.get("metadata") or {}) if isinstance(c, dict) else {}
+                if isinstance(md, dict):
+                    fp = (md.get("file_path") or "").lower()
+                    ct = (md.get("chunk_type") or "").lower()
+                    if fp.endswith(".pdf") or ct.startswith("pdf"):
+                        pdf += 1
+                    tot += 1
+        ratio = (pdf / max(1, tot))
+        return {"pdf_chunks": pdf, "total_chunks": tot, "pdf_ratio": ratio}
+    _web_fetch_batch: List[Dict[str, Any]] = []
+    _MIN_CHUNKS, _MIN_RATIO = 6, 0.60
+
     for i, step in enumerate(plan_steps, 1):
         if "error" in step:
             msg = f"❌ Plan step {i} error: {step['error']}"
@@ -634,6 +652,15 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
         args = dict(step.get("args", {}))
         desc = step.get("description", "")
         logger.info("Plan step {}: tool='{}' desc='{}' args={}", i, tool_name, desc, args)
+
+        # If we already fetched web pages via automatic fallback and this is an edu_* tool,
+        # forward them so edu_tools can append web context *after* PDF snippets.
+        if isinstance(tool_name, str) and tool_name.startswith("edu_"):
+            try:
+                if _web_fetch_batch and "web_fetch_batch" not in args:
+                    args["web_fetch_batch"] = _web_fetch_batch
+            except Exception:
+                pass
 
         # Impose preview for edit-capable tools
         if effective_preview and tool_name in EDIT_TOOLS:
@@ -708,6 +735,43 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
             # Visualize call-graph payloads cleanly (if present)
             _render_call_graph_payload(res)
             _maybe_render_graph(res)
+
+            # --- Automatic web fallback (once) when RAG grounding looks weak ---
+            if (not _web_fallback_done) and isinstance(res, dict) and isinstance(res.get("chunks"), list):
+                sig = _grounding_signal_from(res)
+                weak = (sig["total_chunks"] < _MIN_CHUNKS) or (sig["pdf_ratio"] < _MIN_RATIO)
+                is_edu = isinstance(tool_name, str) and tool_name.startswith("edu_")
+                # Confirm web tools are registered in this ToolRegistry
+                available = set(getattr(tools, "tools", {}).keys()) if hasattr(tools, "tools") else set()
+                web_ok = {"web_search", "web_fetch"}.issubset(available)
+                if weak and web_ok and not is_edu:
+                    # Use the step query/topic if available, otherwise fall back to the global prompt
+                    q = (args.get("query") or args.get("topic") or desc or prompt or "").strip()
+                    if q:
+                        try:
+                            ws = tools.call("web_search", query=q, max_results=5)
+                            results.append({
+                                "step": f"{i}.a",
+                                "tool": "web_search",
+                                "description": f"Automatic web fallback for weak grounding (pdf_ratio={sig['pdf_ratio']:.2f}, total_chunks={sig['total_chunks']})",
+                                "args": {"query": q, "max_results": 5},
+                                "result": ws, "success": True
+                            })
+                            urls = [r.get("url") for r in (ws.get("results") or []) if isinstance(r, dict)]
+                            urls = [u for u in urls if u][:2]
+                            for u in urls:
+                                wf = tools.call("web_fetch", url=u, max_chars=60000)
+                                _web_fetch_batch.append(wf)
+                                results.append({
+                                    "step": f"{i}.b", "tool": "web_fetch",
+                                    "description": "Fetch page for fallback grounding",
+                                    "args": {"url": u, "max_chars": 60000},
+                                    "result": wf, "success": True
+                                })
+                            logger.info("UI execute_plan: auto web fallback injected urls={}", urls)
+                            _web_fallback_done = True
+                        except Exception as _e:
+                            logger.warning("UI execute_plan: web fallback failed (ignored): {}", _e)
 
             if show_raw_json:
                 with st.expander(f"Raw result (step {i})"):

@@ -12,4 +12,7 @@ openai
 chroma-hnswlib
 chromadb
 sentence-transformers
+PyMuPDF
 pypdf
+pytesseract
+

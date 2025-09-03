@@ -8,6 +8,14 @@ from agent import Agent
 from models import LLMModel
 from tools.registry import ToolRegistry
 
+# --- NEW: tiny helper to find BIND tokens like {{BIND:search_code.file0}} ---
+_BIND_RX = re.compile(r"\{\{BIND:([A-Za-z0-9_]+)\.([A-Za-z0-9_\-]+)\}\}")
+
+def _extract_bind_tokens(obj: Any) -> List[tuple[str, str]]:
+    s = ""
+    if isinstance(obj, str):
+        s = obj
+    return _BIND_RX.findall(s) if s else []
 
 class ReasoningAgent(Agent):
     """
@@ -24,8 +32,8 @@ class ReasoningAgent(Agent):
         # registry.py tools
         "scan_relevant_files": {
             "required": [],
-            "allowed": {"prompt", "path", "max_results", "exts"},
-            "defaults": {"prompt": "", "path": "", "max_results": 200, "exts": [".py"]},
+            "allowed": {"prompt", "path", "subdir", "max_results", "exts"},
+            "defaults": {"prompt": "", "path": "", "subdir": "", "max_results": 200, "exts": [".py"]},
         },
         "search_code": {
             "required": {"query"},
@@ -232,6 +240,32 @@ Return JSON array like:
             {"role": "system", "content": self._PLAN_SYSTEM},
             {"role": "user", "content": user_msg},
         ]
+
+        # --- RAG-first planning hint (prefer PDFs; allow web only if needed) ---
+        try:
+            # Your ToolRegistry exposes .tools (used elsewhere in this file)
+            available = sorted(getattr(self.tools, "tools", {}).keys())
+        except Exception:
+            available = []
+
+        rag_policy = (
+            "AVAILABLE_TOOLS:\n- " + "\n- ".join(available) + "\n\n"
+            "PLANNING POLICY:\n"
+            "• Use only AVAILABLE_TOOLS; do not invent tool names.\n"
+            "• Prefer RAG grounding from project PDFs using edu_* tools "
+            "(edu_detect_intent, edu_explain, edu_similar_questions, edu_question_paper) "
+            "and the retriever.\n"
+            "• Only consider web_search/web_fetch if RAG returns too little evidence "
+            "(heuristic: fewer than ~6 relevant chunks, or less than ~60% of context coming from PDFs).\n"
+            "• When you do use the web, explicitly cite the URLs and still keep book/PDF citations when present.\n"
+            "• If no grounded evidence is found at all, state that clearly rather than guessing.\n"
+        )
+        # Append as a system message so it has high weight but remains separate from _PLAN_SYSTEM
+        messages.append({
+            "role": "system",
+            "content": rag_policy
+        })
+
         try:
             logger.info("ReasoningAgent.analyze_and_plan → planning for prompt='{}...'", (query or "")[:160])
             resp = self.adapter.chat(messages)
@@ -337,7 +371,28 @@ Return JSON array like:
         results = []
         last_by_tool: dict[str, Any] = {}  # keep outputs for {{BIND:...}} usage
 
+        # Track which tools produced at least one item we can work with
+        tool_nonempty: dict[str, bool] = {}
+
         logger.info("ReasoningAgent.execute_plan begin: steps={} analysis_only={}", len(plan or []), analysis_only)
+
+        # --- execution-time web fallback guard (injects web context once if RAG is weak) ---
+        def _grounding_signal_from(out: Any) -> dict:
+            pdf = tot = 0
+            chunks = out.get("chunks") if isinstance(out, dict) else None
+            if isinstance(chunks, list):
+                for c in chunks:
+                    md = (c.get("metadata") or {}) if isinstance(c, dict) else {}
+                    if isinstance(md, dict):
+                        fp = (md.get("file_path") or "").lower()
+                        ct = (md.get("chunk_type") or "").lower()
+                        if fp.endswith(".pdf") or ct.startswith("pdf"):
+                            pdf += 1
+                        tot += 1
+            ratio = (pdf / max(1, tot))
+            return {"pdf_chunks": pdf, "total_chunks": tot, "pdf_ratio": ratio}
+        _web_fallback_done = False
+        _MIN_CHUNKS, _MIN_RATIO = 6, 0.60
 
         # quick recursive placeholder detector
         def _looks_like_placeholder(v) -> bool:
@@ -371,7 +426,7 @@ Return JSON array like:
 
         # default values for a few tools (mirrors tools/registry.py)
         DEFAULTS = {
-            "scan_relevant_files": {"prompt": "", "path": "", "max_results": 200, "exts": [".py"]},
+            "scan_relevant_files": {"prompt": "", "path": "", "subdir": "", "max_results": 200, "exts": [".py"]},
             "search_code": {"subdir": "", "regex": False, "case_sensitive": False, "exts": [".py"], "max_results": 2000},
             "analyze_files": {"max_bytes": 8000},
             "write_file": {"overwrite": True, "backup": False},
@@ -436,6 +491,25 @@ Return JSON array like:
                     break
                 continue
 
+            # --------- Guard unresolved BINDs (skip step) ----------
+            # If args contain {{BIND:tool.fieldN}} and we *know* that tool was empty,
+            # skip gracefully instead of letting the tool crash.
+            def _iter_binds(obj):
+                if isinstance(obj, str):
+                    for t in _BIND_RX.findall(obj):
+                        yield t  # (tool_name, field_key)
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        yield from _iter_binds(v)
+                elif isinstance(obj, (list, tuple)):
+                    for x in obj:
+                        yield from _iter_binds(x)
+            unresolved = any(tool_nonempty.get(tname) is False for (tname, _fld) in _iter_binds(args))
+            if unresolved:
+                logger.warning("execute_plan: skipping step {} '{}' due to unresolved BIND (previous tool had no results)", idx, tool)
+                results.append({"step": idx, "tool": tool, "description": desc, "skipped": True, "reason": "unresolved_bind"})
+                continue
+
             # --------- BIND placeholders: {{BIND:search_code.file0}} ----------
             def _bind_value(v):
                 if isinstance(v, str):
@@ -446,8 +520,25 @@ Return JSON array like:
                     if m:
                         tname, field, idx = m.group(1), m.group(2), int(m.group(3))
                         src = last_by_tool.get(tname)
-                        if isinstance(src, list) and 0 <= idx < len(src) and isinstance(src[idx], dict):
-                            return src[idx].get(field, v)
+                        # Case A: previous tool returned a list (of dicts/strings)
+                        if isinstance(src, list):
+                            if 0 <= idx < len(src):
+                                item = src[idx]
+                                if isinstance(item, dict):
+                                    return item.get(field, v)
+                                # e.g., list of file paths and field == "file" or "path"
+                                if isinstance(item, str) and field in {"file", "path"}:
+                                    return item
+                        # Case B: previous tool returned a dict (common: {"files":[...], "paths":[...]})
+                        if isinstance(src, dict):
+                            # try plural then singular
+                            for key in (field + "s", field):
+                                val = src.get(key)
+                                if isinstance(val, list) and 0 <= idx < len(val):
+                                    return val[idx]
+                                if isinstance(val, dict):
+                                    # very rare, but keep symmetry with list-of-dicts
+                                    return val.get(str(idx), v)
                 return v
             def _bind_obj(obj):
                 if isinstance(obj, dict):
@@ -495,11 +586,20 @@ Return JSON array like:
                         break
                     continue
 
-            # fill defaults where missing
-            for dk, dv in DEFAULTS.get(tool, {}).items():
+            # fill defaults where missing (use the post-redirect tool name)
+            for dk, dv in DEFAULTS.get(target_tool, {}).items():
                 fixed_args.setdefault(dk, dv)
 
             # call the tool
+            # If web fallback ran earlier and this is an edu_* tool, forward fetched pages
+            if isinstance(target_tool, str) and target_tool.startswith("edu_"):
+                try:
+                    wfb = last_by_tool.get("web_fetch_batch")
+                    if wfb and "web_fetch_batch" not in fixed_args:
+                        fixed_args["web_fetch_batch"] = wfb
+                except Exception:
+                    pass
+
             try:
                 out = self.tools.call(target_tool, **fixed_args)
                 rec = {
@@ -513,6 +613,74 @@ Return JSON array like:
                 results.append(rec)
                 logger.info("execute_plan: tool '{}' OK (step {})", target_tool, idx)
                 last_by_tool[target_tool] = out
+
+                # --- Mark tool non-empty for downstream BIND guard ---
+                nonempty: Optional[bool] = None
+                # Common shapes: dict with list fields, a bare list, or an explicit count
+                if isinstance(out, dict):
+                    for key in ("chunks", "files", "ids", "documents", "items", "results", "matches"):
+                        v = out.get(key)
+                        if isinstance(v, list) and len(v) > 0:
+                            nonempty = True
+                            break
+                    if nonempty is None:
+                        cnt = out.get("count")
+                        if isinstance(cnt, int):
+                            nonempty = (cnt > 0)
+                elif isinstance(out, list):
+                    nonempty = (len(out) > 0)
+                # Default optimistic if unknown shape
+                if nonempty is None:
+                    nonempty = True
+                tool_nonempty[target_tool] = bool(nonempty)
+
+
+                # --- Automatic web fallback (once) when RAG grounding looks weak ---
+                # Trigger only for retrieval-like outputs (those with "chunks").
+                if (not _web_fallback_done) and isinstance(out, dict) and isinstance(out.get("chunks"), list):
+                    sig = _grounding_signal_from(out)
+                    weak = (sig["total_chunks"] < _MIN_CHUNKS) or (sig["pdf_ratio"] < _MIN_RATIO)
+                    # Avoid web fallback for explicit education tools by default
+                    is_edu = target_tool.startswith("edu_") or ("edu_detect_intent" in last_by_tool)
+
+                    # Only if web tools are registered
+                    available = set(getattr(self.tools, "tools", {}).keys()) if hasattr(self.tools, "tools") else set()
+                    web_ok = {"web_search", "web_fetch"}.issubset(available)
+
+                    if weak and web_ok and not is_edu:
+                        # Derive a query best-effort
+                        q = (fixed_args.get("query") or fixed_args.get("topic") or desc or "").strip()
+                        if q:
+                            try:
+                                ws = self.tools.call("web_search", query=q, max_results=5)
+                                results.append({
+                                    "step": f"{idx}.a",
+                                    "tool": "web_search",
+                                    "description": f"Automatic web fallback for weak grounding (pdf_ratio={sig['pdf_ratio']:.2f}, total_chunks={sig['total_chunks']})",
+                                    "args": {"query": q, "max_results": 5},
+                                    "result": ws,
+                                    "success": True
+                                })
+                                urls = [r.get("url") for r in (ws.get("results") or []) if isinstance(r, dict)]
+                                urls = [u for u in urls if u][:2]
+                                wf_batch = []
+                                for u in urls:
+                                    wf = self.tools.call("web_fetch", url=u, max_chars=60000)
+                                    wf_batch.append(wf)
+                                    results.append({
+                                        "step": f"{idx}.b",
+                                        "tool": "web_fetch",
+                                        "description": "Fetch page for fallback grounding",
+                                        "args": {"url": u, "max_chars": 60000},
+                                        "result": wf, "success": True
+                                    })
+                                last_by_tool["web_search"] = ws
+                                last_by_tool["web_fetch_batch"] = wf_batch
+                                logger.info("execute_plan: auto web fallback injected urls={}", urls)
+                                _web_fallback_done = True
+                            except Exception as _e:
+                                logger.warning("execute_plan: web fallback failed (ignored): {}", _e)
+
             except Exception as e:
                 results.append({
                     "step": idx,
