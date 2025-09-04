@@ -1,11 +1,11 @@
-# indexing/pdf.py
+# indexing/chunkers/pdf.py
 from __future__ import annotations
 
 import io
 import os
 import re
+import hashlib
 from typing import List, Dict, Any, Tuple, Optional
-
 from loguru import logger
 
 # --- PyMuPDF + optional OCR ---
@@ -14,235 +14,300 @@ try:
     import pytesseract
     from PIL import Image
     _OCR_OK = True
-except Exception:
+except Exception:  # pillow or tesseract not installed
     _OCR_OK = False
 
 
-# ---------- heuristics for school-book PDFs ----------
-_HEADING_RX = {
-    "chapter": re.compile(r"(?mi)^(?:Chapter\s+\d+|^\d+\s+[A-Z][^\n]{1,80})$"),
-    "section": re.compile(r"(?mi)^\d+\.\d+\s+[^\n]{1,80}$"),
-    "subsection": re.compile(r"(?mi)^\d+\.\d+\.\d+\s+[^\n]{1,80}$"),
-}
-_BLOCK_RX = {
-    "questions": re.compile(r"(?mi)^(Questions|Exercises?)\b"),
-    "qa":        re.compile(r"(?mi)^(Q\s*[:：]|Q\.)"),
-    "answer":    re.compile(r"(?mi)^(A\s*[:：]|Ans\.)"),
-    "figure":    re.compile(r"(?mi)^(Figure|Fig\.)\s*\d+"),
-    "table":     re.compile(r"(?mi)^Table\s*\d+"),
-    "activity":  re.compile(r"(?mi)^(Activity|Experiment)\b"),
-    "biblio":    re.compile(r"(?mi)^(Bibliography|References)$"),
-}
+# ------------------------- small utils -------------------------
+
+def _sha(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()
+
+def _get(cfg: dict, *path, default=None):
+    cur = cfg or {}
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+def _dehyphenate(text: str) -> str:
+    # common: “exam-\nination” -> “examination”
+    text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
+    # normalize CRLF
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+def _normalize_ws(text: str) -> str:
+    # collapse triple+ newlines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # strip trailing spaces on lines
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    return text
+
+def _first_non_empty(lines: List[str]) -> str:
+    for ln in lines:
+        s = ln.strip()
+        if s:
+            return s
+    return ""
+
+def _last_non_empty(lines: List[str]) -> str:
+    for ln in reversed(lines):
+        s = ln.strip()
+        if s:
+            return s
+    return ""
+
+def _classify_block(text: str) -> str:
+    """
+    Very light heuristics to help downstream grouping:
+      - starts with Questions / Exercise / Practice => 'questions'
+      - starts with Answers / Solutions              => 'answers'
+      - looks like table (many delimiters)          => 'table'
+      - single-line, Title/Heading-ish              => 'heading'
+      - otherwise                                   => 'para'
+    """
+    header = (text.splitlines()[:1] or [""])[0].strip().lower()
+    if re.match(r"^(questions?|exercises?|practice|problems?)\b", header):
+        return "questions"
+    if re.match(r"^(answers?|solutions?)\b", header):
+        return "answers"
+    # crude table signal: lots of separators, tabs or pipes on multiple lines
+    tabish = sum(1 for ln in text.splitlines() if ln.count("|") >= 2 or "\t" in ln) >= 2
+    if tabish:
+        return "table"
+    # heading if very short and title-like
+    if len(text.splitlines()) == 1 and 2 <= len(text.strip()) <= 80:
+        return "heading"
+    return "para"
 
 
-# ------------------------- small helpers -------------------------
+# ------------------------- page extraction -------------------------
 
-def _clean_text(txt: str, dehyphenate: bool, dedupe_headers: bool) -> str:
-    # normalize newlines
-    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
-    if dehyphenate:
-        txt = re.sub(r"(\w+)-\n(\w+)", r"\1\2\n", txt)  # join hyphenated words at line breaks
-    if dedupe_headers:
-        # remove simple "Page N" lines and repeated blank lines
-        lines = [ln for ln in txt.splitlines() if not re.match(r"^\s*Page\s+\d+\s*$", ln)]
-        txt = "\n".join(lines)
-    txt = re.sub(r"\n{3,}", "\n\n", txt)
-    return txt.strip()
+def _extract_text_from_page(page: fitz.Page, use_ocr: bool) -> str:
+    """
+    Try text APIs first; fallback to OCR image if configured and page is mostly empty.
+    """
+    try:
+        # prefer "text" (layout-preserving) over "blocks" / "words" for readability
+        text = page.get_text("text", flags=fitz.TEXT_PRESERVE_LIGATURES | fitz.TEXT_PRESERVE_WHITESPACE) or ""
+        if text.strip():
+            return text
+    except Exception:
+        pass
 
-def _infer_book_chapter(path: str) -> Tuple[Optional[str], Optional[str]]:
-    base = os.path.basename(path)
-    book = os.path.basename(os.path.dirname(path)) or None
-    m = re.search(r"(?:chapter|ch)[_\s\-]?(\d+)", base, flags=re.I) or re.search(r"\b(\d{1,2})\b", base)
-    return book, (m.group(1) if m else None)
+    # fallback to simple text
+    try:
+        t2 = page.get_text() or ""
+        if t2.strip():
+            return t2
+    except Exception:
+        pass
 
-def _page_texts(doc: fitz.Document, ocr_fallback: bool) -> List[str]:
-    out: List[str] = []
-    for pno in range(len(doc)):
-        page = doc.load_page(pno)
-        t = page.get_text("text") or ""
-        if ocr_fallback and len(t.strip()) < 8 and _OCR_OK:
-            try:
-                pix = page.get_pixmap(dpi=250)
-                img = Image.open(io.BytesIO(pix.tobytes()))
-                t = pytesseract.image_to_string(img) or ""
-            except Exception as e:
-                logger.debug("pdf.ocr: page {} OCR failed: {}", pno + 1, e)
-        out.append(t)
+    # OCR path
+    if use_ocr and _OCR_OK:
+        try:
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x DPI for better OCR
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            ocr = pytesseract.image_to_string(img)
+            return ocr or ""
+        except Exception as e:
+            logger.warning("pdf.chunk: OCR failed on page %d: %s", page.number + 1, e)
+
+    return ""
+
+
+def _dedupe_headers_footers(page_texts: List[str], enable: bool) -> List[str]:
+    """
+    Identify repeated first/last lines across pages and drop them (headers/footers).
+    """
+    if not enable or not page_texts:
+        return page_texts
+
+    first_counts: Dict[str, int] = {}
+    last_counts: Dict[str, int] = {}
+    lines_per_page: List[List[str]] = []
+
+    for t in page_texts:
+        lines = [ln.rstrip() for ln in t.splitlines()]
+        lines_per_page.append(lines)
+        f = _first_non_empty(lines)
+        l = _last_non_empty(lines)
+        if f:
+            first_counts[f] = first_counts.get(f, 0) + 1
+        if l:
+            last_counts[l] = last_counts.get(l, 0) + 1
+
+    n = len(page_texts)
+    hdr = {k for k, v in first_counts.items() if v >= max(3, int(0.6 * n))}
+    ftr = {k for k, v in last_counts.items() if v >= max(3, int(0.6 * n))}
+
+    cleaned: List[str] = []
+    for lines in lines_per_page:
+        # drop only one instance at head / tail if exactly matches
+        if lines and lines[0].strip() in hdr:
+            lines = lines[1:]
+        if lines and lines[-1].strip() in ftr:
+            lines = lines[:-1]
+        cleaned.append("\n".join(lines))
+
+    return cleaned
+
+
+def _split_into_blocks(page_text: str) -> List[str]:
+    """
+    Split into roughly-paragraph blocks using blank lines as separators.
+    """
+    blocks: List[str] = []
+    for raw in re.split(r"\n\s*\n", page_text.strip()):
+        blk = raw.strip()
+        if blk:
+            blocks.append(blk)
+    return blocks
+
+
+def _semantic_windows(text: str, max_chars: int, overlap: int) -> List[Tuple[int, int]]:
+    """
+    Sliding character windows over a paragraph-ish text.
+    Returns (start_char, end_char) pairs (0-based, end exclusive).
+    """
+    out: List[Tuple[int, int]] = []
+    n = len(text)
+    if n <= max_chars:
+        return [(0, n)]
+    step = max(1, max_chars - overlap)
+    i = 0
+    while i < n:
+        j = min(n, i + max_chars)
+        out.append((i, j))
+        if j == n:
+            break
+        i += step
     return out
-
-def _paragraphs(text: str) -> List[str]:
-    return [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-
-def _window_paragraphs(paras: List[str], max_chars: int, overlap: int) -> List[str]:
-    if max_chars <= 0:
-        return paras
-    out: List[str] = []
-    buf: List[str] = []
-    cur = 0
-    for p in paras:
-        # +2 for the "\n\n" joiner when present
-        add_len = len(p) + (2 if buf else 0)
-        if cur + add_len <= max_chars:
-            buf.append(p); cur += add_len
-        else:
-            if buf:
-                out.append("\n\n".join(buf))
-            # simple trailing overlap (character-based)
-            if overlap > 0 and out:
-                carry = out[-1][-overlap:] if len(out[-1]) > overlap else out[-1]
-                buf = [carry, p]
-                cur = len(carry) + len(p) + 2
-            else:
-                buf = [p]; cur = len(p)
-    if buf:
-        out.append("\n\n".join(buf))
-    return out
-
-def _split_anchors(content: str):
-    anchors = []
-    for label, rx in _HEADING_RX.items():
-        for m in rx.finditer(content):
-            anchors.append((m.start(), label, m.group(0).strip()))
-    for label, rx in _BLOCK_RX.items():
-        for m in rx.finditer(content):
-            anchors.append((m.start(), label, m.group(0).strip()))
-    anchors = sorted(set(anchors), key=lambda x: x[0])
-    return anchors
 
 
 # ------------------------- main entry -------------------------
 
 def chunk(file_path: str, cfg: dict) -> List[Dict[str, Any]]:
     """
-    Emits chunks according to cfg:
-      cfg["pdf_emit"] may include: "pdf_page", "pdf_structure", "pdf_blocks", "pdf_toc"
-      cfg["ocr_fallback"]: bool
-      cfg["dehyphenate"], cfg["dedupe_headers"], cfg["max_pdf_chunk_chars"]
-      cfg["pdf_semantic"] = {"enabled": True, "max_chars": 1100, "overlap": 120}
-    Each chunk has:
-      - document: text
-      - metadata: { file_path, chunk_type, name, page_number, book, chapter, ... }
+    Chunk a PDF into:
+      - optional full page containers (chunk_type='pdf_page')
+      - semantic blocks / windows (chunk_type in {'para','heading','questions','answers','table','section'})
+
+    Standard metadata fields:
+      - file_path, relpath, file_name, file_ext
+      - profile: "document"
+      - chunk_type: as above
+      - page_number (1-based)
+      - name: "<file> :: p<N> [<label>]"
+      - (for windows) char_start/char_end within the block
     """
     rel = os.path.relpath(file_path)
-    emit = cfg.get("pdf_emit") or ["pdf_page"]
-    ocr_fallback = bool(cfg.get("ocr_fallback", True))
-    dehyphenate = bool(cfg.get("dehyphenate", True))
-    dedupe_headers = bool(cfg.get("dedupe_headers", True))
-    cap = int(cfg.get("max_pdf_chunk_chars", 16000))
+    base = os.path.basename(rel)
+    ext = os.path.splitext(base)[1].lower()
 
-    sem = cfg.get("pdf_semantic") or {}
-    sem_enabled = bool(sem.get("enabled", True))
-    sem_max_chars = int(sem.get("max_chars", 1100))
-    sem_overlap   = int(sem.get("overlap", 120))
+    # settings
+    emit = set(_get(cfg, "pdf_emit", default=["pdf_page", "pdf_blocks"]) or [])
+    ocr_fallback = bool(_get(cfg, "ocr_fallback", default=True))
+    dehy = bool(_get(cfg, "dehyphenate", default=True))
+    drop_headers = bool(_get(cfg, "dedupe_headers", default=True))
+    max_page_chunk = int(_get(cfg, "max_pdf_chunk_chars", default=16000) or 16000)
 
-    logger.info("pdf.chunk: begin '{}' emit={} sem={{enabled:{}, max_chars:{}, overlap:{}}}",
-                rel, emit, sem_enabled, sem_max_chars, sem_overlap)
+    sem_enabled = bool(_get(cfg, "pdf_semantic", "enabled", default=True))
+    sem_max = int(_get(cfg, "pdf_semantic", "max_chars", default=1100) or 1100)
+    sem_ov = int(_get(cfg, "pdf_semantic", "overlap", default=120) or 120)
+    preview_chars = int(_get(cfg, "metadata", "store_preview_chars", default=0) or 0)
+
+    logger.debug("pdf.chunk: begin '{}' emit={} ocr={} sem={} (max={}, ov={})",
+                 rel, sorted(emit), ocr_fallback, sem_enabled, sem_max, sem_ov)
 
     try:
         doc = fitz.open(file_path)
     except Exception as e:
-        logger.error("pdf.chunk: open failed for '{}': {}", rel, e)
+        logger.warning("pdf.chunk: failed to open '%s': %s", rel, e)
         return []
 
-    book, chapter = _infer_book_chapter(rel)
+    # pass 1: read each page text (with OCR fallback)
+    page_texts: List[str] = []
+    for page in doc:
+        txt = _extract_text_from_page(page, ocr_fallback)
+        if dehy:
+            txt = _dehyphenate(txt)
+        txt = _normalize_ws(txt)
+        page_texts.append(txt)
 
-    # ToC
-    toc = []
-    if "pdf_toc" in emit:
-        try:
-            toc = doc.get_toc(simple=True)  # [level, title, page]
-        except Exception as e:
-            logger.debug("pdf.chunk: get_toc failed: {}", e)
-
-    pages_raw = _page_texts(doc, ocr_fallback=ocr_fallback)
-    pages = [_clean_text(t, dehyphenate, dedupe_headers) for t in pages_raw]
+    # optional header/footer cleanup
+    if drop_headers:
+        page_texts = _dedupe_headers_footers(page_texts, enable=True)
 
     chunks: List[Dict[str, Any]] = []
 
-    # ---- ToC chunks ----
-    if "pdf_toc" in emit and toc:
-        for idx, (level, title, page) in enumerate(toc, start=1):
-            s = str(title).strip()
-            if not s:
+    # optional: page-level containers
+    if "pdf_page" in emit:
+        for i, text in enumerate(page_texts, start=1):
+            if not text.strip():
                 continue
+            if len(text) > max_page_chunk:
+                text = text[:max_page_chunk]
+            meta = {
+                "file_path": rel,
+                "relpath": rel,
+                "file_name": base,
+                "file_ext": ext,
+                "profile": "document",
+                "chunk_type": "pdf_page",
+                "name": f"{base} :: p{i}",
+                "page_number": i,
+            }
+            if preview_chars > 0:
+                meta["preview"] = text[:preview_chars]
             chunks.append({
-                "document": s,
-                "metadata": {
-                    "file_path": rel, "chunk_type": "toc", "level": int(level),
-                    "page_number": int(page), "book": book, "chapter": chapter
-                }
+                "id": _sha(f"{rel}:page:{i}"),
+                "document": text,
+                "metadata": meta,
             })
 
-    # ---- Per-page processing ----
-    for pno, text in enumerate(pages, start=1):
-        name = f"Page {pno}"
+    # semantic block extraction
+    if "pdf_blocks" in emit:
+        for i, text in enumerate(page_texts, start=1):
+            if not text.strip():
+                continue
+            blocks = _split_into_blocks(text)
+            # If no blank-line blocks, treat whole page as one block
+            if not blocks:
+                blocks = [text]
 
-        # Page container
-        if "pdf_page" in emit:
-            doc_page = f"PDF {rel} {name}\n\n{text}"
-            if cap and len(doc_page) > cap:
-                doc_page = doc_page[:cap]
-            chunks.append({
-                "document": doc_page,
-                "metadata": {
-                    "file_path": rel,
-                    "chunk_type": "pdf_page",
-                    "name": name,
-                    "page_number": pno,
-                    "book": book,
-                    "chapter": chapter,
-                }
-            })
+            for bi, block in enumerate(blocks):
+                kind = _classify_block(block)
+                label = "section" if kind in {"para", "heading"} else kind
 
-        # Paragraph windows (semantic structure)
-        if sem_enabled and "pdf_structure" in emit and text:
-            paras = _paragraphs(text)
-            windows = _window_paragraphs(paras, sem_max_chars, sem_overlap) if paras else []
-            for j, win in enumerate(windows, start=1):
-                s = f"Page {pno} — ¶window {j}\n\n{win}"
-                if cap and len(s) > cap:
-                    s = s[:cap]
-                chunks.append({
-                    "document": s,
-                    "metadata": {
+                if sem_enabled:
+                    windows = _semantic_windows(block, max_chars=sem_max, overlap=sem_ov)
+                else:
+                    windows = [(0, min(len(block), sem_max))]
+
+                for wi, (s, e) in enumerate(windows):
+                    seg = block[s:e]
+                    meta = {
                         "file_path": rel,
-                        "chunk_type": "paragraph",
-                        "name": f"{name} ¶{j}",
-                        "page_number": pno,
-                        "book": book,
-                        "chapter": chapter,
+                        "relpath": rel,
+                        "file_name": base,
+                        "file_ext": ext,
+                        "profile": "document",
+                        "chunk_type": kind,         # e.g., 'para','heading','questions','answers','table'
+                        "name": f"{base} :: p{i} :: {label} [{bi+1}.{wi+1}]",
+                        "page_number": i,
+                        "char_start": s,
+                        "char_end": e,
                     }
-                })
+                    if preview_chars > 0:
+                        meta["preview"] = seg[:preview_chars]
 
-        # Heuristic blocks (Questions/Answers/Tables/etc.)
-        if "pdf_blocks" in emit and text:
-            anchors = _split_anchors(text)
-            if anchors:
-                split_points = [a[0] for a in anchors] + [len(text)]
-                for bi in range(len(anchors)):
-                    start = anchors[bi][0]; end = split_points[bi + 1]
-                    label = anchors[bi][1]; heading = anchors[bi][2]
-                    sect = text[start:end].strip()
-                    ctype = label if label in _BLOCK_RX else "section"
-                    name2 = (heading[:80] or ctype.title())
-                    s = f"Page {pno} — {name2}\n\n{sect}"
-                    if cap and len(s) > cap:
-                        s = s[:cap]
                     chunks.append({
-                        "document": s,
-                        "metadata": {
-                            "file_path": rel,
-                            "chunk_type": "table" if ctype == "table" else
-                                          "qa"    if ctype == "qa"    else
-                                          "answer"if ctype == "answer"else
-                                          "questions" if ctype == "questions" else
-                                          "section",
-                            "name": name2,
-                            "page_number": pno,
-                            "book": book,
-                            "chapter": chapter,
-                        }
+                        "id": _sha(f"{rel}:p{i}:b{bi}:w{wi}:{s}:{e}"),
+                        "document": seg,
+                        "metadata": meta,
                     })
 
-    logger.info("pdf.chunk: done pages={} chunks={}", len(pages), len(chunks))
+    logger.info("pdf.chunk: done pages=%d chunks=%d", len(page_texts), len(chunks))
     return chunks

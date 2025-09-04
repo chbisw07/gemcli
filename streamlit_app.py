@@ -719,7 +719,8 @@ with colL:
 
 with colR:
     st.markdown("#### Options")
-    preview_only = st.checkbox("Force preview (dry run) where applicable", value=True)
+    # Removed the 'Force preview' UI; we infer dry-run from 'analysis_only'
+    preview_only = False
     show_raw_json = st.checkbox("Show raw JSON/tool outputs", value=False)
 
 # ------------ Log window ------------
@@ -978,6 +979,32 @@ if do_execute:
                 st.session_state["last_plan"] = agent.analyze_and_plan(prompt)
             render_plan(st.session_state["last_plan"])
             st.markdown("---")
+            # --- Router debug (ReasoningAgent only) ---
+            try:
+                if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
+                    info = agent.router_info() or {}
+                    with st.expander("Router debug", expanded=False):
+                        st.markdown(f"**Route:** `{info.get('route', '?')}`")
+                        scores = info.get("scores") or {}
+                        if scores:
+                            st.table([{"bucket": k, "score": round(v, 3)} for k, v in scores.items()])
+                        topk = info.get("top_k")
+                        if topk is not None:
+                            st.caption(f"Top-K: {topk}")
+            except Exception as _e:
+                logger.warning("Router debug panel failed: {}", _e)
+
+            try:
+                if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
+                    with st.expander("Tools visible to the model (by route)", expanded=False):
+                        names = agent.allowed_tool_names()  # route-aware, sorted
+                        if names:
+                            st.code("\n".join(names), language="text")
+                        else:
+                            st.caption("No tools (unlikely).")
+            except Exception as _e:
+                logger.warning("Toolbox panel failed: {}", _e)
+
             log("🚀 Executing plan...")
             logger.info("Executing planned steps…")
             results = execute_plan(st.session_state["last_plan"], analysis_only=analysis_only)

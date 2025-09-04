@@ -1,746 +1,338 @@
-# reasoning_agent.py
+# =========================
+# reasoning_agent.py  (full file)
+# =========================
+from __future__ import annotations
+
 import json
-import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from loguru import logger
 
 from agent import Agent
 from models import LLMModel
 from tools.registry import ToolRegistry
 
-# --- NEW: tiny helper to find BIND tokens like {{BIND:search_code.file0}} ---
-_BIND_RX = re.compile(r"\{\{BIND:([A-Za-z0-9_]+)\.([A-Za-z0-9_\-]+)\}\}")
+# NEW: central router + canonical tool specs/helpers
+from indexing.router import route_query
+from tools.tool_schema import (
+    TOOL_SPECS,
+    normalize_args,
+    allowlist_for_route,
+    apply_bindings,
+    looks_like_placeholder,
+    openai_schemas_from_specs
+)
 
-def _extract_bind_tokens(obj: Any) -> List[tuple[str, str]]:
-    s = ""
-    if isinstance(obj, str):
-        s = obj
-    return _BIND_RX.findall(s) if s else []
+# Tools that can modify files (we enforce dry-run in analysis_only mode)
+_EDIT_TOOLS = {"write_file", "replace_in_file", "bulk_edit", "rewrite_naive_open", "format_python_files"}
+
 
 class ReasoningAgent(Agent):
     """
-    Enhanced agent with multi-step reasoning capabilities:
-    - analyze_and_plan(): prompts the LLM with an EXACT tool spec (names + arg names)
-      so it produces a valid JSON plan.
-    - execute_plan(): runs steps safely and collects results.
-    - _normalize_step_args(): fixes common arg-name mistakes from LLM output.
+    Router-first agent that:
+      1) calls the centralized router (RAG-backed) to infer route (code/doc/hybrid/tabular),
+      2) builds a compact plan (no model planning required),
+      3) executes with guardrails (args validation, bindings, allowlist gating),
+      4) synthesizes a final answer grounded in retrieved chunks (and code hits when applicable).
+    Returns a JSON string of step results (compatible with the Streamlit UI).
     """
 
-    # ---- canonical tool specifications (names + exact arg names) ----
-    # Keep these in sync with tools/registry.py and tools/enhanced_registry.py
-    _TOOL_SPECS: Dict[str, Dict[str, Any]] = {
-        # registry.py tools
-        "scan_relevant_files": {
-            "required": [],
-            "allowed": {"prompt", "path", "subdir", "max_results", "exts"},
-            "defaults": {"prompt": "", "path": "", "subdir": "", "max_results": 200, "exts": [".py"]},
-        },
-        "search_code": {
-            "required": {"query"},
-            "allowed": {"query", "subdir", "regex", "case_sensitive", "exts", "max_results"},
-            "defaults": {"subdir": "", "regex": False, "case_sensitive": False, "exts": [".py"], "max_results": 2000},
-        },
-        "analyze_files": {
-            "required": {"paths"},
-            "allowed": {"paths", "max_bytes"},
-            "defaults": {"max_bytes": 8000},
-        },
-        "write_file": {
-            "required": {"path", "content"},
-            "allowed": {"path", "content", "overwrite", "backup"},
-            "defaults": {"overwrite": True, "backup": False},
-        },
-        "replace_in_file": {
-            "required": {"path", "find", "replace"},
-            "allowed": {"path", "find", "replace", "regex", "dry_run", "backup"},
-            "defaults": {"regex": False, "dry_run": False, "backup": True},
-        },
-        "format_python_files": {
-            "required": [],
-            "allowed": {"subdir", "line_length", "dry_run"},
-            "defaults": {"subdir": "", "line_length": 88, "dry_run": False},
-        },
-        "bulk_edit": {
-            "required": {"edits"},
-            "allowed": {"edits", "dry_run", "backup"},
-            "defaults": {"dry_run": True, "backup": True},
-        },
-        "rewrite_naive_open": {
-            "required": [],
-            "allowed": {"dir", "exts", "dry_run", "backup"},
-            "defaults": {"dir": ".", "exts": [".py"], "dry_run": True, "backup": True},
-        },
-
-        # enhanced_registry.py tools
-        "analyze_code_structure": {
-            "required": {"path"},
-            "allowed": {"path", "subdir"},
-            "defaults": {"subdir": ""},
-        },
-        "find_related_files": {
-            "required": {"main_file"},
-            "allowed": {"main_file"},
-            "defaults": {},
-        },
-        "detect_errors": {
-            "required": {"path"},
-            "allowed": {"path", "subdir"},
-            "defaults": {"subdir": ""},
-        },
-        "call_graph_for_function": {
-            "required": {"function"},
-            "allowed": {"function", "subdir", "depth"},
-            "defaults": {"subdir": "", "depth": 3},
-        },        
-    }
-
-    # common alias map to repair sloppy args from the LLM
-    _ARG_ALIASES: Dict[str, Dict[str, str]] = {
-        "write_file": {"filename": "path", "file": "path"},
-        "analyze_files": {"files": "paths", "file": "paths", "filename": "paths"},
-        "search_code": {"dir": "subdir", "path": "subdir"},
-        "format_python_files": {"dir": "subdir", "path": "subdir"},
-        "scan_relevant_files": {"dir": "path"},
-        "rewrite_naive_open": {"path": "dir"},
-        "analyze_code_structure": {"file": "path", "filename": "path"},
-        "find_related_files": {"file": "main_file", "filename": "main_file"},
-        "detect_errors": {"file": "path", "filename": "path", "files": "path"},
-        "replace_in_file": {"filename": "path", "file": "path"},
-        "bulk_edit": {},  # edits is already correct
-        "call_graph_for_function": {"name": "function", "level": "depth"},
-    }
-
-    # Map common synonyms → real tool names
-    _TOOL_REDIRECT = {
-        "analyze_function": "call_graph_for_function",
-    }
-
-    # Tools that mutate files and must be blocked (or dry-run) in analysis-only mode
-    _EDIT_TOOLS = {
-        "write_file", "replace_in_file", "bulk_edit",
-        "rewrite_naive_open", "format_python_files"
-    }
+    # canonical tool specs (imported)
+    _TOOL_SPECS: Dict[str, Dict[str, Any]] = TOOL_SPECS
 
     def __init__(self, model: LLMModel, tools: ToolRegistry, enable_tools: bool = True):
         super().__init__(model, tools, enable_tools)
-        logger.info("ReasoningAgent initialized (tools_enabled={})", enable_tools)
+        logger.info("ReasoningAgent (router-first) initialized: tools_enabled={}", enable_tools)
+        self._last_router: Dict[str, Any] = {}
 
-    def _try_direct_actions(self, query: str) -> Optional[str]:
-        """Handle call graph queries directly without planning for faster response."""
-        q = (query or "").lower().strip()
-        if "call graph" in q or "callgraph" in q:
-            match = re.search(r'of\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)?', q) or \
-                    re.search(r'for\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)?', q)
-            if match:
-                function_name = match.group(1)
-                logger.info("ReasoningAgent direct call_graph_for_function('{}')", function_name)
-                try:
-                    # Check if the tool is available
-                    if hasattr(self.tools, 'tools') and "call_graph_for_function" in self.tools.tools:
-                        result = self.tools.call("call_graph_for_function", function=function_name)
-                        return json.dumps(result, indent=2)
-                    else:
-                        return "[error] call_graph_for_function tool not available"
-                except Exception as e:
-                    logger.error("Direct call_graph_for_function failed: {}", e)
-                    return f"[error] call_graph_for_function failed: {e}"
-        
-        # Fall back to parent's direct actions for other queries
-        return super()._try_direct_actions(query)
+    # ---------------- public: router info for UI ----------------
+    def router_info(self) -> Dict[str, Any]:
+        return dict(self._last_router or {})
 
-    # ---------------- Planning: strict, grounded, example-driven ----------------
-    _PLAN_SYSTEM = (
-        "You are a careful *code* planner. Produce a small sequence of TOOL calls that are:\n"
-        "1) GROUNDED: Never invent file paths. First discover, then analyze.\n"
-        "2) CONCRETE: Use only the allowed tools and exact argument names.\n"
-        "3) EFFICIENT: 3–6 steps. Mark a step 'critical': true when later steps depend on it.\n"
-        "4) JSON ONLY: Return a JSON array of steps (no prose)."
-    )
+    # ---------------- routing + planning ----------------
 
-    _PLAN_USER_TMPL = """\
-Goal:
-{goal}
-
-Rules:
-- Never use placeholders like "path/to/*.py". If a file path is needed, add a prior discovery step first.
-- Typical flow:
-  - search_code / scan_relevant_files  → locate file(s)
-  - call_graph_for_function (depth={default_depth})  → structural context
-  - analyze_code_structure / detect_errors → targeted analysis on discovered file(s)
-- Always include {{ "subdir": "" }} when the tool allows it.
-- If your plan needs a path for a function, first *find that file* then pass the exact file path to later steps.
-
-Return JSON array like:
-[
-  {"tool": "search_code", "args": {"query": "def my_func", "subdir": "", "exts": [".py"], "max_results": 10}, "description": "Find file for my_func", "critical": true},
-  {"tool": "call_graph_for_function", "args": {"function": "my_func", "subdir": "", "depth": %DEPTH%}, "description": "Generate call graph", "critical": false},
-  {"tool": "analyze_code_structure", "args": {"path": "<BIND:search_code.file0>", "subdir": ""}, "description": "Analyze the file that defines my_func()", "critical": false}
-]
-"""
-
-    def _critique_and_fix_plan(self, plan: list[dict]) -> list[dict]:
+    def _route_and_seed(self, prompt: str) -> Tuple[str, Dict[str, Any], Dict[str, float]]:
         """
-        Post-process the LLM plan to avoid common failure modes:
-        - Replace placeholders like 'path/to/*.py' with real files when we can infer them.
-        - Inject missing defaults (e.g., subdir="").
-        - Normalize depth for call_graph_for_function.
-        The executor will still run with safety, but this prevents 80% of bad steps.
+        Use the centralized router to decide a route and fetch initial chunks.
+        Returns (route, rag_result, scores).
         """
-        fixed: list[dict] = []
-        last_found_file: str | None = None
-
-        def _looks_placeholder(p: str) -> bool:
-            return not p or "path/to" in p or p.strip() in {"<>", "<file>", "<path>","<BIND>"}
-
-        logger.debug("critique_and_fix_plan: input steps={}", len(plan or []))
-        for step in plan or []:
-            s = dict(step or {})
-            args = dict(s.get("args") or {})
-            tool = s.get("tool", "")
-
-            # Ensure subdir defaults where allowed
-            if tool in {"search_code", "format_python_files"}:
-                args.setdefault("subdir", "")
-            if tool in {"analyze_code_structure", "detect_errors", "call_graph_for_function"}:
-                args.setdefault("subdir", "")
-
-            # Normalize depth default
-            if tool == "call_graph_for_function":
-                args.setdefault("depth", 3)
-
-            # Placeholder binding hinting
-            if tool == "search_code":
-                # we can't know the result now; mark intention for binding
-                s["_expects_files"] = True
-            if tool in {"analyze_code_structure", "detect_errors"}:
-                path = args.get("path", "")
-                if isinstance(path, str) and _looks_placeholder(path) and last_found_file:
-                    args["path"] = last_found_file
-
-            s["args"] = args
-            fixed.append(s)
-
-        logger.debug("critique_and_fix_plan: output steps={}", len(fixed))
-        return fixed
-    
-    def analyze_and_plan(self, query: str) -> list:
-        """
-        Create a grounded, discovery-first execution plan.
-        Uses strict, example-driven planner prompts and then runs a
-        local critique/repair pass to remove placeholders and inject defaults.
-        """
-        default_depth = 3
-        user_msg = (
-            self._PLAN_USER_TMPL
-            .replace("{goal}", query)
-            .replace("{default_depth}", str(default_depth))
-            .replace("%DEPTH%", str(default_depth))
-        )
-        messages = [
-            {"role": "system", "content": self._PLAN_SYSTEM},
-            {"role": "user", "content": user_msg},
-        ]
-
-        # --- RAG-first planning hint (prefer PDFs; allow web only if needed) ---
         try:
-            # Your ToolRegistry exposes .tools (used elsewhere in this file)
-            available = sorted(getattr(self.tools, "tools", {}).keys())
-        except Exception:
-            available = []
+            info = route_query(project_root=str(self.tools.root), query=prompt)
+        except Exception as e:
+            logger.warning("router route_query failed: {}", e)
+            info = {"route": "document", "scores": {"code": 0, "document": 0, "tabular": 0}, "top_k": 0, "chunks": []}
 
-        rag_policy = (
-            "AVAILABLE_TOOLS:\n- " + "\n- ".join(available) + "\n\n"
-            "PLANNING POLICY:\n"
-            "• Use only AVAILABLE_TOOLS; do not invent tool names.\n"
-            "• Prefer RAG grounding from project PDFs using edu_* tools "
-            "(edu_detect_intent, edu_explain, edu_similar_questions, edu_question_paper) "
-            "and the retriever.\n"
-            "• Only consider web_search/web_fetch if RAG returns too little evidence "
-            "(heuristic: fewer than ~6 relevant chunks, or less than ~60% of context coming from PDFs).\n"
-            "• When you do use the web, explicitly cite the URLs and still keep book/PDF citations when present.\n"
-            "• If no grounded evidence is found at all, state that clearly rather than guessing.\n"
-        )
-        # Append as a system message so it has high weight but remains separate from _PLAN_SYSTEM
-        messages.append({
-            "role": "system",
-            "content": rag_policy
+        self._last_router = {"route": info.get("route"), "scores": info.get("scores"), "top_k": info.get("top_k")}
+        rag = {"chunks": info.get("chunks") or [], "top_k": info.get("top_k")}
+        logger.info("router: route={} scores={} top_k={}", self._last_router["route"], self._last_router["scores"], rag["top_k"])
+        return self._last_router["route"], rag, self._last_router["scores"]
+
+    def analyze_and_plan(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Build a *small*, deterministic plan (no LLM planning).
+        Steps are later filtered by a per-route allowlist.
+        """
+        route, _rag, _scores = self._route_and_seed(query)
+        plan: List[Dict[str, Any]] = []
+
+        # Always start with RAG (even for code; README/docs often help)
+        plan.append({
+            "tool": "rag_retrieve",
+            "args": {"query": query, "top_k": 12},
+            "description": "Retrieve top chunks for grounding",
+            "critical": True,
         })
 
-        try:
-            logger.info("ReasoningAgent.analyze_and_plan → planning for prompt='{}...'", (query or "")[:160])
-            resp = self.adapter.chat(messages)
-            content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
-            # Allow fenced JSON
-            m = re.search(r"```json\s*(\[.*?\])\s*```", content, re.DOTALL | re.IGNORECASE)
-            if m:
-                content = m.group(1)
-            plan = json.loads(content)
-            logger.info("Plan generated with {} step(s)", len(plan or []))
-        except Exception as e:
-            logger.warning("Planner failed: {}. Falling back to discovery-first plan.", e)
-            # Fallback: minimal discovery-first plan so executor can proceed
-            plan = [
+        if route == "code":
+            plan += [
+                {
+                    "tool": "scan_relevant_files",
+                    "args": {"prompt": query, "subdir": "", "exts": [".py"], "max_results": 50},
+                    "description": "Heuristically list likely files",
+                    "critical": False,
+                },
                 {
                     "tool": "search_code",
-                    "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 50},
-                    "description": "Discover relevant files",
+                    "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 200},
+                    "description": "Find matching lines in codebase",
+                    "critical": False,
+                },
+                {
+                    "tool": "_answer",
+                    "args": {"prompt": query},
+                    "description": "Synthesize answer using RAG + code hits",
+                    "critical": True,
+                },
+            ]
+        elif route == "hybrid":
+            plan += [
+                {
+                    "tool": "search_code",
+                    "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 120},
+                    "description": "Include code hits in addition to docs",
+                    "critical": False,
+                },
+                {
+                    "tool": "_answer",
+                    "args": {"prompt": query},
+                    "description": "Synthesize answer using doc + code context",
+                    "critical": True,
+                },
+            ]
+        else:  # document / tabular
+            plan += [
+                {
+                    "tool": "_answer",
+                    "args": {"prompt": query},
+                    "description": "Answer grounded in retrieved documents",
                     "critical": True,
                 }
             ]
-        # Final local guard-rails: clean up placeholders, inject defaults
-        return self._critique_and_fix_plan(plan)
-    
-    def _render_tool_spec_for_prompt(self) -> str:
-        lines = []
-        for name, spec in self._TOOL_SPECS.items():
-            allowed = ", ".join(sorted(spec["allowed"]))
-            required = ", ".join(sorted(spec["required"])) if spec["required"] else "(none)"
-            lines.append(f'- {name}({allowed})  REQUIRED: {required}')
-        out = "\n".join(lines)
-        logger.debug("render_tool_spec_for_prompt len={}", len(out))
+
+        # Enforce route-specific tool allowlist up front
+        allow = allowlist_for_route(route)
+        filtered: List[Dict[str, Any]] = []
+        for step in plan:
+            t = step.get("tool")
+            if t == "_answer" or t in allow:
+                filtered.append(step)
+            else:
+                logger.debug("analyze_and_plan: dropping tool '{}' not allowed for route '{}'", t, route)
+
+        logger.debug("analyze_and_plan: route={} steps={} (filtered from {})", route, len(filtered), len(plan))
+        return filtered
+
+    # ---------------- executor ----------------
+
+    def _normalize_step_args(self, tool: str, args: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        """Normalize/validate args against canonical TOOL_SPECS."""
+        ok, fixed, err = normalize_args(tool, args, specs=self._TOOL_SPECS)
+        return ok, fixed, err
+
+    def _apply_bindings(self, args: Dict[str, Any], last_by_tool: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve {{BIND:tool.field}} placeholders using central helper."""
+        return apply_bindings(args, last_by_tool)
+
+    def _looks_like_placeholder(self, val: Any) -> bool:
+        return looks_like_placeholder(val)
+
+    def _synthesize_answer(self, prompt: str, last_by_tool: Dict[str, Any]) -> str:
+        """Final model call using any context we have gathered."""
+        # Gather doc snippets
+        docs = []
+        rag = last_by_tool.get("rag_retrieve") or {}
+        for c in (rag.get("chunks") or [])[:12]:
+            md = c.get("metadata") or {}
+            tag = (md.get("file_path") or md.get("relpath") or "?")
+            extra = []
+            if md.get("page_number"):
+                extra.append(f"p.{md.get('page_number')}")
+            if md.get("chunk_type"):
+                extra.append(md.get("chunk_type"))
+            label = f"[{tag}{' ' + ', '.join(extra) if extra else ''}]"
+            body = c.get("document") or ""
+            docs.append(f"{label}\n{body}".strip())
+
+        # Gather code hits (search_code results)
+        code_hits = last_by_tool.get("search_code")
+        if isinstance(code_hits, dict) and isinstance(code_hits.get("result"), list):
+            hits = code_hits["result"][:50]
+            # compact format
+            paths: Dict[str, List[str]] = {}
+            for h in hits:
+                rel = h.get("file"); line = h.get("line"); txt = h.get("text")
+                if rel:
+                    paths.setdefault(rel, []).append(f"{line}: {txt}")
+            if paths:
+                code_block = [f"## {rel}\n" + "\n".join(lines[:10]) for rel, lines in paths.items()]
+                docs.append("\n\n".join(code_block))
+
+        context = ("\n\n".join(docs)).strip()
+        sys = (
+            "You are a precise coding/doc assistant. Cite from the provided CONTEXT by referring to "
+            "[file p.X] tags when helpful. If the context is insufficient, say so clearly and propose next steps."
+        )
+        user = (
+            f"QUESTION:\n{prompt}\n\n"
+            f"CONTEXT:\n{context if context else '(no retrieved context)'}\n\n"
+            "INSTRUCTIONS:\n"
+            "- Be concise and specific.\n"
+            "- If code changes are needed, outline them with filenames and diff hunks.\n"
+            "- If answering from PDFs, include page numbers when possible."
+        )
+        try:
+            resp = self.adapter.chat([
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ])
+            content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
+            return content or "(no content)"
+        except Exception as e:
+            logger.exception("final LLM call failed: {}", e)
+            return f"[error] {e}"
+
+    # --- add this helper inside class ReasoningAgent (anywhere above execute_plan) ---
+    def _apply_arg_aliases(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Rename common alias parameters to the canonical names expected by TOOL_SPECS.
+        Non-destructive: only maps if the canonical key isn't already present.
+        """
+        alias_map = {
+            "edu_explain": {
+                "text": "question_or_topic",
+                "query": "question_or_topic",
+            },
+            "rag_retrieve": {
+                "k": "top_k",
+            },
+        }
+        out = dict(args or {})
+        for src, dst in alias_map.get(tool, {}).items():
+            if src in out and dst not in out:
+                out[dst] = out.pop(src)
         return out
 
-    def _normalize_step_args(self, tool: str, args: Dict[str, Any]) -> (bool, Dict[str, Any], Optional[str]):
-        """
-        Enforce tool arg names and provide light aliasing. Returns (ok, fixed_args, error).
-        """
-        spec = self._TOOL_SPECS.get(tool)
-        if not spec:
-            logger.error("normalize_step_args: unknown tool '{}'", tool)
-            return False, {}, f"Unknown tool '{tool}'."
-        allowed = set(spec["allowed"])
-        required = set(spec["required"])
-        defaults = dict(spec.get("defaults", {}))
+    def execute_plan(self, plan: List[Dict[str, Any]], max_iters: int = 10, analysis_only: bool = False) -> str:
+        results: List[Dict[str, Any]] = []
+        last_by_tool: Dict[str, Any] = {}
+        logger.info("execute_plan: steps={} analysis_only={}", len(plan or []), analysis_only)
 
-        # 1) alias repair (e.g., filename->path, files->paths)
-        alias_map = self._ARG_ALIASES.get(tool, {})
-        repaired: Dict[str, Any] = {}
-        for k, v in (args or {}).items():
-            nk = alias_map.get(k, k)
-            repaired[nk] = v
+        # Per-route allowlist (double-check at execution time)
+        route = (self._last_router.get("route") or "document").lower()
+        allow = allowlist_for_route(route)
 
-        # 2) drop unknown keys
-        cleaned = {k: v for k, v in repaired.items() if k in allowed}
-
-        # 3) fill defaults
-        for k, v in defaults.items():
-            cleaned.setdefault(k, v)
-
-        # 4) special coercions
-        if tool == "analyze_files" and isinstance(cleaned.get("paths"), str):
-            cleaned["paths"] = [cleaned["paths"]]
-        if tool == "detect_errors":
-            v = cleaned.get("path")
-            if isinstance(v, list) and v:
-                cleaned["path"] = v[0]
-        if tool in {"format_python_files"} and "line_length" in cleaned:
-            try:
-                cleaned["line_length"] = int(cleaned["line_length"])
-            except Exception:
-                logger.error("normalize_step_args: line_length must be an integer")
-                return False, {}, "line_length must be an integer"
-
-        # 5) required checks
-        missing = required - set(cleaned.keys())
-        if missing:
-            logger.error("normalize_step_args: missing required args for {}: {}", tool, sorted(missing))
-            return False, {}, f"Missing required args for {tool}: {sorted(missing)}"
-
-        logger.debug("normalize_step_args OK for tool='{}' keys={}", tool, list(cleaned.keys()))
-        return True, cleaned, None
-
-    # ---------------- execution ----------------
-
-    def execute_plan(self, plan: list, max_iters: int = 10, analysis_only: bool = False) -> str:
-        """
-        Execute an LLM-generated plan step-by-step with safety checks
-        and clear, streamlit-friendly results.
-
-        If analysis_only=True, any edit-capable tool is run in preview mode
-        (dry-run when supported) and labelled as blocked-from-write.
-
-        Contract of each plan step:
-        {
-            "tool": "<registered tool name>",
-            "args": { ... concrete args ... },
-            "description": "what this step does",
-            "critical": true   # optional; default True
-        }
-        """
-        import json
-        results = []
-        last_by_tool: dict[str, Any] = {}  # keep outputs for {{BIND:...}} usage
-
-        # Track which tools produced at least one item we can work with
-        tool_nonempty: dict[str, bool] = {}
-
-        logger.info("ReasoningAgent.execute_plan begin: steps={} analysis_only={}", len(plan or []), analysis_only)
-
-        # --- execution-time web fallback guard (injects web context once if RAG is weak) ---
-        def _grounding_signal_from(out: Any) -> dict:
-            pdf = tot = 0
-            chunks = out.get("chunks") if isinstance(out, dict) else None
-            if isinstance(chunks, list):
-                for c in chunks:
-                    md = (c.get("metadata") or {}) if isinstance(c, dict) else {}
-                    if isinstance(md, dict):
-                        fp = (md.get("file_path") or "").lower()
-                        ct = (md.get("chunk_type") or "").lower()
-                        if fp.endswith(".pdf") or ct.startswith("pdf"):
-                            pdf += 1
-                        tot += 1
-            ratio = (pdf / max(1, tot))
-            return {"pdf_chunks": pdf, "total_chunks": tot, "pdf_ratio": ratio}
-        _web_fallback_done = False
-        _MIN_CHUNKS, _MIN_RATIO = 6, 0.60
-
-        # quick recursive placeholder detector
-        def _looks_like_placeholder(v) -> bool:
-            if isinstance(v, str):
-                s = v.strip().lower()
-                return (
-                    "previous_step" in s or "identified_file" in s
-                    or s.startswith("<") or s.endswith(">")
-                    or "tbd" == s or "placeholder" in s
-                )
-            if isinstance(v, (list, tuple, set)):
-                return any(_looks_like_placeholder(x) for x in v)
-            if isinstance(v, dict):
-                return any(_looks_like_placeholder(x) for x in v.values())
-            return False
-
-        # light alias map to fix common LLM slips
-        ARG_ALIASES = {
-            "write_file": {"filename": "path", "file": "path"},
-            "analyze_files": {"files": "paths", "file": "paths", "filename": "paths"},
-            "search_code": {"dir": "subdir", "path": "subdir"},
-            "format_python_files": {"dir": "subdir", "path": "subdir"},
-            "scan_relevant_files": {"dir": "path"},
-            "rewrite_naive_open": {"path": "dir"},
-            "analyze_code_structure": {"file": "path", "filename": "path"},
-            "find_related_files": {"file": "main_file", "filename": "main_file"},
-            "detect_errors": {"file": "path", "filename": "path", "files": "path"},
-            "replace_in_file": {"filename": "path", "file": "path"},
-            "bulk_edit": {},
-        }
-
-        # default values for a few tools (mirrors tools/registry.py)
-        DEFAULTS = {
-            "scan_relevant_files": {"prompt": "", "path": "", "subdir": "", "max_results": 200, "exts": [".py"]},
-            "search_code": {"subdir": "", "regex": False, "case_sensitive": False, "exts": [".py"], "max_results": 2000},
-            "analyze_files": {"max_bytes": 8000},
-            "write_file": {"overwrite": True, "backup": False},
-            "replace_in_file": {"regex": False, "dry_run": False, "backup": True},
-            "format_python_files": {"subdir": "", "line_length": 88, "dry_run": False},
-            "bulk_edit": {"dry_run": True, "backup": True},
-            "rewrite_naive_open": {"dir": ".", "exts": [".py"], "dry_run": True, "backup": True},
-            "analyze_code_structure": {"subdir": ""},
-            "find_related_files": {},
-            "detect_errors": {"subdir": ""},
-        }
-
-        if not isinstance(plan, list):
-            msg = "Plan must be a JSON array of steps."
-            logger.error("execute_plan: {}", msg)
-            return json.dumps([{"error": msg, "success": False}], indent=2)
-
-        for idx, step in enumerate(plan[:max_iters], start=1):
-            if isinstance(step, dict) and "error" in step and "tool" not in step:
-                logger.error("execute_plan: planner error at step {}: {}", idx, step.get("error"))
-                results.append({"step": idx, **step, "success": False})
-                break
-
-            if not isinstance(step, dict):
-                logger.error("execute_plan: invalid step type {} at {}", type(step), idx)
-                results.append({"step": idx, "error": f"Invalid step type: {type(step)}", "success": False})
-                break
-
+        for idx, step in enumerate(plan or [], start=1):
             tool = step.get("tool")
-            args = step.get("args", {}) or {}
-            desc = step.get("description", "")
-            critical = step.get("critical", True)
-            logger.info("execute_plan: step {} tool='{}' critical={} desc='{}'", idx, tool, critical, desc)
+            args = dict(step.get("args") or {})
+            desc = step.get("description") or ""
+            critical = bool(step.get("critical", True))
 
-            # Redirect synonyms first
-            target_tool = self._TOOL_REDIRECT.get(tool, tool)
-
-            if not target_tool or not hasattr(self.tools, "tools") or target_tool not in self.tools.tools:
-                logger.error("execute_plan: unknown/unregistered tool '{}'", tool)
-                results.append({
-                    "step": idx,
-                    "tool": target_tool,
-                    "description": desc,
-                    "error": f"Unknown or unregistered tool: {target_tool}",
-                    "success": False
-                })
+            # Enforce tool allowlist (virtual tool _answer is always allowed)
+            if tool != "_answer" and tool not in allow:
+                msg = f"Tool '{tool}' not allowed for route '{route}'"
+                results.append({"step": idx, "tool": tool, "description": desc, "error": msg, "success": False})
                 if critical:
                     break
                 continue
+            
+            # Normalize aliases first (e.g., text/query -> question_or_topic)
+            args = self._apply_arg_aliases(tool, args)
 
-            # block placeholders
-            if _looks_like_placeholder(args):
-                logger.error("execute_plan: placeholder argument at step {}: {}", idx, args)
-                results.append({
-                    "step": idx,
-                    "tool": tool,
-                    "description": desc,
-                    "error": f"Placeholder argument detected: {args}",
-                    "success": False
-                })
-                if critical:
-                    break
-                continue
-
-            # --------- Guard unresolved BINDs (skip step) ----------
-            # If args contain {{BIND:tool.fieldN}} and we *know* that tool was empty,
-            # skip gracefully instead of letting the tool crash.
-            def _iter_binds(obj):
-                if isinstance(obj, str):
-                    for t in _BIND_RX.findall(obj):
-                        yield t  # (tool_name, field_key)
-                elif isinstance(obj, dict):
-                    for v in obj.values():
-                        yield from _iter_binds(v)
-                elif isinstance(obj, (list, tuple)):
-                    for x in obj:
-                        yield from _iter_binds(x)
-            unresolved = any(tool_nonempty.get(tname) is False for (tname, _fld) in _iter_binds(args))
-            if unresolved:
-                logger.warning("execute_plan: skipping step {} '{}' due to unresolved BIND (previous tool had no results)", idx, tool)
-                results.append({"step": idx, "tool": tool, "description": desc, "skipped": True, "reason": "unresolved_bind"})
-                continue
-
-            # --------- BIND placeholders: {{BIND:search_code.file0}} ----------
-            def _bind_value(v):
-                if isinstance(v, str):
-                    import re
-                    # support {{BIND:tool.fieldN}}  OR  <BIND:tool.fieldN>
-                    m = re.match(r"^\{\{BIND:(\w+)\.([A-Za-z_]+)(\d+)\}\}$", v) \
-                        or re.match(r"^<BIND:(\w+)\.([A-Za-z_]+)(\d+)>$", v)
-                    if m:
-                        tname, field, idx = m.group(1), m.group(2), int(m.group(3))
-                        src = last_by_tool.get(tname)
-                        # Case A: previous tool returned a list (of dicts/strings)
-                        if isinstance(src, list):
-                            if 0 <= idx < len(src):
-                                item = src[idx]
-                                if isinstance(item, dict):
-                                    return item.get(field, v)
-                                # e.g., list of file paths and field == "file" or "path"
-                                if isinstance(item, str) and field in {"file", "path"}:
-                                    return item
-                        # Case B: previous tool returned a dict (common: {"files":[...], "paths":[...]})
-                        if isinstance(src, dict):
-                            # try plural then singular
-                            for key in (field + "s", field):
-                                val = src.get(key)
-                                if isinstance(val, list) and 0 <= idx < len(val):
-                                    return val[idx]
-                                if isinstance(val, dict):
-                                    # very rare, but keep symmetry with list-of-dicts
-                                    return val.get(str(idx), v)
-                return v
-            def _bind_obj(obj):
-                if isinstance(obj, dict):
-                    return {k: _bind_obj(_bind_value(v)) for k, v in obj.items()}
-                if isinstance(obj, list):
-                    return [_bind_obj(_bind_value(x)) for x in obj]
-                return _bind_value(obj)
-            args = _bind_obj(args)
-
-            # --------- Normalize args strictly against tool spec ----------
-            ok, fixed_args, err = self._normalize_step_args(target_tool, args)
+            # Normalize + validate
+            ok, fixed_args, err = self._normalize_step_args(tool, args)
             if not ok:
-                results.append({
-                    "step": idx,
-                    "tool": target_tool,
-                    "description": desc,
-                    "error": err,
-                    "success": False
-                })
-                logger.error("execute_plan: normalization failed for '{}' at step {}: {}", target_tool, idx, err)
+                results.append({"step": idx, "tool": tool, "description": desc, "error": err, "success": False})
                 if critical:
                     break
-                continue
-
-            # coerce some expected shapes
-            if tool == "analyze_files" and isinstance(fixed_args.get("paths"), str):
-                fixed_args["paths"] = [fixed_args["paths"]]
-            if tool == "detect_errors":
-                v = fixed_args.get("path")
-                if isinstance(v, list) and v:
-                    fixed_args["path"] = v[0]
-            if tool == "format_python_files" and "line_length" in fixed_args:
-                try:
-                    fixed_args["line_length"] = int(fixed_args["line_length"])
-                except Exception:
-                    logger.error("execute_plan: line_length must be an integer (step {})", idx)
-                    results.append({
-                        "step": idx,
-                        "tool": tool,
-                        "description": desc,
-                        "error": "line_length must be an integer",
-                        "success": False
-                    })
-                    if critical:
-                        break
+                else:
                     continue
 
-            # fill defaults where missing (use the post-redirect tool name)
-            for dk, dv in DEFAULTS.get(target_tool, {}).items():
-                fixed_args.setdefault(dk, dv)
+            # Dry-run guard for editing tools (if analysis_only)
+            if analysis_only and tool in _EDIT_TOOLS:
+                fixed_args = dict(fixed_args)
+                if "dry_run" in (self._TOOL_SPECS.get(tool) or {}).get("allowed", set()):
+                    fixed_args["dry_run"] = True
 
-            # call the tool
-            # If web fallback ran earlier and this is an edu_* tool, forward fetched pages
-            if isinstance(target_tool, str) and target_tool.startswith("edu_"):
-                try:
-                    wfb = last_by_tool.get("web_fetch_batch")
-                    if wfb and "web_fetch_batch" not in fixed_args:
-                        fixed_args["web_fetch_batch"] = wfb
-                except Exception:
-                    pass
+            # Resolve BIND placeholders against earlier outputs
+            fixed_args = self._apply_bindings(fixed_args, last_by_tool)
 
-            try:
-                out = self.tools.call(target_tool, **fixed_args)
-                rec = {
-                    "step": idx,
-                    "tool": target_tool,
-                    "description": desc,
-                    "args": fixed_args,
-                    "result": out,
-                    "success": True
-                }
+            # Block obvious placeholders
+            if self._looks_like_placeholder(fixed_args):
+                results.append({"step": idx, "tool": tool, "description": desc, "error": f"Placeholder args: {fixed_args}", "success": False})
+                if critical:
+                    break
+                else:
+                    continue
+
+            # Virtual tool: _answer
+            if tool == "_answer":
+                out_text = self._synthesize_answer(fixed_args.get("prompt", ""), last_by_tool)
+                rec = {"step": idx, "tool": tool, "description": desc, "args": fixed_args, "result": out_text, "success": True}
                 results.append(rec)
-                logger.info("execute_plan: tool '{}' OK (step {})", target_tool, idx)
-                last_by_tool[target_tool] = out
+                last_by_tool[tool] = rec
+                continue
 
-                # --- Mark tool non-empty for downstream BIND guard ---
-                nonempty: Optional[bool] = None
-                # Common shapes: dict with list fields, a bare list, or an explicit count
-                if isinstance(out, dict):
-                    for key in ("chunks", "files", "ids", "documents", "items", "results", "matches"):
-                        v = out.get(key)
-                        if isinstance(v, list) and len(v) > 0:
-                            nonempty = True
-                            break
-                    if nonempty is None:
-                        cnt = out.get("count")
-                        if isinstance(cnt, int):
-                            nonempty = (cnt > 0)
-                elif isinstance(out, list):
-                    nonempty = (len(out) > 0)
-                # Default optimistic if unknown shape
-                if nonempty is None:
-                    nonempty = True
-                tool_nonempty[target_tool] = bool(nonempty)
-
-
-                # --- Automatic web fallback (once) when RAG grounding looks weak ---
-                # Trigger only for retrieval-like outputs (those with "chunks").
-                if (not _web_fallback_done) and isinstance(out, dict) and isinstance(out.get("chunks"), list):
-                    sig = _grounding_signal_from(out)
-                    weak = (sig["total_chunks"] < _MIN_CHUNKS) or (sig["pdf_ratio"] < _MIN_RATIO)
-                    # Avoid web fallback for explicit education tools by default
-                    is_edu = target_tool.startswith("edu_") or ("edu_detect_intent" in last_by_tool)
-
-                    # Only if web tools are registered
-                    available = set(getattr(self.tools, "tools", {}).keys()) if hasattr(self.tools, "tools") else set()
-                    web_ok = {"web_search", "web_fetch"}.issubset(available)
-
-                    if weak and web_ok and not is_edu:
-                        # Derive a query best-effort
-                        q = (fixed_args.get("query") or fixed_args.get("topic") or desc or "").strip()
-                        if q:
-                            try:
-                                ws = self.tools.call("web_search", query=q, max_results=5)
-                                results.append({
-                                    "step": f"{idx}.a",
-                                    "tool": "web_search",
-                                    "description": f"Automatic web fallback for weak grounding (pdf_ratio={sig['pdf_ratio']:.2f}, total_chunks={sig['total_chunks']})",
-                                    "args": {"query": q, "max_results": 5},
-                                    "result": ws,
-                                    "success": True
-                                })
-                                urls = [r.get("url") for r in (ws.get("results") or []) if isinstance(r, dict)]
-                                urls = [u for u in urls if u][:2]
-                                wf_batch = []
-                                for u in urls:
-                                    wf = self.tools.call("web_fetch", url=u, max_chars=60000)
-                                    wf_batch.append(wf)
-                                    results.append({
-                                        "step": f"{idx}.b",
-                                        "tool": "web_fetch",
-                                        "description": "Fetch page for fallback grounding",
-                                        "args": {"url": u, "max_chars": 60000},
-                                        "result": wf, "success": True
-                                    })
-                                last_by_tool["web_search"] = ws
-                                last_by_tool["web_fetch_batch"] = wf_batch
-                                logger.info("execute_plan: auto web fallback injected urls={}", urls)
-                                _web_fallback_done = True
-                            except Exception as _e:
-                                logger.warning("execute_plan: web fallback failed (ignored): {}", _e)
-
+            # Real tool
+            try:
+                out = self.tools.call(tool, **fixed_args)
+                rec = {"step": idx, "tool": tool, "description": desc, "args": fixed_args, "result": out, "success": True}
+                results.append(rec)
+                # For web_* tools, keep the whole record (args+result) for downstream BINDs
+                last_by_tool[tool] = rec if tool.startswith("web_") else out
+                logger.info("execute_plan: '{}' OK", tool)
             except Exception as e:
-                results.append({
-                    "step": idx,
-                    "tool": target_tool,
-                    "description": desc,
-                    "args": fixed_args,
-                    "error": str(e),
-                    "success": False
-                })
-                logger.exception("execute_plan: tool '{}' failed at step {}: {}", target_tool, idx, e)
+                results.append({"step": idx, "tool": tool, "description": desc, "error": str(e), "success": False})
+                logger.exception("execute_plan: '{}' failed: {}", tool, e)
                 if critical:
                     break
 
-        # ---------------- final summarization (Part-1) ----------------
-        # In analysis-only mode, produce a unified, natural-language report
-        # over all collected step results. We append it as a final step so
-        # the return type remains a list for existing UI code.
-        try:
-            if analysis_only:
-                summary_prompt = (
-                    "Synthesize a concise, actionable report from these execution results.\n"
-                    f"RESULTS JSON:\n{json.dumps(results, indent=2)}"
-                    "Focus on:\n"
-                    "1) Root cause(s)\n"
-                    "2) Supporting evidence with file/line where possible\n"
-                    "3) Risks/unknowns\n"
-                    "4) Recommended fix steps (do NOT write or apply code)\n\n"                    
-                )
-                resp = self.adapter.chat([
-                    {"role": "system", "content": "You are a precise code analyst. Be concrete and terse."},
-                    {"role": "user", "content": summary_prompt},
-                ])
-                content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
-                results.append({
-                    "step": "final",
-                    "tool": "_summarize",
-                    "report": content,
-                    "success": True
-                })
-                logger.info("execute_plan: summarization appended (len={})", len(content or ""))
-        except Exception as _e:
-            logger.warning("execute_plan: summarizer failed (ignored): {}", _e)
-
         out_json = json.dumps(results, indent=2)
-        logger.info("ReasoningAgent.execute_plan end: steps={} ok={} fail={}",
-                    len(results),
-                    sum(1 for r in results if r.get("success")),
-                    sum(1 for r in results if not r.get("success")))
-        logger.debug("execute_plan: results json size={} bytes", len(out_json.encode("utf-8")))
+        logger.info(
+            "execute_plan: done ok={} fail={} steps={}",
+            sum(1 for r in results if r.get("success")),
+            sum(1 for r in results if not r.get("success")),
+            len(results),
+        )
         return out_json
 
-    # ---------------- main entry ----------------
+    def openai_tool_schemas(self, route: str | None = None) -> list[dict]:
+        """
+        Return OpenAI function/tool schemas filtered by the router's route.
+        Use this if you want to give the model a smaller, route-aware toolset.
+        """
+        r = (route or (self._last_router.get("route") if isinstance(self._last_router, dict) else None) or "document").lower()
+        allow = allowlist_for_route(r)
+        specs = {k: v for k, v in TOOL_SPECS.items() if k in allow and not k.startswith("_")}
+        return openai_schemas_from_specs(specs)
+
+    def allowed_tool_names(self, route: str | None = None) -> list[str]:
+        """
+        Convenience for UIs: which tools are visible for this route?
+        """
+        r = (route or (self._last_router.get("route") if isinstance(self._last_router, dict) else None) or "document").lower()
+        return sorted(t for t in allowlist_for_route(r) if not t.startswith("_"))
+
+    # ---------------- entrypoint ----------------
 
     def ask_with_planning(self, query: str, max_iters: int = 10, analysis_only: bool = False) -> str:
-        """High-level: try fast-path direct actions; else plan + execute."""
-        direct = self._try_direct_actions(query)
-        if direct is not None:
-            logger.info("ask_with_planning → served via direct path")
-            return direct
-
         plan = self.analyze_and_plan(query)
-        logger.debug("ask_with_planning: executing plan of {} step(s)", len(plan or []))
-        return self.execute_plan(plan, max_iters, analysis_only=analysis_only)
+        return self.execute_plan(plan, max_iters=max_iters, analysis_only=analysis_only)

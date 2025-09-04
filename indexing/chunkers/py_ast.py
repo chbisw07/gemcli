@@ -1,68 +1,220 @@
 # indexing/chunkers/py_ast.py
-import ast, os, hashlib
+from __future__ import annotations
+
+import os
+import ast
+import hashlib
+from typing import List, Dict, Any, Tuple, Optional
 from loguru import logger
 
+
 def _sha(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+    return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()
 
-def chunk(file_path: str, cfg: dict):
-    logger.debug("py_ast.chunk: begin '{}'", file_path)
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
-        src = fh.read()
+
+def _get(cfg: dict, *path, default=None):
+    """Safe nested get: _get(cfg, "chunking", "code", "max_lines", default=120)."""
+    cur = cfg or {}
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _read_lines(file_path: str) -> List[str]:
     try:
-        tree = ast.parse(src)
-    except SyntaxError as e:
-        logger.warning("py_ast.chunk: SyntaxError in '{}': {}", file_path, e)
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read().splitlines()
+    except Exception as e:
+        logger.warning("py_ast.chunk: failed to read '%s': %s", file_path, e)
         return []
-    lines = src.splitlines()
-    chunks = []
 
-    # module chunk
-    chunks.append({
-        "id": _sha(file_path + ":module"),
-        "document": src[: cfg["chunking"]["py"]["max_body_chars"]],
-        "metadata": {
-            "file_path": os.path.relpath(file_path),
-            "symbol_kind": "module",
-            "symbol_name": os.path.basename(file_path),
-            "qualified_name": os.path.relpath(file_path),
-            "start_line": 1,
-            "end_line": len(lines),
-        }
-    })
 
-    class V(ast.NodeVisitor):
-        def __init__(self): self.stack=[]
-        def _emit(self, node, kind, qname):
-            start = getattr(node, "lineno", 1)
-            end = getattr(node, "end_lineno", start)
-            body = "\n".join(lines[start-1:end])
-            doc = ast.get_docstring(node) or ""
-            text = f"{kind} {qname}\n\nDocstring:\n{doc}\n\nBody:\n{body}"
-            chunks.append({
-                "id": _sha(file_path + ":" + qname),
-                "document": text[: cfg["chunking"]["py"]["max_body_chars"]],
-                "metadata": {
-                    "file_path": os.path.relpath(file_path),
-                    "symbol_kind": kind,
-                    "symbol_name": getattr(node, "name", qname.split(".")[-1]),
-                    "qualified_name": f"{os.path.relpath(file_path)}:{qname}",
-                    "start_line": start,
-                    "end_line": end,
-                }
-            })
-        def visit_ClassDef(self, node):
-            self.stack.append(node.name)
-            self._emit(node, "class", ".".join(self.stack))
-            self.generic_visit(node)
-            self.stack.pop()
-        def visit_FunctionDef(self, node):
-            kind = "method" if self.stack else "function"
-            self.stack.append(node.name)
-            self._emit(node, kind, ".".join(self.stack))
-            self.stack.pop()
-        def visit_AsyncFunctionDef(self, node): self.visit_FunctionDef(node)
+def _node_span(node: ast.AST, total_lines: int, fallback_end: Optional[int] = None) -> Tuple[int, int]:
+    """
+    Return 1-based (start_line, end_line) for an AST node.
+    Prefers node.end_lineno when available; otherwise uses the provided fallback_end.
+    """
+    start = getattr(node, "lineno", 1)
+    end = getattr(node, "end_lineno", None)
+    if end is None:
+        end = fallback_end if isinstance(fallback_end, int) and fallback_end >= start else total_lines
+    # Clamp
+    start = max(1, min(start, total_lines))
+    end = max(start, min(end, total_lines))
+    return start, end
 
-    V().visit(tree)
-    logger.debug("py_ast.chunk: done defs={} chunks={}", sum(1 for _ in ast.walk(tree) if isinstance(_, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))), len(chunks))
+
+def _collect_defs(tree: ast.AST, total_lines: int) -> List[Tuple[str, int, int]]:
+    """
+    Collect top-level function/class defs and class methods as (label, start, end).
+    Label examples: 'def foo', 'class Bar', 'Bar.method'.
+    """
+    spans: List[Tuple[str, int, int]] = []
+
+    # Top-level defs/classes
+    module_body = getattr(tree, "body", []) or []
+    for i, node in enumerate(module_body):
+        nxt = module_body[i + 1] if (i + 1) < len(module_body) else None
+        nxt_start = getattr(nxt, "lineno", None)
+
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start, end = _node_span(node, total_lines, fallback_end=(nxt_start - 1) if nxt_start else None)
+            spans.append((f"def {node.name}", start, end))
+
+        elif isinstance(node, ast.ClassDef):
+            c_start, c_end = _node_span(node, total_lines, fallback_end=(nxt_start - 1) if nxt_start else None)
+            spans.append((f"class {node.name}", c_start, c_end))
+
+            # Methods inside the class
+            body = getattr(node, "body", []) or []
+            for j, m in enumerate(body):
+                if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # Fallback: limit by next sibling or class end
+                    nxt2 = body[j + 1] if (j + 1) < len(body) else None
+                    nxt2_start = getattr(nxt2, "lineno", None)
+                    m_start, m_end = _node_span(m, total_lines, fallback_end=(nxt2_start - 1) if nxt2_start else c_end)
+                    spans.append((f"{node.name}.{m.name}", m_start, m_end))
+
+    # Sort and merge small gaps/overlaps lightly
+    spans.sort(key=lambda x: (x[1], x[2]))
+    merged: List[Tuple[str, int, int]] = []
+    for label, s, e in spans:
+        if not merged:
+            merged.append((label, s, e))
+            continue
+        prev_label, ps, pe = merged[-1]
+        if s <= pe + 1 and (e - ps) <= 2000:  # simple coalescing rule for near-adjacent blocks
+            merged[-1] = (f"{prev_label}; {label}", ps, max(pe, e))
+        else:
+            merged.append((label, s, e))
+    return merged
+
+
+def _window(lines: List[str], start_line: int, end_line: int, max_lines: int, overlap: int) -> List[Tuple[int, int]]:
+    """
+    Break a (start_line, end_line) segment into windows (1-based inclusive line numbers).
+    """
+    out: List[Tuple[int, int]] = []
+    step = max(1, max_lines - overlap)
+    cur = start_line
+    while cur <= end_line:
+        last = min(end_line, cur + max_lines - 1)
+        out.append((cur, last))
+        if last == end_line:
+            break
+        cur = last - overlap + 1
+    return out
+
+
+def _make_chunk(rel: str, base: str, ext: str, window_lines: List[str], line_start: int, line_end: int,
+                label: str, preview_chars: int) -> Dict[str, Any]:
+    text = "\n".join(window_lines)
+    meta = {
+        "file_path": rel,
+        "relpath": rel,
+        "file_name": base,
+        "file_ext": ext,
+        "profile": "code",
+        "chunk_type": "code_block",
+        "name": f"{base} :: {label} :: L{line_start}-{line_end}",
+        "line_start": line_start,
+        "line_end": line_end,
+        "lang": "python",
+        "symbols": [label] if label else [],
+    }
+    if preview_chars and preview_chars > 0:
+        meta["preview"] = text[:preview_chars]
+    return {
+        "id": _sha(f"{rel}:{line_start}:{line_end}:{label}"),
+        "document": text,
+        "metadata": meta,
+    }
+
+
+def chunk(file_path: str, cfg: dict) -> List[Dict[str, Any]]:
+    """
+    Chunk a Python source file using AST-aware boundaries (functions/classes/methods),
+    with a fallback to fixed-size line windows.
+
+    Metadata fields:
+      - file_path, relpath, file_name, file_ext
+      - profile: "code"
+      - chunk_type: "code_block"
+      - name: "<file> :: <symbol> :: L<start>-<end>"
+      - line_start, line_end (1-based, inclusive)
+      - lang: "python"
+      - symbols: [ "Class.method" | "def foo" | ... ]
+      - preview: optional first N chars (controlled by settings.metadata.store_preview_chars)
+    """
+    logger.debug("py_ast.chunk: begin '%s'", file_path)
+
+    lines = _read_lines(file_path)
+    if not lines:
+        return []
+
+    # Settings with safe fallbacks
+    max_lines = int(_get(cfg, "chunking", "code", "max_lines", default=120) or 120)
+    overlap = int(_get(cfg, "chunking", "code", "overlap_lines", default=20) or 20)
+    preview_chars = int(_get(cfg, "metadata", "store_preview_chars", default=0) or 0)
+
+    rel = os.path.relpath(file_path)
+    base = os.path.basename(rel)
+    ext = os.path.splitext(base)[1].lower()
+    total = len(lines)
+
+    # Parse AST and collect spans; if parsing fails, fall back to whole-file windowing
+    spans: List[Tuple[str, int, int]] = []
+    try:
+        tree = ast.parse("\n".join(lines), filename=base)
+        spans = _collect_defs(tree, total)
+    except Exception as e:
+        logger.warning("py_ast.chunk: AST parse failed for '%s': %s (falling back)", rel, e)
+        spans = []
+
+    chunks: List[Dict[str, Any]] = []
+
+    if spans:
+        # Window each span if needed
+        for label, s, e in spans:
+            if e < s:
+                continue
+            length = e - s + 1
+            if length <= max_lines:
+                windowed = [(s, e)]
+            else:
+                windowed = _window(lines, s, e, max_lines, overlap)
+            for ws, we in windowed:
+                segment = lines[ws - 1: we]
+                chunks.append(_make_chunk(rel, base, ext, segment, ws, we, label, preview_chars))
+
+        # Include any uncovered regions (e.g., module docstring, imports) via coarse windows
+        covered = [False] * (total + 1)
+        for _, s, e in spans:
+            for i in range(max(1, s), min(total, e) + 1):
+                covered[i] = True
+        i = 1
+        while i <= total:
+            if covered[i]:
+                i += 1
+                continue
+            j = i
+            while j <= total and not covered[j]:
+                j += 1
+            # [i, j-1] is an uncovered region
+            for ws, we in _window(lines, i, j - 1, max_lines, overlap):
+                segment = lines[ws - 1: we]
+                chunks.append(_make_chunk(rel, base, ext, segment, ws, we, "module", preview_chars))
+            i = j
+    else:
+        # No AST spans; do whole-file windowing
+        for ws, we in _window(lines, 1, total, max_lines, overlap):
+            segment = lines[ws - 1: we]
+            chunks.append(_make_chunk(rel, base, ext, segment, ws, we, "module", preview_chars))
+
+    logger.debug(
+        "py_ast.chunk: done file='%s' lines=%d chunks=%d max_lines=%d overlap=%d",
+        rel, total, len(chunks), max_lines, overlap
+    )
     return chunks

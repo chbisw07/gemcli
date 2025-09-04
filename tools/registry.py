@@ -1,4 +1,6 @@
-# tools/registry.py
+# =========================
+# tools/registry.py  (full file)
+# =========================
 from __future__ import annotations
 
 import re
@@ -23,6 +25,11 @@ from tools.edu_tools import (
     edu_similar_questions, edu_question_paper, edu_explain, edu_extract_tables
 )
 from tools.web_tools import web_search, web_fetch
+# NEW — blueprint & generation helpers
+from tools.edu_blueprint import build_blueprint as _bp_build, save_blueprint as _bp_save, load_blueprint as _bp_load
+from tools.edu_parsers import parse_weightage_request as _parse_weightage
+from tools.edu_generator import collect_exemplars as _collect_exemplars, build_generation_pack as _build_pack
+
 
 class ToolRegistry:
     """
@@ -112,7 +119,7 @@ class ToolRegistry:
         )(fn)
         self.tools[name] = wrapped
         logger.debug("Registered tool '{}'", name)
-    
+
     def call(self, name: str, **kwargs) -> Any:
         if name not in self.tools:
             logger.error("call: tool '{}' not registered", name)
@@ -131,14 +138,54 @@ class ToolRegistry:
     # -------------------- built-in tools ---------------------
 
     def _register_builtin_tools(self):
+        # ---------- rag_retrieve ----------
+        def rag_retrieve(
+            query: str,
+            top_k: int | None = None,
+            where: Dict[str, Any] | None = None,
+            min_score: float | None = None,
+            rag_path: str | None = None,
+            project_root: str | None = None,
+        ) -> Dict[str, Any]:
+            """
+            Retrieve top chunks from the project's Chroma index, with optional metadata filters.
+            Defaults:
+              - project_root: this registry's root
+              - rag_path: config_home.GLOBAL_RAG_PATH
+            Returns: {"chunks":[{id, document, metadata, score, distance}], "top_k":int, ...}
+            """
+            try:
+                from indexing.retriever import retrieve as _retrieve
+                from config_home import GLOBAL_RAG_PATH
+            except Exception as e:  # pragma: no cover
+                logger.error("rag_retrieve import failed: {}", e)
+                raise
+            pr = project_root or str(self.root)
+            rp = rag_path or str(GLOBAL_RAG_PATH)
+            res = _retrieve(project_root=pr, rag_path=rp, query=query, k=top_k, where=where, min_score=min_score)
+            logger.info("rag_retrieve: query='{}...' hits={} where_keys={} threshold={}", (query or "")[:80], len(res.get("chunks") or []), list((where or {}).keys()), min_score)
+            return res
+
         # ---------- read_file ----------
-        def read_file(path: str) -> str:
-            p = self.root / path
+        @log_call
+        def read_file(path: str, subdir: str = "") -> str:
+            """
+            Read a text file.
+            - Accepts optional `subdir` so the planner can pass it.
+            - Uses the existing resolver to be flexible with partial paths / filenames.
+            """
+            # Try flexible resolution first
+            resolved = self._resolve_path(path, subdir=subdir) or path
+            p = (self.root / resolved).resolve()
             if not p.exists() or not p.is_file():
-                logger.error("read_file: not found '{}'", path)
+                logger.error("read_file: not found '{}' (resolved from path='{}', subdir='{}')", str(p), path, subdir)
                 raise FileNotFoundError(f"Not found: {path}")
-            text = p.read_text(encoding="utf-8", errors="ignore")
-            logger.info("read_file: '{}' bytes={}", path, len(text.encode("utf-8")))
+            try:
+                text = p.read_text(encoding="utf-8", errors="ignore")
+            except UnicodeDecodeError:
+                # Fall back to binary read -> decode best effort
+                text = p.read_bytes().decode("utf-8", errors="ignore")
+            logger.info("read_file: '{}' bytes={}", self._rel(p), len(text.encode("utf-8")))
             return text
 
         # ---------- list_files ----------
@@ -538,7 +585,7 @@ class ToolRegistry:
                 results.append(
                     {
                         "path": str(p.relative_to(self.root)),
-                        "replacements": 1,  # at least one with-block introduced; you could count more precisely if desired
+                        "replacements": 1,  # at least one with-block introduced; could count precisely
                         "dry_run": bool(dry_run),
                         "diff": diff,
                     }
@@ -547,7 +594,115 @@ class ToolRegistry:
             logger.info("rewrite_naive_open: changed_files={} dir='{}' dry_run={}", changed_files, dir, dry_run)
             return results
 
+        # ---------- edu_build_blueprint ----------
+        def edu_build_blueprint(
+            subject: str,
+            klass: int,
+            board: str = "CBSE",
+            filename_hint: str | None = None,
+            session: str = "",
+        ) -> dict:
+            """
+            Parse 'General Instructions' + section rules from indexed SQPs/syllabi and save a blueprint JSON.
+            Returns: {"blueprint": {...}, "saved_to": "<relpath>"}
+            """
+            try:
+                bp = _bp_build(
+                    project_root=str(self.root),
+                    subject=subject,
+                    klass=int(klass),
+                    board=board,
+                    filename_hint=filename_hint,
+                    session=session,
+                )
+                p = _bp_save(str(self.root), bp)
+                return {"blueprint": bp.to_dict(), "saved_to": str(p.relative_to(self.root))}
+            except Exception as e:
+                logger.exception("edu_build_blueprint failed: {}", e)
+                raise
+
+        # ---------- edu_generate_paper ----------
+        def edu_generate_paper(
+            subject: str,
+            klass: int,
+            weightage: str | None = None,
+            total_questions: int | None = None,
+            total_marks: int | None = None,
+            include_solutions: bool = True,
+            board: str = "CBSE",
+            seed: int | None = None,
+            filename_hint: str | None = None,
+        ) -> dict:
+            """
+            Produce a generation pack (system/user messages) for a new paper + optional solutions,
+            honoring a blueprint and a free-text weightage request (e.g., '.25/.25/.50 short/medium/long').
+            Returns: {
+              "blueprint": {...},
+              "distribution": {...},
+              "generation_pack": {"system": "...", "user": "..."},
+              "seed": <int or null>,
+              "suggested_messages": [...]
+            }
+            """
+            try:
+                # Load or build blueprint
+                bp = _bp_load(str(self.root), board=board, klass=int(klass), subject=subject)
+                if bp is None:
+                    bp = _bp_build(
+                        project_root=str(self.root),
+                        subject=subject,
+                        klass=int(klass),
+                        board=board,
+                        filename_hint=filename_hint,
+                    )
+                    _bp_save(str(self.root), bp)
+                bp_dict = bp.to_dict()
+
+                # Parse the weightage spec (or mirror blueprint to total_questions if provided)
+                dist = _parse_weightage(
+                    request_text=(weightage or ""),
+                    blueprint=bp_dict,
+                    total_questions=total_questions,
+                    total_marks=total_marks,
+                )
+
+                # Pull a few exemplars to steer style (kept short)
+                exemplars = _collect_exemplars(
+                    project_root=str(self.root),
+                    subject=subject,
+                    klass=int(klass),
+                    per_type=3,
+                )
+
+                # Build the final prompt pack
+                pack = _build_pack(
+                    blueprint=bp_dict,
+                    distribution=dist,
+                    subject=subject,
+                    klass=int(klass),
+                    board=board,
+                    include_solutions=include_solutions,
+                    seed=seed,
+                    exemplars=exemplars,
+                )
+
+                suggested = [
+                    {"role": "system", "content": pack["system"]},
+                    {"role": "user", "content": pack["user"]},
+                ]
+                return {
+                    "blueprint": bp_dict,
+                    "distribution": dist,
+                    "generation_pack": {"system": pack["system"], "user": pack["user"]},
+                    "seed": pack.get("seed"),
+                    "suggested_messages": suggested,
+                }
+            except Exception as e:
+                logger.exception("edu_generate_paper failed: {}", e)
+                raise
+
         # -------------------- register everything --------------------
+        self._register("rag_retrieve", rag_retrieve)
         self._register("read_file", read_file)
         self._register("list_files", list_files)
         self._register("search_code", search_code)
@@ -566,6 +721,8 @@ class ToolRegistry:
         self._register("edu_extract_tables", edu_extract_tables)
         self._register("web_search", web_search)
         self._register("web_fetch", web_fetch)
+        self._register("edu_build_blueprint", edu_build_blueprint)
+        self._register("edu_generate_paper", edu_generate_paper)
 
 
     # --------------- OpenAI tool schema (function-calling) ---------------
@@ -576,9 +733,35 @@ class ToolRegistry:
             {
                 "type": "function",
                 "function": {
+                    "name": "rag_retrieve",
+                    "description": "Retrieve top chunks from the project's vector index (with optional filter).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "top_k": {"type": "integer"},
+                            "where": {"type": "object"},
+                            "min_score": {"type": "number"},
+                            "rag_path": {"type": "string"},
+                            "project_root": {"type": "string"}
+                        },
+                        "required": ["query"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "read_file",
-                    "description": "Read a text file at a relative path.",
-                    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                    "description": "Read a text file at a relative path (optional subdir).",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "subdir": {"type": "string"}
+                        },
+                        "required": ["path"]
+                    },
                 },
             },
             {
@@ -788,6 +971,46 @@ class ToolRegistry:
                         "top_k": {"type": "integer"}
                     },
                     "required": ["project_root", "rag_path"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_build_blueprint",
+                    "description": "Extract and save a blueprint JSON from indexed SQPs/syllabi for {board, class, subject}.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subject": {"type": "string"},
+                            "klass": {"type": "integer"},
+                            "board": {"type": "string"},
+                            "filename_hint": {"type": "string"},
+                            "session": {"type": "string"}
+                        },
+                        "required": ["subject", "klass"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "edu_generate_paper",
+                    "description": "Build a generation pack (system/user messages) for a new paper with optional solutions, honoring a blueprint and weightage.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "subject": {"type": "string"},
+                            "klass": {"type": "integer"},
+                            "weightage": {"type": "string"},
+                            "total_questions": {"type": "integer"},
+                            "total_marks": {"type": "integer"},
+                            "include_solutions": {"type": "boolean"},
+                            "board": {"type": "string"},
+                            "seed": {"type": "integer"},
+                            "filename_hint": {"type": "string"}
+                        },
+                        "required": ["subject", "klass"]
                     },
                 },
             },
