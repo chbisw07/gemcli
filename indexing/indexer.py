@@ -1,15 +1,13 @@
 # indexing/indexer.py
 from __future__ import annotations
 
-import os
-import json
-import time
-import hashlib
+import os, json, time, hashlib, traceback
 from typing import Dict, List
 from pathlib import Path
 
 from loguru import logger
 import chromadb
+import concurrent.futures as cf
 
 from config_home import project_rag_dir  # ~/.gencli/<project>/RAG
 from .settings import load as load_settings
@@ -73,6 +71,28 @@ def _relpath(root: str, fp: str) -> str:
     except Exception:
         return fp
 
+def _stop_flag_path(project_root: str) -> Path:
+    return project_rag_dir(project_root) / ".index_stop"
+
+def _status_path(project_root: str) -> Path:
+    return project_rag_dir(project_root) / ".index_status.json"
+
+def request_stop(project_root: str) -> Dict[str, bool]:
+    """Create a stop flag; workers will finish in-flight and halt."""
+    p = _stop_flag_path(project_root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"ts": time.time()}), encoding="utf-8")
+    logger.warning("Indexing STOP requested (flag written to '{}')", str(p))
+    return {"ok": True}
+
+def index_status(project_root: str) -> Dict:
+    """Read lightweight status (running/progress/dirty)."""
+    try:
+        p = _status_path(project_root)
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except Exception:
+        return {}
+    
 def _apply_max_chars(docs: List[str], metas: List[dict], cfg: dict) -> None:
     """
     Backstop guard to keep each embed payload light.
@@ -105,7 +125,10 @@ def _rekey(chunks: List[dict], project_root: str, root: str, fp: str) -> List[di
         mtime = 0
     proj = _project_key(project_root)
 
+    file_name = os.path.basename(rel)
+    base_name, file_ext = os.path.splitext(file_name)
     out: List[dict] = []
+
     seq = 0
     for ch in chunks:
         seq += 1
@@ -114,6 +137,10 @@ def _rekey(chunks: List[dict], project_root: str, root: str, fp: str) -> List[di
         md = dict(c.get("metadata") or {})
         md.setdefault("relpath", rel)
         md.setdefault("mtime", mtime)
+        # enrich filename metadata so we can filter/boost by file name later
+        md.setdefault("file_name", file_name)
+        md.setdefault("base_name", base_name)
+        md.setdefault("file_ext", file_ext.lower())
         c["metadata"] = md
         out.append(c)
     return out
@@ -137,6 +164,72 @@ def _chroma(project_root: str, cfg: dict):
 
 
 # --------------------------------- chunking -----------------------------------
+# ---------------------------- parallel chunking -------------------------------
+
+def _auto_workers(cfg: dict) -> int:
+    w = int(cfg.get("indexing_workers", 0) or 0)
+    if w <= 0:
+        try:
+            w = max(1, (os.cpu_count() or 2) - 1)
+        except Exception:
+            w = 1
+    return w
+
+def _chunk_file_worker(args):
+    fp, cfg = args
+    t0 = time.time()
+    try:
+        from indexing.indexer import _chunk_file as _router
+        chunks = _router(fp, cfg)
+        return fp, chunks, (time.time() - t0), None
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=2)}"
+        return fp, [], (time.time() - t0), err
+
+def _parallel_chunk_stream(files: List[str], cfg: dict, workers: int, project_root: str):
+    """
+    Submit at most `workers` tasks; yield results as they finish.
+    If STOP flag appears, do not submit new tasks; drain in-flight only.
+    """
+    if workers <= 1:
+        for fp in files:
+            t0 = time.time()
+            try:
+                yield fp, _chunk_file(fp, cfg), (time.time() - t0), None
+            except Exception as e:
+                yield fp, [], (time.time() - t0), f"{type(e).__name__}: {e}"
+        return
+
+    stop_flag = _stop_flag_path(project_root)
+    inflight: dict = {}
+    it = iter(files)
+    with cf.ProcessPoolExecutor(max_workers=workers) as ex:
+        # prefill
+        while len(inflight) < workers:
+            try:
+                fp = next(it)
+            except StopIteration:
+                break
+            f = ex.submit(_chunk_file_worker, (fp, cfg))
+            inflight[f] = fp
+        # stream
+        while inflight:
+            for fut in cf.as_completed(list(inflight.keys()), timeout=None):
+                fp0 = inflight.pop(fut)
+                try:
+                    yield fut.result()
+                except Exception as e:
+                    yield fp0, [], 0.0, f"{type(e).__name__}: {e}"
+                break  # re-check stop & backfill one by one
+            # backfill only if no stop requested
+            if not stop_flag.exists():
+                try:
+                    fp = next(it)
+                except StopIteration:
+                    continue
+                f = ex.submit(_chunk_file_worker, (fp, cfg))
+                inflight[f] = fp
+        # done
 
 def _chunk_file(fp: str, cfg: dict) -> List[dict]:
     """
@@ -215,6 +308,12 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     embed_fn = resolve_embedder(models_path, cfg)
     logger.info("Embedder resolved for selected='{}'", (cfg.get("embedder") or {}).get("selected_name") or (cfg.get("embedder") or {}).get("model_key"))
 
+    # Clear any stale STOP and set status → running
+    try:
+        _stop_flag_path(project_root).unlink(missing_ok=True)  # py>=3.8
+    except Exception:
+        pass
+
     # Wipe collection
     try:
         coll.delete(where={})
@@ -222,47 +321,93 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     except Exception as e:
         logger.debug("Collection clear skipped/failed: {}", e)
 
-    added = 0
-    per_file_stats = {}
-    embed_batch = int(cfg.get("embedding_batch_size") or 8)
+    files = list(iter_files(root, cfg))
+    workers = _auto_workers(cfg)
     upsert_batch = int(cfg.get("upsert_batch_size") or 64)
-    logger.info("Batch params: embedding_batch_size={} upsert_batch_size={}", embed_batch, upsert_batch)
+    max_pending = int(cfg.get("max_pending_chunks") or 2000)
+    logger.info("Parallel chunking: files={} workers={} upsert_batch={} max_pending={}",
+                len(files), workers, upsert_batch, max_pending)
 
-    for fp in iter_files(root, cfg):
-        chunks = _chunk_file(fp, cfg)
-        if not chunks:
+    # status seed
+    status = {"state": "running", "dirty": False, "processed_files": 0,
+              "total_files": len(files), "started": time.time()}
+    try:
+        _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+    except Exception:
+        pass
+
+    added, per_file_stats = 0, {}
+    buf_ids: List[str] = []
+    buf_docs: List[str] = []
+    buf_meta: List[dict] = []
+
+    def _flush():
+        nonlocal added, buf_ids, buf_docs, buf_meta
+        if not buf_docs:
+            return
+        _embed_and_upsert(coll, embed_fn, buf_ids, buf_docs, buf_meta, upsert_batch=upsert_batch)
+        added += len(buf_docs)
+        buf_ids.clear(); buf_docs.clear(); buf_meta.clear()
+
+    stop_flag = _stop_flag_path(project_root)
+    dirty = False
+
+    for fp, chunks, elapsed, err in _parallel_chunk_stream(files, cfg, workers, project_root):
+        rel = _relpath(root, fp)
+        if err:
+            logger.error("chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
+            # still update progress and continue
+            status["processed_files"] += 1
+            try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+            except Exception: pass
             continue
 
-        # Always canonicalize IDs/metadata
-        chunks = _rekey(chunks, project_root, root, fp)
-
-        ids = [c["id"] for c in chunks]
-        docs = [c["document"] for c in chunks]
-        metas = [c["metadata"] for c in chunks]
-
-        _apply_max_chars(docs, metas, cfg)
-
-        # Let the embedder do micro-batching internally; we call once per file
-        _embed_and_upsert(coll, embed_fn, ids, docs, metas, upsert_batch=upsert_batch)
-
-        added += len(chunks)
-        rel = _relpath(root, fp)
+        logger.info("chunk OK   '{}' chunks={} time={:.1f}s", rel, len(chunks), elapsed)
         per_file_stats[rel] = len(chunks)
-        logger.debug("Indexed '{}': {} chunk(s)", rel, len(chunks))
+        status["processed_files"] += 1
+        try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+        except Exception: pass
+
+        # rekey + buffer
+        chunks = _rekey(chunks, project_root, root, fp)
+        for c in chunks:
+            buf_ids.append(c["id"])
+            buf_docs.append(c["document"])
+            buf_meta.append(c["metadata"])
+            if len(buf_docs) >= upsert_batch or len(buf_docs) >= max_pending:
+                _apply_max_chars(buf_docs, buf_meta, cfg)
+                _flush()
+
+        # If a stop was requested while we were working, mark dirty (no new submits happen above)
+        if stop_flag.exists():
+            dirty = True
+
+    # final flush
+    _apply_max_chars(buf_docs, buf_meta, cfg)
+    _flush()
 
     # Stamp for delta indexing
     # Stamp lives under the project root alongside the DB
     stamp_path = project_rag_dir(project_root) / ".last_index.json"
     try:
         stamp_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"ts": time.time(), "dirty": bool(dirty)}
         with stamp_path.open("w") as f:
-            json.dump({"ts": time.time()}, f)
-        logger.info("Index stamp updated at '{}'", str(stamp_path))
+            json.dump(payload, f)
+        logger.info("Index stamp updated at '{}' dirty={}", str(stamp_path), bool(dirty))
     except Exception as e:
         logger.warning("Failed to write index stamp '{}': {}", str(stamp_path), e)
 
-    logger.info("full_reindex: done added={} file_count={}", added, len(per_file_stats))
-    return {"ok": True, "added": added, "files": per_file_stats}
+    # update status file (final)
+    status.update({"state": "stopped" if dirty else "complete", "dirty": bool(dirty), "ended": time.time()})
+    try:
+        _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+    except Exception:
+        pass
+
+    logger.info("full_reindex: done added={} files={} dirty={}", added, len(per_file_stats), bool(dirty))
+    return {"ok": True, "added": added, "files": per_file_stats, "dirty": bool(dirty),
+            "processed_files": status["processed_files"], "total_files": status["total_files"]}
 
 
 def delta_index(project_root: str, rag_path: str | None) -> Dict:
@@ -303,8 +448,12 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
     changed, added = [], 0
     now = time.time()
     upsert_batch = int(cfg.get("upsert_batch_size") or 64)
+    workers = _auto_workers(cfg)
+    max_pending = int(cfg.get("max_pending_chunks") or 2000)
     logger.info("Batch params: upsert_batch_size={}", upsert_batch)
 
+    # Build list of candidates that actually changed since last
+    candidates: List[str] = []
     for fp in iter_files(root, cfg):
         try:
             mtime = os.path.getmtime(fp)
@@ -312,42 +461,72 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
             continue
         if mtime <= last:
             continue
+        candidates.append(fp)
 
+    status = {"state": "running", "dirty": False, "processed_files": 0,
+              "total_files": len(candidates), "started": time.time()}
+    try:
+        _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+    except Exception:
+        pass
+
+    buf_ids: List[str] = []; buf_docs: List[str] = []; buf_meta: List[dict] = []
+    def _flush():
+        nonlocal added, buf_ids, buf_docs, buf_meta
+        if not buf_docs:
+            return
+        _embed_and_upsert(coll, embed_fn, buf_ids, buf_docs, buf_meta, upsert_batch=upsert_batch)
+        added += len(buf_docs)
+        buf_ids.clear(); buf_docs.clear(); buf_meta.clear()
+
+    dirty = False
+    stop_flag = _stop_flag_path(project_root)
+    for fp, chunks, elapsed, err in _parallel_chunk_stream(candidates, cfg, workers, project_root):
         rel = _relpath(root, fp)
-        logger.debug("delta_index: changed file '{}'", rel)
-
-        # Remove any prior chunks for this file (by relpath), then re-index it
-        try:
-            coll.delete(where={"relpath": rel})
-            logger.debug("Removed old chunks for '{}'", rel)
-        except Exception as e:
-            logger.debug("Failed to delete old chunks for '{}': {}", rel, e)
-
-        chunks = _chunk_file(fp, cfg)
-        if not chunks:
+        if err:
+            logger.error("delta chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
+            status["processed_files"] += 1
+            try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+            except Exception: pass
             continue
 
-        chunks = _rekey(chunks, project_root, root, fp)
-
-        ids = [c["id"] for c in chunks]
-        docs = [c["document"] for c in chunks]
-        metas = [c["metadata"] for c in chunks]
-
-        _apply_max_chars(docs, metas, cfg)
-        _embed_and_upsert(coll, embed_fn, ids, docs, metas, upsert_batch=upsert_batch)
-
-        added += len(chunks)
+        logger.info("delta chunk OK   '{}' chunks={} time={:.1f}s", rel, len(chunks), elapsed)
+        # purge old chunks for this file before inserting new
+        try:
+            coll.delete(where={"relpath": rel})
+        except Exception as e:
+            logger.debug("delta delete old failed for '{}': {}", rel, e)
         changed.append(rel)
-        logger.debug("Re-indexed '{}': {} chunk(s)", rel, len(chunks))
+
+        chunks = _rekey(chunks, project_root, root, fp)
+        for c in chunks:
+            buf_ids.append(c["id"]); buf_docs.append(c["document"]); buf_meta.append(c["metadata"])
+            if len(buf_docs) >= upsert_batch or len(buf_docs) >= max_pending:
+                _apply_max_chars(buf_docs, buf_meta, cfg); _flush()
+
+        status["processed_files"] += 1
+        try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+        except Exception: pass
+        if stop_flag.exists():
+            dirty = True
+
+    _apply_max_chars(buf_docs, buf_meta, cfg); _flush()
 
     # Update stamp
     try:
         stamp_path.parent.mkdir(parents=True, exist_ok=True)
         with stamp_path.open("w") as f:
-            json.dump({"ts": now}, f)
-        logger.info("Index stamp updated at '{}'", str(stamp_path))
+            json.dump({"ts": now, "dirty": bool(dirty)}, f)
+        logger.info("Index stamp updated at '{}' dirty={}", str(stamp_path), bool(dirty))
     except Exception as e:
         logger.warning("Failed to write index stamp '{}': {}", str(stamp_path), e)
         
-    logger.info("delta_index: done added={} changed_files={}", added, len(changed))
-    return {"ok": True, "added": added, "changed_files": changed}
+    status.update({"state": "stopped" if dirty else "complete", "dirty": bool(dirty), "ended": time.time()})
+    try:
+        _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+    except Exception:
+        pass
+
+    logger.info("delta_index: done added={} changed_files={} dirty={}", added, len(changed), bool(dirty))
+    return {"ok": True, "added": added, "changed_files": changed, "dirty": bool(dirty),
+            "processed_files": status["processed_files"], "total_files": status["total_files"]}

@@ -25,7 +25,7 @@ try:
     from config_home import UI_SETTINGS_PATH, GLOBAL_RAG_PATH
     from config_home import project_rag_dir, GLOBAL_RAG_PATH, UI_SETTINGS_PATH  # already present if you used my file
     from indexing.settings import load as load_rag, save as save_rag
-    from indexing.indexer import full_reindex, delta_index
+    from indexing.indexer import full_reindex, delta_index, request_stop, index_status
 except Exception as e:
     # Soft fallback if helper not yet present; keeps app runnable
     HOME = Path(os.path.expanduser("~")) / ".gencli"
@@ -495,6 +495,26 @@ with st.sidebar:
     ui["rag_auto_index"] = st.session_state["rag_auto_index"]
     logger.info("Auto indexing: {}", bool(ui["rag_auto_index"]))
 
+    # Graceful STOP control
+    if st.button("Stop indexing (graceful)"):
+        try:
+            res = request_stop(project_root)
+            st.warning("Stop requested. Current workers will finish; no new files will start.")
+            logger.warning("User requested STOP: {}", res)
+        except Exception as e:
+            st.error(f"Failed to request stop: {e}")
+
+    # (Optional) show last known status / dirty flag
+    try:
+        _st = index_status(project_root) or {}
+        if _st.get("dirty"):
+            st.markdown("<span style='color:#c00;font-size:0.85em'>Indexing status: DIRTY</span>", unsafe_allow_html=True)
+        if _st.get("state") == "running":
+            pf, tf = int(_st.get("processed_files", 0)), int(_st.get("total_files", 0) or 1)
+            st.caption(f"Indexing… {pf}/{tf} files")
+    except Exception as e:
+        logger.debug("index_status read failed: {}", e)
+
     # Manual full reindex
     if st.button("Reindex now (full)"):
         with st.spinner("Reindexing…"):
@@ -509,7 +529,10 @@ with st.sidebar:
                 logger.info("Manual full reindex triggered (embedder='{}')", emb_name)
 
                 res = full_reindex(project_root, RAG_PATH)
-                st.success(f"Reindex complete. Added chunks: {res.get('added')}")
+                if res.get("dirty"):
+                    st.markdown("<span style='color:#c00;font-size:0.85em'>Indexing finished early (DIRTY). Partial index is usable.</span>", unsafe_allow_html=True)
+                else:
+                    st.success(f"Reindex complete. Added chunks: {res.get('added')}")
                 st.caption(res)
                 logger.info("Manual full reindex completed: {}", res)
             except Exception as e:
@@ -765,6 +788,7 @@ def execute_plan(plan_steps: List[Dict[str, Any]], analysis_only: bool = False):
         return {"pdf_chunks": pdf, "total_chunks": tot, "pdf_ratio": ratio}
     _web_fetch_batch: List[Dict[str, Any]] = []
     _MIN_CHUNKS, _MIN_RATIO = 6, 0.60
+    _web_fallback_done = False
 
     for i, step in enumerate(plan_steps, 1):
         if "error" in step:

@@ -58,9 +58,11 @@ DEFAULT = {
         "overlap": 120
     },
 
-    # --- Batching knobs used by embedder/indexer ---
     "embedding_batch_size": 16,              # remote OpenAI-compat: 16–32; local ST: ~64
     "upsert_batch_size": 128,                # Chroma upsert batch size
+    # --- Parallel chunking + backpressure ---
+    "indexing_workers": 0,                   # 0=auto (cpu_count-1, min 1)
+    "max_pending_chunks": 2000,              # memory guard: flush when buffered docs hit this
 
     # --- Auto-indexer ---
     "auto_indexing": {
