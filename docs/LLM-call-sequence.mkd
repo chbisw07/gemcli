@@ -1,0 +1,344 @@
+**My Question**
+
+if i ask you something, how you are able to understand my prompt, divide it into next set of relevant steps/tasks/activities, and excute them, collate all results, and then start streaming (possibly). the point is whether it is coding or documents like pdf, you are always able to generate the correct path of execution to follow and execute it.
+i want similar type of thing with my app.
+possible?
+
+Short answer: yes—it’s absolutely possible, and you already have most of the plumbing. The last mile is to make your **Run** path always do “plan → execute → synthesize” (with a fast no-tool path when appropriate) and to give the planner a small library of intent templates.
+
+Here’s the mental model + the concrete way to wire it.
+
+---
+
+# What you want (and how I do it)
+
+When you ask me something, I internally do:
+
+1. **Parse & detect intent**
+   Normalize the prompt, spot obvious signals (paths, CSV/JSON blobs, numbers, subject words), and decide if this smells like code, documents, tabular, or hybrid.
+
+2. **Ground**
+   Retrieve top-K, threshold, bucket by profile (code/document/tabular). This tells me “which toolbox” is safe/most useful.
+
+3. **Compose a plan**
+   Build a short list of tool steps with arguments (some filled, some using BIND placeholders), mark critical steps, choose fallbacks.
+
+4. **Execute the plan**
+   Call tools deterministically (with timeouts/guards), collect results in a scratchpad (`last_by_tool`).
+
+5. **Synthesize**
+   Call the LLM once with: your question + compact context + tool outputs (e.g., “Chart saved to …”).
+
+6. **(Optional) Stream**
+   Stream the final LLM response tokens to the UI while keeping step logs.
+
+You already have pieces 1–5. The only thing causing confusion is that **Run** sometimes skips 2–4 and just does a single chat.
+
+---
+
+# Make your app behave like that (deterministic “always plan”)
+
+## A) Unify Run → “plan → execute → synthesize” (with a fast lane)
+
+In `ReasoningAgent.ask_once`, do this at the very top:
+
+```python
+def ask_once(self, prompt: str) -> str:
+    # Always analyze and build a plan
+    plan = self.analyze_and_plan(prompt)
+
+    # Fast lane: if the planner decided nothing needs tools, skip straight to LLM
+    needs_tools = any(step.get("tool") for step in plan)
+    if needs_tools and self.tools_enabled and not self.analysis_only:
+        results = self._execute_plan(plan, max_iters=self.max_tool_iters)
+    else:
+        results = {}  # no tools → empty scratchpad
+
+    return self._synthesize_answer(prompt, results)
+```
+
+Result: pressing **Run** now does what you expect—thinks, executes, then answers. (Your **Plan (show steps)** button can still preview the plan before you run.)
+
+> If you still want opportunistic one-shot mode sometimes, keep a toggle (e.g., “single-turn mode”) and branch accordingly.
+
+## B) Give the planner a tiny template library (determinism)
+
+Inside `analyze_and_plan`, after you compute `route` and normalize `low = query.lower()`:
+
+* **Charts** → insert `draw_chart_data`/`draw_chart_csv` (you already added this “short-circuit”).
+* **CSV/JSON tables** → insert a `table_preview` tool (if you add one later).
+* **File/section refs** → `search_code`/`read_file`/`rag_retrieve` with BIND args.
+* **Paper generation** → `edu_build_blueprint` → `edu_generate_paper`.
+* **Default doc Q\&A** → `rag_retrieve` (only if route == document and no structured signals) to enrich context.
+
+Each template is 1–3 steps, tops. The point is: **the agent, not the model, chooses the sequence**.
+
+## C) Use route allowlists + argument guards
+
+You already have `TOOL_SPECS` and allowlists—great. Keep them tight:
+
+* **Code route:** read/search/edit code tools; no diagram/chart by default.
+* **Document route:** RAG/PDF/diagram; no mutating code tools.
+* **Universal:** math guards, charting, safe previews.
+
+Argument fill order:
+
+1. Extract from prompt (paths, numbers, JSON/CSV).
+2. Bind from previous tool results (via your `{{BIND:...}}`).
+3. Apply defaults from `TOOL_SPECS`.
+
+## D) Always give a text fallback
+
+* Diagram requests → return text first; add ASCII diagram if the renderer fails.
+* Math asks → use deterministic helpers (you added this earlier) before asking the LLM.
+* Retrieval sparse → say what’s missing and what to add.
+
+## E) Stream the final answer (optional but nice)
+
+If your adapter supports streaming, add a `chat_stream` variant and in Streamlit:
+
+```python
+placeholder = st.empty()
+buf = ""
+for token in agent.ask_stream(prompt):  # yields text chunks
+    buf += token
+    placeholder.markdown(buf)
+```
+
+The step logs stay in the “Activity / Thinking” panel; the final text streams as it’s generated.
+
+---
+
+# How the two buttons feel after this change
+
+* **Run** → always does “plan → execute → synthesize”.
+  Pure Q\&A? Plan will be empty → it just answers. Chart/file/paper? Plan will have steps → tools run deterministically.
+
+* **Plan (show steps)** → shows the plan only.
+  Then either click **Run**, or add a “Run plan” button next to it.
+
+---
+
+# Will it work across coding and PDFs?
+
+Yes, because the **router + allowlists** keep you safe and focused:
+
+* **Coding prompt** → code route → code tools only → synthesize with code snippets/diffs.
+* **PDF/doc prompt** → document route → RAG + doc tools → synthesize with citations/page tags.
+* **Hybrid** (e.g., “find in code and then explain from PDF”) → small sequence across both buckets.
+
+---
+
+# TL;DR
+
+* Flip **Run** into “analyze → plan → execute → synthesize” (with a fast no-tool path).
+* Keep your planner templates small and deterministic.
+* Guard with allowlists and argument validation.
+* Always include fallbacks so the answer returns even when a step fails.
+
+Do that and your app will “feel” like what you see here: it understands, plans, executes the right tools, and then answers—consistently, across documents and code.
+
+# **My Prompt:**
+brilliant! and thanks for the explanation and exposition.
+now i am trying to think from user's point of view rather than a developer.
+i think, let's have a single "submit" button that relays prompt to the LLM triggering various workflow sequences and processes.
+i see there are 3 major use cases or modes.
+
+1) talking to LLM -- stateless, pure talking to llm, bypassing rag, bypassing out intent guessing, bypassing what our app does, besides just connecting to the LLM. it is as if through the app, i am talking to the llm, which i could have talked through lm studio or chatgpt or  ollama.
+summary:
+STREAMING=ON/OFF
+RAG=OFF
+ENABLE_TOOLS=OFF
+CONTROLLER_AGENT=OFF
+
+
+2-a) talking to LLM (stateless) + parse and detect intent + expose tools (ENABLE_TOOLS) + CONTROLLER_LLM (let LLM decide how it uses tools)
+2-b) if RAG=ON, ground data. if RAG=OFF, no reference to the project data. in this case it may use web tools to search internet (if required)
+summary:
+STREAMING=ON/OFF
+RAG=ON/OFF
+ENABLE_TOOLS=ON/OFF
+CONTROLLER_AGENT=OFF
+
+3) talking to LLM (stateless) + parse and detect intent + expose tools (ENABLE_TOOLS) + CONTROLLER_AGENT (here the agent rather than the LLM is the controller)
+summary:
+STREAMING=ON/OFF
+RAG=ON/OFF
+ENABLE_TOOLS=ON/OFF
+CONTROLLER_AGENT=ON
+
+a) COMPLEX_TASK_PLANNING=OFF
+b) COMPLEX_TASK_PLANNING=ON
+
+i have tried to put my thoughts here. For ease of use and to user's benefit, this is how i tried to break the working of app in modes.
+understand this, and try to put your thoughts (as you described in previous chat) in this mould.
+having done this critially review.
+if you approve, we will go with the mode way.
+i think it will make the life easier for the user and developer.
+
+fyi ... we are still discussing things ...
+
+Love this direction. Your three-mode model is exactly how I’d package the UX. Here’s a clean mapping of what each mode does, how it runs under-the-hood in your app, and a simple way to wire it into a single **Submit** button without surprising users.
+
+# The three modes (user-facing)
+
+## Mode 1 — Direct Chat (LLM only)
+
+Talk to the model with zero automation. Great for quick answers, ideation, or when you explicitly don’t want tool calls or project grounding.
+
+* STREAMING: on/off (streams the single reply)
+* RAG: **off**
+* ENABLE\_TOOLS: **off**
+* CONTROLLER\_AGENT: **off**
+* Behavior: **one** LLM call; no tools; no plan; stateless (no history unless you build it).
+
+## Mode 2 — LLM-controlled Tools (function calling)
+
+Let the model decide whether to call tools (including RAG) to answer your prompt. You still keep safety via allowlists.
+
+* STREAMING: on/off (stream only the **final** answer after tool loop)
+* RAG: on/off (if on, expose `rag_retrieve` as a callable tool)
+* ENABLE\_TOOLS: **on**
+* CONTROLLER\_AGENT: **off** (the LLM is the controller)
+* Behavior: single **conversation** with the LLM that may include a tool loop:
+
+  1. Model decides to call a tool (e.g., `draw_chart_csv`, `read_file`, `rag_retrieve`).
+  2. Tool runs, returns results.
+  3. Model may call more tools, then produces the final answer.
+
+> Determinism note: this is **opportunistic**. The model might *not* call the tool you expect. You still apply your route allowlists + arg validation so it can’t call the wrong tools.
+
+## Mode 3 — Agent-controlled (plan → execute → synthesize)
+
+The agent decides the sequence (deterministic), executes the steps, then asks the LLM to write the final answer.
+
+* STREAMING: on/off (stream the **final** synthesis; steps are logged as they run)
+* RAG: on/off (planner inserts retrieval only if useful)
+* ENABLE\_TOOLS: **on**
+* CONTROLLER\_AGENT: **on**
+* COMPLEX\_TASK\_PLANNING:
+
+  * off → **minimal templates** (short-circuits like “chart from JSON/CSV”, quick RAG, quick file read)
+  * on → **full planner** (route-aware, multi-step plans, re-tries/fallbacks)
+* Behavior (deterministic):
+
+  1. **Analyze & Plan** (router, intent templates).
+  2. **Execute** the tool steps (with allowlists/arg guards).
+  3. **Synthesize** final answer with gathered context (one LLM call).
+
+# How this maps to your current app
+
+* Today’s **Run** ≈ Mode 1 or Mode 2 depending on toggles:
+
+  * If tools disabled → Mode 1.
+  * If tools enabled & analysis-only off → Mode 2 (opportunistic).
+* Today’s **Plan (show steps)** = “show plan only”; when “planning for complex tasks” is enabled and you then press **Run**, it behaves like Mode 3 (plan → execute → synthesize).
+
+# Proposal: one **Submit** button + a simple Mode selector
+
+Add a segmented control: **Direct Chat**, **LLM Tools**, **Agent Plan & Run**.
+Hide most toggles; expose only what matters per mode.
+
+### Default flags per mode
+
+| Mode             | Streaming | RAG    | Enable Tools | Controller Agent | Complex Planning |
+| ---------------- | --------- | ------ | ------------ | ---------------- | ---------------- |
+| Direct Chat      | ON        | OFF    | OFF          | OFF              | n/a              |
+| LLM Tools        | ON        | Toggle | ON           | OFF              | n/a              |
+| Agent Plan & Run | ON        | Toggle | ON           | ON               | Toggle           |
+
+> Optional: add a **Preview plan** checkbox in Mode 3 to show the plan before executing.
+
+# Execution flows (what Submit actually does)
+
+## Mode 1 (Direct Chat)
+
+```python
+# single-turn
+resp = adapter.chat_stream(messages=[{"role": "user", "content": prompt}])  # or chat() if not streaming
+return resp
+```
+
+## Mode 2 (LLM Tools)
+
+```python
+# one conversation with function-calling
+schemas = registry.schemas_openai(route_allowlist)
+resp = adapter.chat_with_tools(messages=[{"role": "user", "content": prompt}],
+                               tools=schemas,
+                               tool_loop=True,  # keep invoking tools until model stops
+                               streaming=STREAMING)
+return final_message_from(resp)
+```
+
+* If **RAG on**, include `rag_retrieve` in `tools`.
+* Route allowlists still apply (from `TOOL_SPECS`) so the model can’t call disallowed tools.
+
+## Mode 3 (Agent Plan & Run)
+
+```python
+route, rag_seed, scores = agent._route_and_seed(prompt)
+plan = agent.analyze_and_plan(prompt)  # uses templates, short-circuits, allowlists
+
+if PREVIEW: show(plan); return
+
+results = agent._execute_plan(plan, max_iters=agent.max_tool_iters)
+answer  = agent._synthesize_answer(prompt, results)  # 1 final LLM call (stream if enabled)
+return answer
+```
+
+* With **Complex planning OFF**, `analyze_and_plan` sticks to minimal templates (e.g., chart short-circuit).
+* With it **ON**, it can add retries, soft timeouts, fallbacks, etc.
+
+# Critical guardrails that make this solid
+
+* **Allowlists & validation** (you already have): tool exposure is route-filtered; args checked against `TOOL_SPECS`. Even in Mode 2, the model only sees allowed tools and must pass valid args.
+* **RAG switch**: if OFF, don’t expose `rag_retrieve` at all (Mode 2 will then rely on web tools or none).
+* **Analysis-only**: make this a red “Tools disabled” banner that’s **ignored** in Mode 3 (or blocked with a clear notice). Users got confused by this earlier.
+
+# UX copy (clear and friendly)
+
+* **Direct Chat** — “Talk to the model. No tools, no project data.”
+* **LLM Tools** — “Let the model decide which tools to call. May use RAG if enabled.”
+* **Agent Plan & Run** — “Agent plans steps, runs tools deterministically, and writes the final answer.”
+
+Add a small badge near Submit:
+
+* If tools disabled: “🔒 Tools disabled (analysis-only)”
+* If RAG enabled: “📚 Using your project data”
+
+# A few defaults I recommend
+
+* Default mode: **Agent Plan & Run** (users get consistent results, fewer surprises).
+* Streaming: ON in all modes (stream only the final synthesis for Modes 2–3).
+* RAG: ON by default (users expect their data to be used); make it obvious with a badge.
+* Keep **“Tools visible to the model (by route)”** expander for transparency.
+
+# Sanity examples across modes
+
+* “Draw a weekly line chart from `data/stocks/INFY.NS.csv` (x=Date, y=Close).”
+
+  * Direct Chat → explains steps (no chart).
+  * LLM Tools → model *may* call `draw_chart_csv`.
+  * Agent Plan & Run → planner inserts `draw_chart_csv` → PNG path returned (deterministic).
+
+* “Find and summarise AP definition from our PDFs.”
+
+  * Direct Chat → generic answer.
+  * LLM Tools → model might call `rag_retrieve`.
+  * Agent Plan & Run → planner adds `rag_retrieve` → synthesis cites PDFs.
+
+* “Generate a 20-question mixed paper for Mathematics.”
+
+  * Direct Chat → generic questions.
+  * LLM Tools → maybe; not guaranteed.
+  * Agent Plan & Run → `edu_build_blueprint` → `edu_generate_paper` → final synthesis with proper weightage.
+
+# My verdict
+
+✅ Your “mode way” makes the UX **much clearer** and maps perfectly to the plumbing you’ve built.
+Adopt these three modes with a single **Submit** button, and wire the execution switch exactly as above. Users get a predictable mental model, and you keep developer control where it matters.
+
+If you want, I can draft the small Streamlit changes (mode selector + simplified toggles + Submit handler) next.
+
+

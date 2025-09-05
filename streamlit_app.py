@@ -5,6 +5,7 @@ import json
 import os
 import re
 import ast
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
@@ -439,6 +440,102 @@ def _render_call_graph_payload(result: Any) -> bool:
     return True
 
 
+def _human_dt(ts: float) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+    except Exception:
+        return str(ts)
+
+def _list_charts(root: Path, charts_subdir: str = "charts") -> list[dict]:
+    base = (root / charts_subdir).resolve()
+    if not base.exists():
+        return []
+    out = []
+    for name in os.listdir(base):
+        if not name.lower().endswith(".png"):
+            continue
+        p = base / name
+        try:
+            stt = p.stat()
+        except Exception:
+            continue
+        meta = None
+        j = p.with_suffix(".json")
+        if j.exists():
+            # optional sidecar metadata (if you later decide to write it)
+            try:
+                import json
+                meta = json.loads(j.read_text(encoding="utf-8"))
+            except Exception:
+                meta = None
+        out.append({
+            "path": p,
+            "rel": str(p.relative_to(root)),
+            "name": name,
+            "mtime": stt.st_mtime,
+            "size": stt.st_size,
+            "meta": meta,
+        })
+    # newest first
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out
+
+def render_chart_gallery(root: Path, charts_subdir: str = "charts"):
+    import streamlit as st
+
+    items = _list_charts(root, charts_subdir=charts_subdir)
+    st.caption(f"Folder: `{charts_subdir}` under project root · Found {len(items)} image(s)")
+
+    # Controls
+    c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+    with c1:
+        q = st.text_input("Search name", placeholder="type to filter…", label_visibility="collapsed")
+    with c2:
+        cols = st.slider("Columns", 2, 6, 4, help="How many thumbnails per row")
+    with c3:
+        limit = st.selectbox("Show", [12, 24, 48, 96, 200], index=1)
+    with c4:
+        sort_by = st.selectbox("Sort by", ["Newest", "Oldest", "Name A→Z", "Name Z→A"])
+    if sort_by == "Oldest":
+        items = list(reversed(items))
+    elif sort_by == "Name A→Z":
+        items = sorted(items, key=lambda d: d["name"].lower())
+    elif sort_by == "Name Z→A":
+        items = sorted(items, key=lambda d: d["name"].lower(), reverse=True)
+
+    if q:
+        qlow = q.lower()
+        items = [it for it in items if qlow in it["name"].lower() or qlow in it["rel"].lower()]
+
+    if not items:
+        st.info("No charts yet. Use the tools `draw_chart_csv` or `draw_chart_data` to create one.")
+        return
+
+    # Grid render
+    grid = [items[i:i+cols] for i in range(0, min(len(items), limit), cols)]
+    for row in grid:
+        cols_list = st.columns(len(row))
+        for col, it in zip(cols_list, row):
+            with col:
+                st.image(str(it["path"]), use_container_width=True)
+                st.markdown(f"**{it['name']}**")
+                st.caption(f"{_human_dt(it['mtime'])} · {it['size']/1024:.1f} KB")
+                with st.expander("Details", expanded=False):
+                    st.code(it["rel"], language="bash")
+                    if it["meta"]:
+                        # pretty-print whatever your charting tool returns if you decide to save a JSON sidecar later
+                        import json
+                        st.json(it["meta"])
+                # download button (reads bytes once)
+                with open(it["path"], "rb") as fh:
+                    st.download_button(
+                        label="Download PNG",
+                        data=fh.read(),
+                        file_name=it["name"],
+                        mime="image/png",
+                        use_container_width=True,
+                    )
+
 # ---------- UI settings (global) ----------
 def _load_ui_settings() -> dict:
     try:
@@ -745,6 +842,15 @@ def log(line: str):
 # ------------ Planning ------------
 agent = st.session_state["agent"]
 tools = st.session_state["tools"]
+
+# ⬇️ Chart gallery (always available)
+try:
+    # Derive project root: prefer registry root if available
+    _root = Path(getattr(agent.tools, "root", Path.cwd()))
+    with st.expander("📈 Local chart gallery", expanded=False):
+        render_chart_gallery(_root, charts_subdir="charts")
+except Exception as _e:
+    logger.warning("Chart gallery failed: {}", _e)
 
 
 def render_plan(plan_steps: List[Dict[str, Any]]):

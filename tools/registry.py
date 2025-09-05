@@ -29,6 +29,10 @@ from tools.web_tools import web_search, web_fetch
 from tools.edu_blueprint import build_blueprint as _bp_build, save_blueprint as _bp_save, load_blueprint as _bp_load
 from tools.edu_parsers import parse_weightage_request as _parse_weightage
 from tools.edu_generator import collect_exemplars as _collect_exemplars, build_generation_pack as _build_pack
+from tools.charting import (
+    draw_chart_from_csv as _chart_from_csv,
+    draw_chart_from_json_records as _chart_from_json,
+)
 
 
 class ToolRegistry:
@@ -701,6 +705,59 @@ class ToolRegistry:
                 logger.exception("edu_generate_paper failed: {}", e)
                 raise
 
+                # ---------- charting (matplotlib) ----------
+        def draw_chart_csv(
+            csv_path: str,
+            kind: str = "line",
+            x: str | None = None,
+            y: str | None = None,          # comma-separated list or single
+            parse_dates: bool = True,
+            resample: str | None = None,   # "D" | "W" | "M"
+            agg: str | None = "mean",
+            title: str | None = None,
+            out_dir: str = "charts",
+            width: int = 1200,
+            height: int = 800,
+            dpi: int = 144,
+            grid: bool = True,
+        ) -> dict:
+            """
+            Draw a chart from a CSV located under project root. Saves PNG locally.
+            """
+            # Resolve path relative to project root
+            resolved = self._resolve_path(csv_path) or csv_path
+            p = (self.root / resolved).resolve()
+            return _chart_from_csv(
+                p, kind=kind, x=x, y=y, parse_dates=parse_dates, resample=resample, agg=agg,
+                title=title, out_dir=(self.root / out_dir), width=width, height=height, dpi=dpi, grid=grid
+            )
+
+        def draw_chart_data(
+            data_json: str,
+            kind: str = "line",
+            x: str | None = None,
+            y: str | None = None,
+            parse_dates: bool = True,
+            resample: str | None = None,
+            agg: str | None = "mean",
+            title: str | None = None,
+            out_dir: str = "charts",
+            width: int = 1200,
+            height: int = 800,
+            dpi: int = 144,
+            grid: bool = True,
+        ) -> dict:
+            """
+            Draw a chart from inline JSON records: '[{"date":"...", "value": ...}, ...]'.
+            """
+            return _chart_from_json(
+                data_json, kind=kind, x=x, y=y, parse_dates=parse_dates, resample=resample, agg=agg,
+                title=title, out_dir=(self.root / out_dir), width=width, height=height, dpi=dpi, grid=grid
+            )
+
+        self._register("draw_chart_csv", draw_chart_csv)
+        self._register("draw_chart_data", draw_chart_data)
+
         # -------------------- register everything --------------------
         self._register("rag_retrieve", rag_retrieve)
         self._register("read_file", read_file)
@@ -1039,6 +1096,60 @@ class ToolRegistry:
                         "max_chars":{"type":"integer"}
                     },"required":["url"]}
                 }
+            },
+        ]
+        schemas += [
+            {
+                "type": "function",
+                "function": {
+                    "name": "draw_chart_csv",
+                    "description": "Create a chart (PNG) from a CSV using matplotlib. Saves locally and returns the file path.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "csv_path": {"type": "string"},
+                            "kind": {"type": "string", "description": "line|bar|scatter|hist"},
+                            "x": {"type": "string"},
+                            "y": {"type": "string"},
+                            "parse_dates": {"type": "boolean"},
+                            "resample": {"type": "string", "description": "D|W|M"},
+                            "agg": {"type": "string", "description": "mean|sum|min|max|median"},
+                            "title": {"type": "string"},
+                            "out_dir": {"type": "string"},
+                            "width": {"type": "integer"},
+                            "height": {"type": "integer"},
+                            "dpi": {"type": "integer"},
+                            "grid": {"type": "boolean"}
+                        },
+                        "required": ["csv_path"]
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "draw_chart_data",
+                    "description": "Create a chart (PNG) from inline JSON records using matplotlib. Saves locally and returns the file path.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "data_json": {"type": "string", "description": "JSON array of records"},
+                            "kind": {"type": "string", "description": "line|bar|scatter|hist"},
+                            "x": {"type": "string"},
+                            "y": {"type": "string"},
+                            "parse_dates": {"type": "boolean"},
+                            "resample": {"type": "string", "description": "D|W|M"},
+                            "agg": {"type": "string", "description": "mean|sum|min|max|median"},
+                            "title": {"type": "string"},
+                            "out_dir": {"type": "string"},
+                            "width": {"type": "integer"},
+                            "height": {"type": "integer"},
+                            "dpi": {"type": "integer"},
+                            "grid": {"type": "boolean"}
+                        },
+                        "required": ["data_json"]
+                    },
+                },
             },
         ]
         

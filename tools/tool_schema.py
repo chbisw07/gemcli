@@ -114,13 +114,24 @@ TOOL_SPECS: Dict[str, Dict[str, Any]] = {
         },
         "defaults": {"include_solutions": True, "board": "CBSE"},
     },
+    "draw_chart_csv": {
+        "required": {"csv_path"},
+        "allowed": {"csv_path", "kind", "x", "y", "parse_dates", "resample", "agg", "title", "out_dir", "width", "height", "dpi", "grid"},
+        "defaults": {"kind": "line", "parse_dates": True, "dpi": 144, "width": 1200, "height": 800, "grid": True},
+    },
+    "draw_chart_data": {
+        "required": {"data_json"},
+        "allowed": {"data_json", "kind", "x", "y", "parse_dates", "resample", "agg", "title", "out_dir", "width", "height", "dpi", "grid"},
+        "defaults": {"kind": "line", "parse_dates": True, "dpi": 144, "width": 1200, "height": 800, "grid": True},
+    },
+
 }
 
 # Tools that are safe anywhere (document or code flows)
 UNIVERSAL_TOOLS: Set[str] = {
     "rag_retrieve", "read_file", "list_files", "analyze_files", "web_search", "web_fetch",
     "edu_detect_intent", "edu_explain", "edu_extract_tables", "edu_similar_questions", "edu_question_paper",
-    "edu_build_blueprint", "edu_generate_paper",
+    "edu_build_blueprint", "edu_generate_paper", "draw_chart_csv", "draw_chart_data",
 }
 
 

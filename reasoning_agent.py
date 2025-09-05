@@ -3,6 +3,7 @@
 # =========================
 from __future__ import annotations
 
+import re
 import json
 from typing import List, Dict, Any, Optional, Tuple
 from loguru import logger
@@ -72,6 +73,72 @@ class ReasoningAgent(Agent):
         Steps are later filtered by a per-route allowlist.
         """
         route, _rag, _scores = self._route_and_seed(query)
+
+        # ---- CHART SHORT-CIRCUIT: route chart prompts straight to chart tools ----
+        low = (query or "").lower()
+
+        def _extract_inline_json_array(txt: str) -> Optional[str]:
+            # Grab the first JSON array of objects: [ { ... }, ... ]
+            m = re.search(r"\[\s*\{.*?\}\s*\]", txt, flags=re.S)
+            return m.group(0) if m else None
+
+        def _csv_in_prompt(txt: str) -> Optional[str]:
+            # Match a CSV path token anywhere in the prompt
+            m = re.search(r"([^\s'\"<>]+\.csv)", txt, flags=re.I)
+            return m.group(1) if m else None
+
+        is_charty = any(w in low for w in ("chart", "plot", "graph", "draw"))
+
+        # JSON → draw_chart_data
+        if is_charty:
+            json_blob = _extract_inline_json_array(query)
+            if json_blob:
+                # Heuristic column guesses
+                x_guess = "date" if ("date" in low or re.search(r"\"date\"\s*:", json_blob, flags=re.I)) else None
+                y_guess = None
+                for cand in ("price", "close", "value", "y"):
+                    if cand in low or re.search(fr"\"{cand}\"\s*:", json_blob, flags=re.I):
+                        y_guess = cand
+                        break
+
+                return [{
+                    "tool": "draw_chart_data",
+                    "args": {
+                        "data_json": json_blob,
+                        "x": x_guess,
+                        "y": y_guess,
+                        "kind": "line",
+                        "title": "Chart from JSON",
+                    },
+                    "description": "Render chart from inline JSON records (matplotlib)",
+                    "critical": True,
+                }]
+
+            # CSV → draw_chart_csv
+            csv_path = _csv_in_prompt(query)
+            if csv_path:
+                resample = "W" if "week" in low else ("M" if "month" in low else None)
+                x_guess = "Date" if "date" in low else None
+                y_guess = None
+                for cand in ("Close", "Price", "Value"):
+                    if cand.lower() in low:
+                        y_guess = cand
+                        break
+
+                return [{
+                    "tool": "draw_chart_csv",
+                    "args": {
+                        "csv_path": csv_path,
+                        "x": x_guess,
+                        "y": y_guess,
+                        "resample": resample,
+                        "kind": "line",
+                        "title": "Chart from CSV",
+                    },
+                    "description": "Render chart from CSV (matplotlib)",
+                    "critical": True,
+                }]
+        
         plan: List[Dict[str, Any]] = []
 
         # Always start with RAG (even for code; README/docs often help)
@@ -185,6 +252,24 @@ class ReasoningAgent(Agent):
             if paths:
                 code_block = [f"## {rel}\n" + "\n".join(lines[:10]) for rel, lines in paths.items()]
                 docs.append("\n\n".join(code_block))
+
+        # -------- PATCH B: surface chart tool outputs (saved PNG path) --------
+        def _tool_result(name: str):
+            val = last_by_tool.get(name)
+            if isinstance(val, dict) and "result" in val:
+                return val["result"]
+            return val
+
+        aux_lines = []
+        for tname in ("draw_chart_data", "draw_chart_csv"):
+            res = _tool_result(tname)
+            if isinstance(res, dict) and res.get("image_path"):
+                aux_lines.append(f"Chart saved to: `{res['image_path']}`")
+
+        if aux_lines:
+            # Prepend above other context so users see the path immediately
+            docs.insert(0, "\n".join(aux_lines))
+        # -------- END PATCH B --------
 
         context = ("\n\n".join(docs)).strip()
         sys = (

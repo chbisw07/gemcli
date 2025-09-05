@@ -16,3 +16,6 @@ PyMuPDF
 pypdf
 pytesseract
 
+matplotlib
+pandas
+
