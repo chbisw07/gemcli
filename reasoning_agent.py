@@ -51,6 +51,45 @@ class ReasoningAgent(Agent):
 
     # ---------------- routing + planning ----------------
 
+    # ---- Generic keyword/phrase extractor → focused sub-queries (domain-agnostic) ----
+    def _keywordize(self, text: str, max_terms: int = 8) -> list[str]:
+        """
+        Turn an arbitrary task prompt into a handful of retrieval queries:
+        - preserve quoted phrases, if any
+        - extract keywords (drop tiny/stop words), keep order & de-dupe
+        - return a small list: phrases first, then 2–4 term combos, then single terms
+        """
+        if not text:
+            return []
+        t = text.strip()
+        import re
+        phrases = [m.group(1).strip() for m in re.finditer(r'"([^"]+)"', t)]
+        stop = {
+            "the","and","or","a","an","to","for","of","in","on","by","with","from","at",
+            "this","that","these","those","it","is","are","be","as","into","via","using",
+            "make","create","build","generate","please","show","need","want","how","why",
+            "plan","run","agent","llm","tools","rag","final","answer","step","steps"
+        }
+        tokens = [w.lower() for w in re.findall(r"[A-Za-z0-9_]+", t)]
+        keywords, seen = [], set()
+        for w in tokens:
+            if len(w) <= 2 or w in stop:
+                continue
+            if w not in seen:
+                seen.add(w)
+                keywords.append(w)
+        queries: list[str] = []
+        queries.extend(phrases[:3])  # keep a few phrases if present
+        head = keywords[:6]
+        if head:
+            if len(head) >= 4: queries.append(" ".join(head[:4]))
+            if len(head) >= 3: queries.append(" ".join(head[:3]))
+            if len(head) >= 2: queries.append(" ".join(head[:2]))
+        for w in head:
+            if len(queries) >= max_terms: break
+            if w not in queries: queries.append(w)
+        return queries[:max_terms]
+
     def _route_and_seed(self, prompt: str) -> Tuple[str, Dict[str, Any], Dict[str, float]]:
         """
         Use the centralized router to decide a route and fetch initial chunks.
@@ -71,6 +110,7 @@ class ReasoningAgent(Agent):
         """
         Build a *small*, deterministic plan (no LLM planning).
         Steps are later filtered by a per-route allowlist.
+        Now: fan out several focused RAG sub-queries, then one broad RAG, then route steps → _answer.
         """
         route, _rag, _scores = self._route_and_seed(query)
 
@@ -141,12 +181,20 @@ class ReasoningAgent(Agent):
         
         plan: List[Dict[str, Any]] = []
 
-        # Always start with RAG (even for code; README/docs often help)
+        # Focused RAG sub-queries (domain-agnostic)
+        for sub in self._keywordize(query, max_terms=8):
+            plan.append({
+                "tool": "rag_retrieve",
+                "args": {"query": sub, "top_k": 8},
+                "description": "Focused retrieval from sub-query",
+                "critical": False,
+            })
+        # One broad retrieval for residual gaps
         plan.append({
             "tool": "rag_retrieve",
             "args": {"query": query, "top_k": 12},
-            "description": "Retrieve top chunks for grounding",
-            "critical": True,
+            "description": "Broad retrieval for any residual gaps",
+            "critical": False,
         })
 
         if route == "code":
@@ -224,10 +272,10 @@ class ReasoningAgent(Agent):
 
     def _synthesize_answer(self, prompt: str, last_by_tool: Dict[str, Any]) -> str:
         """Final model call using any context we have gathered."""
-        # Gather doc snippets
-        docs = []
+        # Gather doc snippets (aggregate chunks if multiple rag_retrieve calls ran)
+        docs: List[str] = []
         rag = last_by_tool.get("rag_retrieve") or {}
-        for c in (rag.get("chunks") or [])[:12]:
+        for c in (rag.get("chunks") or [])[:24]:
             md = c.get("metadata") or {}
             tag = (md.get("file_path") or md.get("relpath") or "?")
             extra = []
@@ -325,6 +373,14 @@ class ReasoningAgent(Agent):
         route = (self._last_router.get("route") or "document").lower()
         allow = allowlist_for_route(route)
 
+        # Tools that should always receive project_root/rag_path defaults if missing
+        _CTX_TOOLS = {
+            "rag_retrieve","read_file","list_files","search_code","scan_relevant_files","analyze_files",
+            "edu_detect_intent","edu_similar_questions","edu_question_paper","edu_explain",
+            "edu_extract_tables","edu_build_blueprint","find_related_files","analyze_code_structure",
+            "detect_errors","call_graph_for_function","analyze_function"
+        }
+
         for idx, step in enumerate(plan or [], start=1):
             tool = step.get("tool")
             args = dict(step.get("args") or {})
@@ -378,11 +434,43 @@ class ReasoningAgent(Agent):
 
             # Real tool
             try:
+                # Ensure RAG context for tools that need it
+                if tool in _CTX_TOOLS:
+                    if fixed_args.get("project_root") in (None,"",".","default"):
+                        fixed_args["project_root"] = str(getattr(self.tools, "root", ""))
+                    if fixed_args.get("rag_path") in (None,"",".","default"):
+                        from config_home import GLOBAL_RAG_PATH
+                        fixed_args["rag_path"] = str(GLOBAL_RAG_PATH)
                 out = self.tools.call(tool, **fixed_args)
+
+                # RAG retry if empty: try a simplified query once
+                if tool == "rag_retrieve" and isinstance(out, dict) and not (out.get("chunks") or []):
+                    import re as _re
+                    q = fixed_args.get("query","")
+                    simple = " ".join(_re.findall(r\"[A-Za-z0-9]+\", q)[:12])
+                    if simple and simple != q:
+                        try:
+                            out2 = self.tools.call(tool, **{**fixed_args, "query": simple})
+                            if out2 and (out2.get("chunks") or []):
+                                out = out2
+                        except Exception:
+                            pass
+
                 rec = {"step": idx, "tool": tool, "description": desc, "args": fixed_args, "result": out, "success": True}
                 results.append(rec)
                 # For web_* tools, keep the whole record (args+result) for downstream BINDs
-                last_by_tool[tool] = rec if tool.startswith("web_") else out
+                if tool == "rag_retrieve":
+                    # Accumulate chunks across multiple retrieval steps
+                    prior = last_by_tool.get("rag_retrieve")
+                    if isinstance(prior, dict):
+                        merged = dict(prior)
+                        merged["chunks"] = (prior.get("chunks") or []) + (out.get("chunks") or [])
+                        last_by_tool["rag_retrieve"] = merged
+                    else:
+                        last_by_tool["rag_retrieve"] = out
+                else:
+                    last_by_tool[tool] = rec if tool.startswith("web_") else out
+
                 logger.info("execute_plan: '{}' OK", tool)
             except Exception as e:
                 results.append({"step": idx, "tool": tool, "description": desc, "error": str(e), "success": False})

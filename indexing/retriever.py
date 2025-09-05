@@ -74,7 +74,12 @@ def _query_collection(
     """
     Run a single Chroma query and normalize the rows.
     """
-    res = coll.query(query_embeddings=[qvec], n_results=int(n_results), where=where or {})
+    # Chroma >= 0.5 dislikes an empty filter {}; omit the argument when not used.
+    query_kwargs = {"query_embeddings": [qvec], "n_results": int(n_results)}
+    if where:
+        query_kwargs["where"] = where
+    res = coll.query(**query_kwargs)
+
     ids: List[str] = res.get("ids", [[]])[0]
     docs: List[str] = res.get("documents", [[]])[0]
     metas: List[dict] = res.get("metadatas", [[]])[0]
@@ -118,9 +123,8 @@ def retrieve(
     q_preview = (query or "").strip().replace("\n", " ")[:160]
     logger.info("retriever.retrieve: q='{}…' root='{}' ragdir='{}'", q_preview, project_root, rag_path)
 
-    # --- Load settings (global/default rag.json) ---
-    # NOTE: settings.load expects a rag.json path; do not pass rag_dir here.
-    cfg = load_settings(None)
+    # --- Load settings (prefer an explicit rag.json path if given) ---
+    cfg = load_settings(rag_path) if (rag_path and rag_path.lower().endswith(".json")) else load_settings(None)
 
     # knobs
     topk = int(k or (cfg.get("retrieval") or {}).get("top_k", 8))
@@ -133,8 +137,15 @@ def retrieve(
         enable_filename_boost = bool(router_cfg.get("enable_filename_boost", True))
 
     # --- Resolve rag directory and collection ---
-    # Prefer explicit rag_path; else cfg['chroma_dir']; else project_rag_dir(project_root)
-    rag_dir = str(rag_path or cfg.get("chroma_dir") or project_rag_dir(project_root))
+    # If rag_path is a rag.json file → use its chroma_dir; if it's a directory → use it;
+    # else fall back to cfg['chroma_dir'] → project_rag_dir(project_root).
+    if rag_path and rag_path.lower().endswith(".json"):
+        use_cfg = load_settings(rag_path)
+        rag_dir = str(use_cfg.get("chroma_dir") or project_rag_dir(project_root))
+    elif rag_path and os.path.isdir(rag_path):
+        rag_dir = str(rag_path)
+    else:
+        rag_dir = str(cfg.get("chroma_dir") or project_rag_dir(project_root))
     client = chromadb.PersistentClient(path=rag_dir)
     coll_name = _collection_name_for(cfg)
     coll = client.get_or_create_collection(name=coll_name, metadata={"hnsw:space": "cosine"})
@@ -147,6 +158,19 @@ def retrieve(
     if not qvecs:
         return {"chunks": [], "top_k": topk, "used_where": where or {}, "filename_boosted": []}
     qvec = qvecs[0]
+
+    # Guard against degenerate vectors (common when a server accepted an invalid method)
+    try:
+        if not any(qvec):
+            raise ValueError("all-zero embedding")
+        mean = sum(qvec) / len(qvec)
+        var = sum((x - mean) ** 2 for x in qvec) / len(qvec)
+        if var < 1e-12:
+            raise ValueError("near-constant embedding")
+    except Exception as e:
+        logger.error("retriever: invalid query embedding ({}). Aborting retrieval.", e)
+        return {"chunks": [], "top_k": topk, "used_where": where or {}, "filename_boosted": []}
+
 
     # --- Base query (optionally filtered) ---
     base = _query_collection(coll, qvec, topk, where=where)

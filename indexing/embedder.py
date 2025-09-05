@@ -17,6 +17,7 @@ import requests
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from loguru import logger
+from urllib.parse import urlsplit, urlunsplit
 
 # Optional: auto-load .env so API keys are available when running outside Streamlit
 try:
@@ -116,15 +117,21 @@ def _headers(entry: Dict[str, Any]) -> Dict[str, str]:
 
 def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
     """
-    Only checks basic connectivity (host:port reachable). We do NOT interpret HTTP status;
-    any response means it's up. Pure connection errors/timeouts → unreachable.
+    Connectivity probe: hit the **host root** with HEAD (not /v1/embeddings).
+    We only care about socket reachability, not HTTP semantics of the embeddings route.
     """
+    parts = urlsplit(url)
+    base = urlunsplit((parts.scheme, parts.netloc, "/", "", ""))
     try:
-        requests.get(url, timeout=timeout)
-        logger.debug("embedder: endpoint reachable '{}'", url)
+        # Prefer HEAD to avoid noisy logs; fall back to GET if HEAD not allowed.
+        try:
+            requests.head(base, timeout=timeout, allow_redirects=True)
+        except requests.RequestException:
+            requests.get(base, timeout=timeout)
+        logger.debug("embedder: endpoint reachable '{}'", base)
         return True
     except requests.RequestException as e:
-        logger.debug("embedder: endpoint unreachable '{}': {}", url, e)
+        logger.debug("embedder: endpoint unreachable '{}': {}", base, e)
         return False
 
 
@@ -160,7 +167,7 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
         microbatch = int(rag_cfg.get("embedding_batch_size") or 8)
         logger.info("embedder: remote OpenAI-compatible url='{}' model='{}' microbatch={}", url, model_name, microbatch)
 
-        # Only fail early if we can't connect at all.
+        # Only fail early if we can't connect to the host at all.
         if not _endpoint_reachable(url, timeout=2.0):
             raise RuntimeError(
                 f"Embedding endpoint not reachable: {url}. "
