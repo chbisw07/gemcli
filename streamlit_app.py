@@ -509,6 +509,7 @@ def _rag_summary_from_steps(steps: List[dict]) -> Optional[str]:
         rsteps = [s for s in steps if s.get("tool") == "rag_retrieve" and s.get("success")]
         if not rsteps: return None
         total = 0; files=set()
+        file_boost_cnt = 0
         for s in rsteps:
             chunks = (s.get("result") or {}).get("chunks") or []
             total += len(chunks)
@@ -516,14 +517,20 @@ def _rag_summary_from_steps(steps: List[dict]) -> Optional[str]:
                 md = c.get("metadata") or {}
                 fp = md.get("file_path") or md.get("relpath")
                 if fp: files.add(fp)
-        # expose boosts if present
+            # expose filename boosts if present
+            try:
+                file_boost_cnt += len((s.get("result") or {}).get("filename_boosted") or [])
+            except Exception:
+                pass
+        # expose symbol boosts if present (from last RAG step)
         boosted = []
         try:
             boosted = (rsteps[-1].get("result") or {}).get("symbol_boosted") or []
         except Exception:
             pass
         sym = f" · sym_boost={len(boosted)}" if boosted else ""
-        return f"RAG · retrievals={len(rsteps)} · chunks={total} · files={len(files)}{sym}"
+        fboost = f" · file_boost={file_boost_cnt}" if file_boost_cnt else ""
+        return f"RAG · retrievals={len(rsteps)} · chunks={total} · files={len(files)}{fboost}{sym}"
     except Exception:
         return None
 
@@ -657,7 +664,8 @@ if submit:
                         "critical": True
                     })
 
-                with st.expander("Plan (steps)", expanded=False):
+                # Keep plan visible by default in Agent mode for easier audits
+                with st.expander("Plan (steps)", expanded=True):
                     st.code(_pretty(plan), language="json")
 
                 # EXECUTE: use agent's executor if present; otherwise run a local minimal runner
@@ -727,6 +735,32 @@ if submit:
                 _rs = _rag_summary_from_steps(steps)
                 if _rs:
                     st.caption(_rs)
+
+                # Collated call-graph section (verifiable in one place)
+                try:
+                    cg_steps = [s for s in steps if s.get("tool") == "call_graph_for_function" and s.get("success")]
+                    if cg_steps:
+                        with st.expander("Call graph (computed)", expanded=True):
+                            for s in cg_steps[-2:]:
+                                res = s.get("result") or {}
+                                fn = res.get("function") or s.get("args", {}).get("function") or "<function>"
+                                fpath = res.get("file") or s.get("args", {}).get("file_hint") or "<file>"
+                                st.markdown(f"**Function:** `{fn}`  \n**File:** `{fpath}`")
+                                calls = res.get("calls") or []
+                                if calls:
+                                    rows = [{"name": c.get("name"), "defined_in": c.get("defined_in")} for c in calls if isinstance(c, dict)]
+                                    st.table(rows)
+                                edges = res.get("edges") or []
+                                if edges:
+                                    txt = ", ".join(f"{u}→{v}" for (u, v) in edges[:15])
+                                    st.caption(f"Edges: {txt}")
+                                if isinstance(res.get("dot"), str):
+                                    try:
+                                        st.graphviz_chart(res["dot"])
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
 
                 # Visualize artifacts
                 for rec in steps:

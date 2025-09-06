@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, List, Tuple
+from pathlib import Path
 from loguru import logger
 
 from .settings import load as load_settings
@@ -12,6 +13,13 @@ CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".cpp",
 DOC_EXTS  = {".pdf", ".md", ".txt", ".docx", ".rst"}
 TAB_EXTS  = {".csv", ".xlsx", ".tsv"}
 
+
+def _norm_lower(x) -> str:
+    """Robust lowercase for strings/Paths/objects."""
+    try:
+        return str(x).lower()
+    except Exception:
+        return ""
 
 def _sim_from_distance(d: Optional[float]) -> float:
     """Map Chroma distance to [0,1] similarity."""
@@ -37,9 +45,9 @@ def score_buckets(chunks: List[dict]) -> Dict[str, float]:
     for c in chunks or []:
         md = c.get("metadata") or {}
         sim = c.get("score") or _sim_from_distance(c.get("distance")) or 0.0
-        fp = (md.get("file_path") or md.get("relpath") or "").lower()
+        fp = _norm_lower(md.get("file_path") or md.get("relpath") or "")
         ext = "." + fp.split(".")[-1] if "." in fp else ""
-        prof = (md.get("profile") or "").lower()
+        prof = _norm_lower(md.get("profile") or "")
 
         if prof == "code" or ext in CODE_EXTS:
             s["code"] += sim
@@ -148,7 +156,7 @@ def grounding_summary(chunks: List[dict], max_items: int = 10) -> Dict[str, Any]
     by_file: Dict[str, float] = {}
     for c in chunks[: max_items or 10]:
         md = c.get("metadata") or {}
-        key = (md.get("file_path") or md.get("relpath") or "?")
+        key = str(md.get("file_path") or md.get("relpath") or "?")
         by_file[key] = by_file.get(key, 0.0) + (c.get("score") or _sim_from_distance(c.get("distance")) or 0.0)
 
     # top-N

@@ -74,7 +74,9 @@ class ReasoningAgent(Agent):
             # metadata-ish tokens that are not meaningful queries on their own
             "start_line","end_line","line_start","line_end",
             # drop generic/noisy tokens that add no retrieval signal
-            "code","scv2"
+            "code","scv2",
+            # remaining low-signal tokens we saw producing 0 hits
+            "backend","stack"
         }
         tokens = [w.lower() for w in re.findall(r"[A-Za-z0-9_]+", t)]
 
@@ -216,6 +218,30 @@ class ReasoningAgent(Agent):
                 "critical": False,
             })
 
+        # Extract function-like targets for call-graph & code search signals
+        func_targets: List[str] = []
+        try:
+            raw_funcs = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", query or "")
+            seen = set()
+            for f in raw_funcs:
+                if f.endswith("_retrieve") or f.startswith("calculate_"):
+                    if f not in seen:
+                        seen.add(f)
+                        func_targets.append(f)
+        except Exception:
+            pass
+        # Optional filename hint from the prompt (first .py mentioned)
+        file_hints = re.findall(r"\b([A-Za-z0-9_\-]+\.py)\b", query or "") or []
+        default_hint = file_hints[0] if file_hints else ""
+        def _hint_for(fn: str) -> str:
+            fn_l = (fn or "").lower()
+            if fn_l.endswith("_retrieve") or fn_l.startswith("calculate_"):
+                return "retriever.py"
+            if "sanitize" in fn_l or "upsert" in fn_l:
+                return "indexer.py"
+            return default_hint or "retriever.py"
+
+
         # ---- Detect function-like targets for call-graph injection ----
         low = (query or "").lower()
         func_targets: List[str] = []
@@ -248,15 +274,16 @@ class ReasoningAgent(Agent):
                 for fn in func_targets[:2]:
                     plan.append({
                         "tool": "call_graph_for_function",
-                        "args": {"function": fn, "file_hint": file_hint},
+                        "args": {"function": fn, "file_hint": _hint_for(fn)},
                         "description": f"Build call graph for {fn}",
                         "critical": False,
                     })
             plan += [
                 {
                     "tool": "search_code",
-                    "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 200},
-                    "description": "Find matching lines in codebase",
+                    # use compact code tokens so we actually get line-precise hits
+                    "args": {"query": " ".join(func_targets) or " ".join(self._keywordize(query, 4)), "subdir": "", "exts": [".py"], "max_results": 120},
+                    "description": "Find matching lines in codebase (symbol tokens)",
                     "critical": False,
                 },
                 {
@@ -270,8 +297,8 @@ class ReasoningAgent(Agent):
             plan += [
                 {
                     "tool": "search_code",
-                    "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 120},
-                    "description": "Include code hits in addition to docs",
+                    "args": {"query": " ".join(func_targets) or " ".join(self._keywordize(query, 4)), "subdir": "", "exts": [".py"], "max_results": 120},
+                    "description": "Include code hits (symbol tokens) in addition to docs",
                     "critical": False,
                 },
             ]
@@ -280,7 +307,7 @@ class ReasoningAgent(Agent):
                 for fn in func_targets[:2]:
                     plan.append({
                         "tool": "call_graph_for_function",
-                        "args": {"function": fn, "file_hint": file_hint},
+                        "args": {"function": fn, "file_hint": _hint_for(fn)},
                         "description": f"Build call graph for {fn}",
                         "critical": False,
                     })
@@ -331,99 +358,170 @@ class ReasoningAgent(Agent):
         return looks_like_placeholder(val)
 
     def _synthesize_answer(self, prompt: str, last_by_tool: Dict[str, Any]) -> str:
-        """Final model call using any context we have gathered."""
-        # Gather doc snippets (aggregate chunks if multiple rag_retrieve calls ran)
-        docs: List[str] = []
-        rag = last_by_tool.get("rag_retrieve") or {}
-        for c in (rag.get("chunks") or [])[:24]:
+        """
+        Final model call using whatever context we have gathered.
+        Builds a compact, auditable context block:
+        - RAG evidence (deduped) with [file Ls–Le score=…] headers
+        - Code search hits grouped by file (first 10 lines/file)
+        - Call-graph summary (if available)
+        - Chart artifacts produced by draw_chart_* tools
+        Then asks the model to synthesize a precise answer using those citations.
+        """
+        def _label_for_chunk(c: Dict[str, Any]) -> str:
             md = c.get("metadata") or {}
-            tag = (md.get("file_path") or md.get("relpath") or "?")
+            tag = (md.get("file_path") or md.get("relpath") or md.get("file_name") or "?")
             extra = []
+            # page number (for PDFs)
             if md.get("page_number"):
                 extra.append(f"p.{md.get('page_number')}")
+            # chunk type (code_block, pdf_page, table, etc.)
             if md.get("chunk_type"):
                 extra.append(md.get("chunk_type"))
-            # NEW: append start/end lines and retrieval score for easy auditing
+            # lines (from AST-aware chunker)
             try:
-                # prefer AST chunker keys; fall back to older names if present
                 sline = md.get("line_start") or md.get("start_line")
                 eline = md.get("line_end")   or md.get("end_line") or md.get("end")
                 if sline is not None or eline is not None:
                     extra.append(f"L{(sline if sline is not None else '?')}–{(eline if eline is not None else '?')}")
             except Exception:
                 pass
+            # retrieval score (cosine or sim proxy)
             try:
                 sc = c.get("score", None)
                 if isinstance(sc, (int, float)):
                     extra.append(f"score={sc:.3f}")
             except Exception:
                 pass
-            label = f"[{tag}{' ' + ', '.join(extra) if extra else ''}]"
-            body = c.get("document") or ""
-            docs.append(f"{label}\n{body}".strip())
+            return f"[{tag}{' ' + ', '.join(extra) if extra else ''}]"
 
-        # Gather code hits (search_code results)
-        code_hits = last_by_tool.get("search_code")
-        if isinstance(code_hits, dict) and isinstance(code_hits.get("result"), list):
-            hits = code_hits["result"][:50]
-            # compact format
-            paths: Dict[str, List[str]] = {}
-            for h in hits:
-                rel = h.get("file"); line = h.get("line"); txt = h.get("text")
-                if rel:
-                    paths.setdefault(rel, []).append(f"{line}: {txt}")
-            if paths:
-                code_block = [f"## {rel}\n" + "\n".join(lines[:10]) for rel, lines in paths.items()]
-                docs.append("\n\n".join(code_block))
+        # -------- Collect RAG evidence (across multiple rag steps; dedupe by id) --------
+        rag = last_by_tool.get("rag_retrieve") or {}
+        chunks = list(rag.get("chunks") or [])
+        # some executors keep only last step; in ours we already merge — keep defensive anyway
+        seen_ids, evidence_blocks = set(), []
+        for c in chunks[:128]:  # hard cap to avoid giant prompts
+            cid = c.get("id") or (c.get("metadata") or {}).get("id")
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            label = _label_for_chunk(c)
+            body = (c.get("document") or "").strip()
+            if not body:
+                continue
+            evidence_blocks.append(f"{label}\n{body}")
+        rag_context = "\n\n---\n\n".join(evidence_blocks)
 
-        # -------- PATCH B: surface chart tool outputs (saved PNG path) --------
-        def _tool_result(name: str):
-            val = last_by_tool.get(name)
-            if isinstance(val, dict) and "result" in val:
-                return val["result"]
-            return val
+        # -------- Collect code search hits (grouped by file) --------
+        code_hits_section = ""
+        try:
+            hits = last_by_tool.get("search_code")
+            # our executor stores 'out' (a list) for non web_* tools
+            hit_list = hits if isinstance(hits, list) else (hits.get("result") if isinstance(hits, dict) else None)
+            if isinstance(hit_list, list) and hit_list:
+                per_file: Dict[str, List[str]] = {}
+                for h in hit_list:
+                    rel = h.get("file"); line = h.get("line"); txt = h.get("text")
+                    if not rel: 
+                        continue
+                    per_file.setdefault(rel, []).append(f"{line}: {txt}")
+                parts = []
+                for rel, lines in per_file.items():
+                    parts.append(f"## {rel}\n" + "\n".join(lines[:10]))
+                code_hits_section = "\n\n".join(parts[:8])  # up to 8 files
+        except Exception:
+            pass
 
-        aux_lines = []
+        # -------- Surface call-graph output (latest invocation) --------
+        callgraph_section = ""
+        try:
+            cg = last_by_tool.get("call_graph_for_function")
+            if isinstance(cg, dict) and (cg.get("edges") or cg.get("calls")):
+                fn = cg.get("function") or "<function>"
+                fpath = cg.get("file") or "<file>"
+                edges = cg.get("edges") or []
+                # compact textual summary of first few edges
+                edge_txt = "; ".join([f"{u} → {v}" for (u, v) in edges[:12]])
+                calls = cg.get("calls") or []
+                direct_txt = ", ".join(sorted({c.get("name") for c in calls if isinstance(c, dict) and c.get("name")}))[:400]
+                lines = [f"Function: {fn}", f"Defined in: {fpath}"]
+                if direct_txt:
+                    lines.append(f"Direct callees: {direct_txt}")
+                if edge_txt:
+                    lines.append(f"Edges: {edge_txt}")
+                callgraph_section = "\n".join(lines)
+        except Exception:
+            pass
+
+        # -------- Chart artifacts (paths) --------
+        artifact_lines = []
         for tname in ("draw_chart_data", "draw_chart_csv"):
-            res = _tool_result(tname)
+            res = last_by_tool.get(tname)
             if isinstance(res, dict) and res.get("image_path"):
-                aux_lines.append(f"Chart saved to: `{res['image_path']}`")
+                artifact_lines.append(f"Chart: `{res['image_path']}`")
+        artifacts_section = "\n".join(artifact_lines)
 
-        if aux_lines:
-            # Prepend above other context so users see the path immediately
-            docs.insert(0, "\n".join(aux_lines))
-        # -------- END PATCH B --------
+        # -------- Build the final prompt --------
+        context_sections = []
+        if artifacts_section:
+            context_sections.append(artifacts_section)
+        if rag_context:
+            context_sections.append("### RAG evidence\n" + rag_context)
+        if code_hits_section:
+            context_sections.append("### Code search hits\n" + code_hits_section)
+        if callgraph_section:
+            context_sections.append("### Call graph\n" + callgraph_section)
 
-        context = ("\n\n".join(docs)).strip()
-        sys = (
-            "You are a precise coding/doc assistant. Cite from the provided CONTEXT by referring to "
-            "[file p.X] tags when helpful. If the context is insufficient, say so clearly and propose next steps."
+        context = ("\n\n".join(context_sections)).strip()
+        system_msg = (
+            "You are a precise code/doc assistant.\n"
+            "Use the provided EVIDENCE only; when citing, rely on the bracket headers already shown "
+            "([file Ls–Le score=…] or '## path:line'). Keep changes minimal and concrete."
         )
-        user = (
+        user_msg = (
             f"QUESTION:\n{prompt}\n\n"
-            f"CONTEXT:\n{context if context else '(no retrieved context)'}\n\n"
+            f"EVIDENCE:\n{context if context else '(no retrieved context)'}\n\n"
             "INSTRUCTIONS:\n"
             "- Be concise and specific.\n"
-            "- If code changes are needed, outline them with filenames and diff hunks.\n"
-            "- If answering from PDFs, include page numbers when possible."
+            "- Prefer exact code citations from the headers above over paraphrase.\n"
+            "- When proposing code changes, include filenames and unified diff hunks.\n"
+            "- If the evidence is insufficient for a claim, say so and list what extra you would need."
         )
         try:
             resp = self.adapter.chat([
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user},
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
             ])
             content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "(no content)"
-            # If retriever exposed symbol boosts, append a compact summary for auditability
-            try:
-                sym = (rag.get("symbol_boosted") or [])
-                if sym:
-                    content = f"{content}\n\n---\nSymbol hits: " + ", ".join(sym[:6])
-            except Exception:
-                pass
-            return content
         except Exception as e:
             logger.exception("final LLM call failed: {}", e)
             return f"[error] {e}"
+
+        # -------- Footer: symbol hits + grounding summary (auditable) --------
+        try:
+            sym = (rag.get("symbol_boosted") or [])
+            footer = []
+            if sym:
+                footer.append("Symbol hits: " + ", ".join(sym[:8]))
+            # tiny grounding summary by file
+            by_file: Dict[str, float] = {}
+            for c in chunks[:40]:
+                md = c.get("metadata") or {}
+                key = (md.get("file_path") or md.get("relpath") or "?")
+                sc = c.get("score")
+                try:
+                    val = float(sc) if sc is not None else 0.0
+                except Exception:
+                    val = 0.0
+                by_file[key] = by_file.get(key, 0.0) + val
+            if by_file:
+                top = sorted(by_file.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                footer.append("Grounding: " + "; ".join(f"{k}={v:.3f}" for k, v in top))
+            if footer:
+                content = f"{content}\n\n---\n" + "\n".join(footer)
+        except Exception:
+            pass
+
+        return content
 
     # --- add this helper inside class ReasoningAgent (anywhere above execute_plan) ---
     def _apply_arg_aliases(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:

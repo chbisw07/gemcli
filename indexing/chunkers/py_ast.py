@@ -4,9 +4,83 @@ from __future__ import annotations
 import os
 import ast
 import hashlib
+from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 from loguru import logger
 
+
+def _iter_py_files(root: Path) -> List[Path]:
+    return [p for p in root.rglob("*.py") if p.is_file()]
+
+def _best_file(root: Path, hint: Optional[str]) -> Optional[Path]:
+    if not hint:
+        return None
+    # try exact relpath first, then basename match
+    cand = root / hint
+    if cand.exists():
+        return cand
+    hits = [p for p in _iter_py_files(root) if p.name == Path(hint).name]
+    return hits[0] if hits else None
+
+def build_call_graph(function: str, file_hint: Optional[str], project_root: str | Path) -> Dict:
+    """
+    Build a lightweight intra-file call graph for `function`.
+    Returns: {
+      "function": str, "file": str,
+      "edges": [ [caller, callee], ... ],
+      "calls": [ {"name": str, "lineno": int}, ... ],
+      "summary": str
+    }
+    """
+    root = Path(project_root)
+    target = _best_file(root, file_hint)
+    files = [target] if target else _iter_py_files(root)
+    func_def: Optional[ast.FunctionDef | ast.AsyncFunctionDef] = None
+    src_file: Optional[Path] = None
+
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="ignore")
+            mod = ast.parse(text, filename=str(f))
+        except Exception:
+            continue
+        for node in ast.walk(mod):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function:
+                func_def, src_file = node, f
+                break
+        if func_def:
+            break
+
+    edges: List[Tuple[str, str]] = []
+    calls: List[Dict] = []
+    if func_def and src_file:
+        for node in ast.walk(func_def):
+            if isinstance(node, ast.Call):
+                callee = None
+                fn = node.func
+                if isinstance(fn, ast.Name):
+                    callee = fn.id
+                elif isinstance(fn, ast.Attribute):
+                    callee = fn.attr
+                if callee:
+                    edges.append((function, callee))
+                    calls.append({"name": callee, "lineno": getattr(node, "lineno", None)})
+
+    summary = ""
+    if src_file:
+        summary = f"{function} in {src_file.as_posix()}: calls " + (
+            ", ".join(sorted({c['name'] for c in calls})) if calls else "no functions"
+        )
+
+    # normalize edge format to lists for JSON safety
+    edge_list = [[u, v] for (u, v) in edges[:64]]
+    return {
+        "function": function,
+        "file": src_file.as_posix() if src_file else "",
+        "edges": edge_list,
+        "calls": calls[:128],
+        "summary": summary,
+    }
 
 def _sha(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", "ignore")).hexdigest()
@@ -218,3 +292,5 @@ def chunk(file_path: str, cfg: dict) -> List[Dict[str, Any]]:
         rel, total, len(chunks), max_lines, overlap
     )
     return chunks
+
+__all__ = ["build_call_graph"]

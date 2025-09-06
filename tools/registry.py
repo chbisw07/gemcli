@@ -33,7 +33,7 @@ from tools.charting import (
     draw_chart_from_csv as _chart_from_csv,
     draw_chart_from_json_records as _chart_from_json,
 )
-
+from indexing.chunkers.py_ast import build_call_graph
 
 class ToolRegistry:
     """
@@ -46,6 +46,7 @@ class ToolRegistry:
     def __init__(self, project_root: str):
         self.root = Path(project_root).resolve()
         self.tools: Dict[str, Callable[..., Any]] = {}
+        self.schemas: Dict[str, Any] = {}
         logger.info("ToolRegistry init → root='{}'", str(self.root))
         self._register_builtin_tools()
         logger.info("ToolRegistry ready with {} tool(s)", len(self.tools))
@@ -279,6 +280,30 @@ class ToolRegistry:
             logger.info("search_code: '{}' hits={} subdir='{}' regex={} case_sensitive={}",
                         query, len(results), subdir, regex, case_sensitive)
             return results
+
+        def call_graph_for_function(function: str, file_hint: str | None = None, project_root: str | None = None) -> Dict[str, Any]:
+            """
+            Build a compact call graph for `function`. If `file_hint` is provided, we scope search to that file.
+            """
+            root = Path(project_root or self.root)
+            return build_call_graph(function=function, file_hint=file_hint, project_root=root)
+
+        self.tools["call_graph_for_function"] = call_graph_for_function
+
+        # (If you publish OpenAI tool schemas here, add:)
+        self.schemas["call_graph_for_function"] = {
+            "name": "call_graph_for_function",
+            "description": "Build a compact call graph for a function (uses AST).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "function": {"type": "string"},
+                    "file_hint": {"type": "string"},
+                    "project_root": {"type": "string"},
+                },
+                "required": ["function"]
+            }
+        }
 
         # ---------- write_file ----------
         def write_file(

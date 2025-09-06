@@ -97,6 +97,33 @@ class EnhancedToolRegistry:
         logger.info("EnhancedToolRegistry.call('{}') args_keys={}", name, list(kwargs.keys()))
         return self.tool_registry.call(name, **kwargs)
 
+    def list_tools(self) -> Dict[str, Any]:
+        """
+        Return OpenAI-style tool schemas. Ensure our enhanced tools — in particular
+        `call_graph_for_function` — are advertised even if the base registry hasn't
+        defined a schema for them.
+        """
+        base = dict(getattr(self.tool_registry, "schemas", {}) or {})
+        if "call_graph_for_function" not in base and "call_graph_for_function" in self.tools:
+            base["call_graph_for_function"] = {
+                "name": "call_graph_for_function",
+                "description": "Build a compact call graph for a function (uses AST).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "function": {"type": "string", "description": "Function name to analyze"},
+                        "file_hint": {"type": "string", "description": "Filename hint (e.g., retriever.py)"},
+                        "project_root": {"type": "string", "description": "Project root; defaults to the app root"},
+                        "subdir": {"type": "string", "description": "Optional subdir to constrain the search"},
+                        "depth": {"type": "integer", "description": "Traversal depth (1=direct calls)"},
+                        "project_only": {"type": "boolean", "description": "Skip external/builtins if True"},
+                        "filter_noise": {"type": "boolean", "description": "Drop trivial/builtin calls"},
+                    },
+                    "required": ["function"],
+                },
+            }
+        return base
+
     def _register_enhanced_tools(self):
         """Register enhanced code analysis tools"""
         logger.info("Registering enhanced tools…")
