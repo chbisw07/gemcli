@@ -124,12 +124,24 @@ class ToolRegistry:
         self.tools[name] = wrapped
         logger.debug("Registered tool '{}'", name)
 
-    def call(self, name: str, **kwargs) -> Any:
+    def call(self, name: str, **kwargs):
         if name not in self.tools:
-            logger.error("call: tool '{}' not registered", name)
-            raise ValueError(f"Tool '{name}' is not registered.")
-        logger.info("call('{}') args_keys={}", name, list(kwargs.keys()))
-        return self.tools[name](**kwargs)
+            raise KeyError(f"Unknown tool: {name}")
+        fn = self.tools[name]
+        # Safely drop unexpected kwargs so tools don't crash on extra params.
+        # Unwrap decorated callables to inspect real signature.
+        try:
+            import inspect
+            orig = fn
+            while hasattr(orig, "__wrapped__"):
+                orig = orig.__wrapped__  # type: ignore[attr-defined]
+            sig = inspect.signature(orig)
+            accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            filtered = kwargs if accepts_var_kw else {k: v for k, v in kwargs.items() if k in sig.parameters}
+        except Exception:
+            filtered = kwargs
+        logger.info("→ %s(%s)", name, ", ".join(f"{k}={v!r}" for k, v in filtered.items()))
+        return fn(**filtered)
 
     def try_direct(self, query: str) -> Optional[dict]:
         res = try_direct_actions(query, self.root)
@@ -232,6 +244,7 @@ class ToolRegistry:
             case_sensitive: bool = False,
             exts: Iterable[str] | None = None,
             max_results: int = 2000,
+            **_: Any,
         ) -> List[dict]:
             """
             Search for a string/regex across files (default: .py) and return line hits.
@@ -801,7 +814,8 @@ class ToolRegistry:
                             "where": {"type": "object"},
                             "min_score": {"type": "number"},
                             "rag_path": {"type": "string"},
-                            "project_root": {"type": "string"}
+                            "project_root": {"type": "string"},
+                            "enable_filename_boost": {"type": "boolean"}
                         },
                         "required": ["query"]
                     },

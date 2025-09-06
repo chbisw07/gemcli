@@ -72,7 +72,9 @@ class ReasoningAgent(Agent):
             "plan","run","agent","llm","tools","rag","final","answer","step","steps",
             "you","your","we","assistant","first","then","finish","only","order","constraints",
             # metadata-ish tokens that are not meaningful queries on their own
-            "start_line","end_line","line_start","line_end"
+            "start_line","end_line","line_start","line_end",
+            # drop generic/noisy tokens that add no retrieval signal
+            "code","scv2"
         }
         tokens = [w.lower() for w in re.findall(r"[A-Za-z0-9_]+", t)]
 
@@ -467,8 +469,9 @@ class ReasoningAgent(Agent):
             desc = step.get("description") or ""
             critical = bool(step.get("critical", True))
 
-            # Enforce tool allowlist (virtual tool _answer is always allowed)
-            if tool != "_answer" and tool not in allow:
+            # Enforce tool allowlist (virtual tool _answer is always allowed).
+            # Keep call-graph in code/hybrid even if not listed in allowlist.
+            if tool != "_answer" and tool not in allow and not (tool == "call_graph_for_function" and route in ("code","hybrid")):
                 msg = f"Tool '{tool}' not allowed for route '{route}'"
                 results.append({"step": idx, "tool": tool, "description": desc, "error": msg, "success": False})
                 if critical:
