@@ -150,6 +150,7 @@ class ToolRegistry:
             min_score: float | None = None,
             rag_path: str | None = None,
             project_root: str | None = None,
+            enable_filename_boost: bool | None = None,
         ) -> Dict[str, Any]:
             """
             Retrieve top chunks from the project's Chroma index, with optional metadata filters.
@@ -166,7 +167,7 @@ class ToolRegistry:
                 raise
             pr = project_root or str(self.root)
             rp = rag_path or str(GLOBAL_RAG_PATH)
-            res = _retrieve(project_root=pr, rag_path=rp, query=query, k=top_k, where=where, min_score=min_score)
+            res = _retrieve(project_root=pr, rag_path=rp, query=query, k=top_k, where=where, min_score=min_score, enable_filename_boost=enable_filename_boost)
             logger.info("rag_retrieve: query='{}...' hits={} where_keys={} threshold={}", (query or "")[:80], len(res.get("chunks") or []), list((where or {}).keys()), min_score)
             return res
 

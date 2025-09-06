@@ -26,6 +26,45 @@ except Exception:  # pragma: no cover
     load_dotenv = None
 
 
+def _sanitize_metadata_value(v):
+    """
+    Chroma only accepts str/int/float/bool/None for metadata values.
+    Convert anything else (lists, dicts, Paths, custom objects) to a safe string.
+    """
+    import json
+    from pathlib import Path as _Path
+    if v is None or isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, _Path):
+        return str(v)
+    # Lists/tuples/sets → JSON string (after best-effort scalarization)
+    if isinstance(v, (list, tuple, set)):
+        try:
+            return json.dumps([_sanitize_metadata_value(x) for x in v], ensure_ascii=False)
+        except Exception:
+            return str([str(x) for x in v])
+    # Dicts → JSON string (after best-effort scalarization)
+    if isinstance(v, dict):
+        try:
+            return json.dumps({str(k): _sanitize_metadata_value(x) for k, x in v.items()}, ensure_ascii=False)
+        except Exception:
+            return str({str(k): str(x) for k, x in v.items()})
+    # Fallback for any custom/object types
+    try:
+        return str(v)
+    except Exception:
+        return repr(v)
+
+def _sanitize_metadata(meta: dict) -> dict:
+    out = {}
+    for k, v in (meta or {}).items():
+        try:
+            out[str(k)] = _sanitize_metadata_value(v)
+        except Exception:
+            # drop the bad key
+            continue
+    return out
+
 # ------------------------------ env helper ------------------------------
 
 def _load_env_for_project(project_root: str) -> None:
@@ -266,11 +305,16 @@ def _embed_and_upsert(coll, embed_fn, ids, docs, metas, upsert_batch: int = 64):
         m = min(len(vectors), len(docs))
         ids, docs, metas, vectors = ids[:m], docs[:m], metas[:m], vectors[:m]
 
-    # Ensure chunk_id in metadata
+    # Ensure chunk_id in metadata and sanitize values to Chroma-safe types
     for k in range(len(metas)):
         md = dict(metas[k] or {})
         md["chunk_id"] = ids[k]
-        metas[k] = md
+        metas[k] = _sanitize_metadata(md)
+        # also guarantee document is a string
+        try:
+            docs[k] = "" if docs[k] is None else str(docs[k])
+        except Exception:
+            docs[k] = ""
 
     # Upsert in simple fixed-size chunks
     n = len(ids)

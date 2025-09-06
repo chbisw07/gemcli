@@ -156,7 +156,9 @@ def retrieve(
     embed = resolve_embedder(models_path, cfg)
     qvecs = embed([query]) if query else []
     if not qvecs:
+        logger.warning("retriever: No query embeddings returned — possible model misconfiguration or endpoint issue")
         return {"chunks": [], "top_k": topk, "used_where": where or {}, "filename_boosted": []}
+
     qvec = qvecs[0]
 
     # Guard against degenerate vectors (common when a server accepted an invalid method)

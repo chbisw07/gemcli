@@ -441,13 +441,33 @@ class ReasoningAgent(Agent):
                     if fixed_args.get("rag_path") in (None,"",".","default"):
                         from config_home import GLOBAL_RAG_PATH
                         fixed_args["rag_path"] = str(GLOBAL_RAG_PATH)
+                    # Gentler retrieval threshold; the index + query models mismatch slightly
+                    if tool == "rag_retrieve" and fixed_args.get("min_score") in (None, "", 0):
+                        fixed_args["min_score"] = 0.35
+                    # If a filename is mentioned in prompt/query, add a where-filter automatically
+                    if tool == "rag_retrieve" and not fixed_args.get("where"):
+                        import re as _re
+                        _prompt = (self._last_router or {}).get("prompt", "") + " " + str(fixed_args.get("query",""))
+                        _names = _re.findall(r"\b([A-Za-z0-9_\-]+\.(?:py|pdf|md|txt))\b", _prompt)
+                        if _names:
+                            name = _names[0]
+                            fixed_args["where"] = {"$or":[
+                                {"file_path":{"$contains": name}},
+                                {"relpath":{"$contains": name}},
+                            ]}
+
+                    # If not explicitly set by the caller, encourage filename-aware boosting
+                    if tool == "rag_retrieve" and "enable_filename_boost" not in fixed_args:
+                        fixed_args["enable_filename_boost"] = True
+
                 out = self.tools.call(tool, **fixed_args)
 
                 # RAG retry if empty: try a simplified query once
                 if tool == "rag_retrieve" and isinstance(out, dict) and not (out.get("chunks") or []):
                     import re as _re
                     q = fixed_args.get("query","")
-                    simple = " ".join(_re.findall(r\"[A-Za-z0-9]+\", q)[:12])
+                    # simplify query once if first retrieval came back empty
+                    simple = " ".join(_re.findall(r"[A-Za-z0-9]+", q)[:12])
                     if simple and simple != q:
                         try:
                             out2 = self.tools.call(tool, **{**fixed_args, "query": simple})

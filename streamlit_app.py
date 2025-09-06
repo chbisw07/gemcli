@@ -400,7 +400,7 @@ st.markdown("### Assistant Response")
 # Tools visible (helpful when LLM Tools/Agent)
 try:
     agent = st.session_state["agent"]
-    if ENHANCED_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
+    if ENHANCED_TOOLS_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
         with st.expander("Tools visible to the model (by route)", expanded=False):
             try:
                 names = agent.allowed_tool_names()
@@ -502,6 +502,23 @@ def _maybe_render_dot_from_text(text: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _rag_summary_from_steps(steps: List[dict]) -> Optional[str]:
+    try:
+        rsteps = [s for s in steps if s.get("tool") == "rag_retrieve" and s.get("success")]
+        if not rsteps: return None
+        total = 0; files=set()
+        for s in rsteps:
+            chunks = (s.get("result") or {}).get("chunks") or []
+            total += len(chunks)
+            for c in chunks:
+                md = c.get("metadata") or {}
+                fp = md.get("file_path") or md.get("relpath")
+                if fp: files.add(fp)
+        return f"RAG · retrievals={len(rsteps)} · chunks={total} · files={len(files)}"
+    except Exception:
+        return None
 
 
 # Generic keyword/phrase extractor → focused sub-queries (domain-agnostic)
@@ -698,8 +715,11 @@ if submit:
                 except Exception:
                     steps = []
 
-                # tiny run banner
+                # tiny run banner + RAG summary
                 st.caption(f"Run · Planner={agent.__class__.__name__} · Executor={'agent' if hasattr(agent,'execute_plan') else 'local'} · RAG={'on' if rag_on else 'off'} · Steps={sum(1 for r in steps if r.get('success'))} ok / {sum(1 for r in steps if not r.get('success', False))} failed")
+                _rs = _rag_summary_from_steps(steps)
+                if _rs:
+                    st.caption(_rs)
 
                 # Visualize artifacts
                 for rec in steps:
