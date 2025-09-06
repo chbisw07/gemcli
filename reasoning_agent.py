@@ -64,23 +64,31 @@ class ReasoningAgent(Agent):
         t = text.strip()
         import re
         phrases = [m.group(1).strip() for m in re.finditer(r'"([^"]+)"', t)]
+        # Drop glue words so we don't query "you", "assistant", etc.
         stop = {
             "the","and","or","a","an","to","for","of","in","on","by","with","from","at",
             "this","that","these","those","it","is","are","be","as","into","via","using",
             "make","create","build","generate","please","show","need","want","how","why",
-            "plan","run","agent","llm","tools","rag","final","answer","step","steps"
+            "plan","run","agent","llm","tools","rag","final","answer","step","steps",
+            "you","your","we","assistant","first","then","finish","only","order","constraints"
         }
         tokens = [w.lower() for w in re.findall(r"[A-Za-z0-9_]+", t)]
-        keywords, seen = [], set()
+
+        # Promote "codey" tokens (func names, .py) to the front
+        keywords, seen, codey = [], set(), []
         for w in tokens:
             if len(w) <= 2 or w in stop:
                 continue
             if w not in seen:
                 seen.add(w)
-                keywords.append(w)
+                if "_" in w or w.endswith("py"):
+                    codey.append(w)
+                else:
+                    keywords.append(w)
+
         queries: list[str] = []
         queries.extend(phrases[:3])  # keep a few phrases if present
-        head = keywords[:6]
+        head = (codey + keywords)[:6]
         if head:
             if len(head) >= 4: queries.append(" ".join(head[:4]))
             if len(head) >= 3: queries.append(" ".join(head[:3]))
@@ -99,9 +107,15 @@ class ReasoningAgent(Agent):
             info = route_query(project_root=str(self.tools.root), query=prompt)
         except Exception as e:
             logger.warning("router route_query failed: {}", e)
-            info = {"route": "document", "scores": {"code": 0, "document": 0, "tabular": 0}, "top_k": 0, "chunks": []}
+            # Prefer hybrid so code tools are available even if routing hiccups
+            info = {"route": "hybrid", "scores": {"code": 0, "document": 0, "tabular": 0}, "top_k": 0, "chunks": []}
 
-        self._last_router = {"route": info.get("route"), "scores": info.get("scores"), "top_k": info.get("top_k")}
+        self._last_router = {
+            "route": info.get("route"),
+            "scores": info.get("scores"),
+            "top_k": info.get("top_k"),
+            "prompt": prompt,  # keep to mine filenames later
+        }
         rag = {"chunks": info.get("chunks") or [], "top_k": info.get("top_k")}
         logger.info("router: route={} scores={} top_k={}", self._last_router["route"], self._last_router["scores"], rag["top_k"])
         return self._last_router["route"], rag, self._last_router["scores"]
@@ -444,17 +458,22 @@ class ReasoningAgent(Agent):
                     # Gentler retrieval threshold; the index + query models mismatch slightly
                     if tool == "rag_retrieve" and fixed_args.get("min_score") in (None, "", 0):
                         fixed_args["min_score"] = 0.35
-                    # If a filename is mentioned in prompt/query, add a where-filter automatically
+                    # If a filename is mentioned, add a Chroma-valid filter (no $contains)
                     if tool == "rag_retrieve" and not fixed_args.get("where"):
                         import re as _re
                         _prompt = (self._last_router or {}).get("prompt", "") + " " + str(fixed_args.get("query",""))
-                        _names = _re.findall(r"\b([A-Za-z0-9_\-]+\.(?:py|pdf|md|txt))\b", _prompt)
-                        if _names:
-                            name = _names[0]
-                            fixed_args["where"] = {"$or":[
-                                {"file_path":{"$contains": name}},
-                                {"relpath":{"$contains": name}},
-                            ]}
+                        names = _re.findall(r"\b([A-Za-z0-9_\-]+\.(?:py|pdf|md|txt))\b", _prompt)
+                        if names:
+                            root = str(getattr(self.tools, "root", "")).rstrip("/\\")
+                            # Try exact relpaths and absolute paths (Chroma supports $in/$eq)
+                            rels = [f"rag/{n}" for n in names] + names
+                            abss = [f"{root}/{p}" for p in rels]
+                            fixed_args["where"] = {
+                                "$or": [
+                                    {"relpath": {"$in": rels}},
+                                    {"file_path": {"$in": abss}},
+                                ]
+                            }
 
                     # If not explicitly set by the caller, encourage filename-aware boosting
                     if tool == "rag_retrieve" and "enable_filename_boost" not in fixed_args:
