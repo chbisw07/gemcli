@@ -544,10 +544,17 @@ class ReasoningAgent(Agent):
                 out[dst] = out.pop(src)
         return out
 
-    def execute_plan(self, plan: List[Dict[str, Any]], max_iters: int = 10, analysis_only: bool = False) -> str:
+    def execute_plan(self, plan: List[Dict[str, Any]], max_iters: int = 10, analysis_only: bool = False, progress_cb=None) -> str:
         results: List[Dict[str, Any]] = []
         last_by_tool: Dict[str, Any] = {}
         logger.info("execute_plan: steps={} analysis_only={}", len(plan or []), analysis_only)
+        def _emit(event: str, **data):
+            try:
+                if progress_cb is None: return True
+                cont = progress_cb(event, **data)
+                return (cont is not False)
+            except Exception: return True
+        if not _emit("plan_start", steps=len(plan or [])): return json.dumps(results)
 
         # Per-route allowlist (double-check at execution time)
         route = (self._last_router.get("route") or "document").lower()
@@ -562,6 +569,7 @@ class ReasoningAgent(Agent):
         }
 
         for idx, step in enumerate(plan or [], start=1):
+            if not _emit("step_start", step=idx, tool=step.get("tool"), description=step.get("description")): break
             tool = step.get("tool")
             args = dict(step.get("args") or {})
             desc = step.get("description") or ""
@@ -607,10 +615,12 @@ class ReasoningAgent(Agent):
 
             # Virtual tool: _answer
             if tool == "_answer":
+                _emit("synthesis_start")
                 out_text = self._synthesize_answer(fixed_args.get("prompt", ""), last_by_tool)
                 rec = {"step": idx, "tool": tool, "description": desc, "args": fixed_args, "result": out_text, "success": True}
                 results.append(rec)
                 last_by_tool[tool] = rec
+                _emit("synthesis_done")
                 continue
 
             # Real tool
@@ -664,6 +674,8 @@ class ReasoningAgent(Agent):
 
                 rec = {"step": idx, "tool": tool, "description": desc, "args": fixed_args, "result": out, "success": True}
                 results.append(rec)
+                _emit("step_done", step=idx, tool=tool, ok=True,
+                      summary=(f"chunks={len((out or {}).get('chunks', []))}" if tool=="rag_retrieve" and isinstance(out, dict) else None))
                 # For web_* tools, keep the whole record (args+result) for downstream BINDs
                 if tool == "rag_retrieve":
                     # Accumulate chunks across multiple retrieval steps
@@ -680,6 +692,7 @@ class ReasoningAgent(Agent):
                 logger.info("execute_plan: '{}' OK", tool)
             except Exception as e:
                 results.append({"step": idx, "tool": tool, "description": desc, "error": str(e), "success": False})
+                _emit("step_done", step=idx, tool=tool, ok=False, error=str(e))
                 logger.exception("execute_plan: '{}' failed: {}", tool, e)
                 if critical:
                     break

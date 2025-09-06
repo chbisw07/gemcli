@@ -366,6 +366,13 @@ with st.sidebar:
             st.caption("ReasoningAgent could not be imported; using base Agent with local fallback executor.")
             st.code(RAG_AGENT_ERR)
 
+# --- streaming-progress state ---
+if "cancel" not in st.session_state:
+    st.session_state["cancel"] = False
+if "progress_rows" not in st.session_state:
+    st.session_state["progress_rows"] = []
+
+
 # ============ TOP BAR (new UI) ============
 st.write("")
 bar = st.container(border=False)
@@ -378,11 +385,10 @@ with bar:
     with right:
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
-            _agent_for_stream = st.session_state.get("agent")
-            _adapter_for_stream = getattr(_agent_for_stream, "adapter", None)
-            _has_stream = bool(getattr(_adapter_for_stream, "chat_stream", None))
+            _adapter = getattr(st.session_state.get("agent"), "adapter", None)
+            _has_stream = bool(getattr(_adapter, "chat_stream", None))
             can_stream = (mode == "Direct Chat") and _has_stream
-            streaming = st.toggle("Streaming", value=can_stream, disabled=not can_stream, help=("Streaming is only available in Direct Chat" if mode != "Direct Chat" else ("Adapter doesn't support streaming" if not _has_stream else None)))
+            streaming = st.toggle("Streaming", value=can_stream, disabled=not can_stream, help=("Streaming is only available in Direct Chat" if mode != "Direct Chat" else ("Adapter does not support streaming" if not _has_stream else None)))
         with col2:
             rag_on = st.toggle("RAG (use project data)", value=True)
         with col3:
@@ -394,7 +400,13 @@ prompt = st.text_area(
     height=140,
     placeholder="Type your instruction…",
 )
-submit = st.button("Submit", type="primary", use_container_width=True)
+left_btn, right_btn = st.columns([4,1])
+with left_btn:
+    submit = st.button("Submit", type="primary", use_container_width=True)
+with right_btn:
+    stop_now = st.button("Stop", type="secondary", use_container_width=True)
+    if stop_now:
+        st.session_state["cancel"] = True; st.toast("Stopping…", icon="🛑")
 
 # Secondary panels
 st.markdown("### Assistant Response")
@@ -634,11 +646,26 @@ if submit:
                     st.error(f"[error] {e}")
 
         elif mode == "LLM Tools":
+            # Live progress panel (no token streaming)
+            prog_exp = st.expander("Run progress", expanded=True)
+            prog_ph = prog_exp.empty()
+            st.session_state["progress_rows"] = []
+            def _progress_cb(event: str, **data):
+                if st.session_state.get("cancel"): return False
+                import time as _t
+                ts = _t.strftime("%H:%M:%S")
+                icon = {"start":"▶️","model_call_start":"⌛","model_call_done":"✅","tool_call_start":"🔧","tool_call_done":"✅","synthesis_start":"📝","synthesis_done":"✅"}.get(event,"•")
+                line = f"{ts} {icon} **{event}** — " + ", ".join(f"{k}={v}" for k,v in data.items() if v is not None)
+                st.session_state["progress_rows"].append(line)
+                prog_ph.markdown("\n\n".join(st.session_state["progress_rows"]))
+                return True
             # A single-turn ask that allows tools (your agent handles the loop)
             try:
-                answer = agent.ask_once(prompt, max_iters=int(st.session_state.get("max_iters", 5)))
+                answer = agent.ask_once(prompt, max_iters=int(st.session_state.get("max_iters", 5)), progress_cb=_progress_cb)
             except Exception as e:
                 answer = f"[error] {e}"
+            finally:
+                st.session_state["cancel"] = False
             parsed = _looks_like_tool_blob(answer)
             if parsed is not None:
                 # show special payloads (diffs, graphs) if present
@@ -654,6 +681,18 @@ if submit:
                     render_response_with_latex(answer)
 
         else:  # Agent Plan & Run
+            prog_exp = st.expander("Run progress", expanded=True)
+            prog_ph = prog_exp.empty()
+            st.session_state["progress_rows"] = []
+            def _progress_cb(event: str, **data):
+                if st.session_state.get("cancel"): return False
+                import time as _t
+                ts = _t.strftime("%H:%M:%S")
+                icon = {"plan_start":"🗺️","step_start":"🔧","step_done":"✅","synthesis_start":"📝","synthesis_done":"✅"}.get(event,"•")
+                line = f"{ts} {icon} **{event}** — " + ", ".join(f"{k}={v}" for k,v in data.items() if v is not None)
+                st.session_state["progress_rows"].append(line)
+                prog_ph.markdown("\n\n".join(st.session_state["progress_rows"]))
+                return True
             try:
                 # PLAN
                 if hasattr(agent, "analyze_and_plan"):
@@ -690,7 +729,7 @@ if submit:
                     exec_json = agent.execute_plan(  # type: ignore[attr-defined]
                         plan,
                         max_iters=int(st.session_state.get("max_iters", 5)),
-                        analysis_only=bool(st.session_state.get("analysis_only", True)),
+                        analysis_only=bool(st.session_state.get("analysis_only", True)), progress_cb=_progress_cb,
                     )
                 else:
                     # ---- Local minimal runner (no _answer tool; we will synthesize after steps) ----
@@ -746,6 +785,8 @@ if submit:
                     steps = json.loads(exec_json) if isinstance(exec_json, str) else (exec_json or [])
                 except Exception:
                     steps = []
+                finally:
+                    st.session_state["cancel"] = False
 
                 # tiny run banner + RAG summary
                 st.caption(f"Run · Planner={agent.__class__.__name__} · Executor={'agent' if hasattr(agent,'execute_plan') else 'local'} · RAG={'on' if rag_on else 'off'} · Steps={sum(1 for r in steps if r.get('success'))} ok / {sum(1 for r in steps if not r.get('success', False))} failed")

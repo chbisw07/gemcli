@@ -74,7 +74,7 @@ class Agent:
 
     # --------------------------- Public API ---------------------------
 
-    def ask_once(self, query: str, max_iters: int = 3) -> str:
+    def ask_once(self, query: str, max_iters: int = 3, progress_cb=None) -> str:
         """
         Single-turn ask with an internal tool loop. Keeps the LLM primary:
         - If OpenAI-native tool_calls arrive, execute them in the correct order.
@@ -82,6 +82,20 @@ class Agent:
         - Deterministic parsers + search intent filter act as safety hatches.
         """
         logger.info("Agent.ask_once → prompt='{}...'", (query or "")[:200])
+        def _emit(event: str, **data):
+            """
+            Emit a progress event. If the callback returns False, treat as user cancel.
+            """
+            try:
+                if progress_cb is None:
+                    return True
+                cont = progress_cb(event, **data)
+                return (cont is not False)
+            except Exception as e:
+                logger.debug("progress_cb error ignored: {}", e)
+                return True
+        if not _emit("start", mode="LLM Tools"):
+            return "[cancelled]"
         # Deterministic / intent fast-paths (no LLM needed)
         direct = self._try_direct_actions(query)
         if direct is not None:
@@ -105,11 +119,16 @@ class Agent:
             logger.debug("ask_once: tool_choice_override={}", tool_choice_override)
 
         for it in range(max_iters):
+            if not _emit("model_call_start", iter=it+1):
+                return "[cancelled]"
             try:
                 resp = self.adapter.chat(messages, tool_choice_override=tool_choice_override)
             except Exception as e:
                 logger.exception("adapter.chat failed on iter {}: {}", it + 1, e)
                 return f"[error] chat failed: {e}"
+            finally:
+                if not _emit("model_call_done", iter=it+1):
+                    return "[cancelled]"
 
             msg = (resp.get("choices") or [{}])[0].get("message", {}) or {}
             tool_calls = msg.get("tool_calls") or []
@@ -120,6 +139,7 @@ class Agent:
                 messages.append(msg)
                 for tc in tool_calls:
                     fn = (tc.get("function") or {}).get("name")
+                    if not _emit("tool_call_start", iter=it+1, name=(tc.get("function") or {}).get("name")): return "[cancelled]"
                     args_str = (tc.get("function") or {}).get("arguments", "{}")
                     try:
                         args = json.loads(args_str) if isinstance(args_str, str) else (args_str or {})
@@ -173,10 +193,13 @@ class Agent:
 
             # Final answer
             if content:
+                if not _emit("synthesis_start", iter=it+1): return "[cancelled]"
                 ran, result_or_text = self._maybe_run_textual_tool(content)
                 if ran:
+                    _emit("synthesis_done", iter=it+1, via="textual_tool")
                     logger.info("Final textual tool execution returned")
                     return result_or_text["content"]
+                _emit("synthesis_done", iter=it+1, via="assistant_content")
                 logger.info("ask_once → returning assistant content ({} chars)", len(content or ""))
                 return content
 
