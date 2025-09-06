@@ -20,6 +20,7 @@ _FILENAME_RX = re.compile(
     r"\b([\w\-. ]+\.(?:pdf|docx|txt|md|csv|xlsx|pptx|py|js|jsx|ts|tsx))\b", re.I
 )
 
+_SYMBOL_RX = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b")
 
 def _to_score(distance: Optional[float]) -> float:
     """
@@ -63,6 +64,35 @@ def _merge_by_id(primary: List[dict], extra: List[dict], boost: float = 1.15) ->
     out = list(by_id.values())
     out.sort(key=lambda x: (x.get("score") is not None, x.get("score") or 0.0), reverse=True)
     return out
+
+def _extract_symbol_candidates(q: str) -> List[str]:
+    """Pull probable function/class tokens from the query."""
+    if not q: return []
+    toks = _SYMBOL_RX.findall(q)
+    seen, out = set(), []
+    for t in toks:
+        # favor codey tokens (snake_case / CamelCase-ish), ignore obvious stop-words
+        if len(t) < 3: 
+            continue
+        if t.lower() in {"the","and","for","with","into","using","please","explain","call","graph","file"}:
+            continue
+        if ( "_" in t or t[0].isupper() or t.endswith("_retrieve") or t.startswith("calculate_") ) and t not in seen:
+            seen.add(t); out.append(t)
+    return out
+
+def _row_mentions_symbol(row: dict, sym_l: str) -> bool:
+    """Best-effort check across metadata/text (symbols may be JSON-stringified)."""
+    md = row.get("metadata") or {}
+    name_s = str(md.get("name") or "").lower()
+    syms_s = str(md.get("symbols") or "").lower()
+    doc_s  = str(row.get("document") or "").lower()
+    # direct mentions
+    if sym_l in name_s or sym_l in syms_s:
+        return True
+    # lightweight code heuristics
+    if f"def {sym_l}" in doc_s or f"class {sym_l}" in doc_s or f"{sym_l}(" in doc_s:
+        return True
+    return False
 
 
 def _query_collection(
@@ -199,6 +229,19 @@ def retrieve(
                     filename_hits.append(name)
                     merged = _merge_by_id(merged, extra, boost=1.2)
 
+    # --- NEW: Symbol-aware boosting pass ---
+    symbol_hits: List[str] = []
+    cands = _extract_symbol_candidates(query or "")
+    if cands:
+        wide2 = _query_collection(coll, qvec, n_results=max(3 * topk, 48), where=None)
+        for cand in cands:
+            c_l = cand.lower()
+            extra = [r for r in wide2 if _row_mentions_symbol(r, c_l)]
+            if extra:
+                symbol_hits.append(cand)
+                merged = _merge_by_id(merged, extra, boost=1.30)
+
+
     # --- Apply threshold & clip ---
     if isinstance(min_score, (int, float)):
         before = len(merged)
@@ -208,10 +251,11 @@ def retrieve(
     merged = merged[:topk]
 
     logger.info(
-        "retriever: results={} first_id='{}' boosted={} where_keys={}",
+        "retriever: results={} first_id='{}' boosted_files={} boosted_symbols={} where_keys={}",
         len(merged),
         merged[0]["id"] if merged else None,
         len(filename_hits),
+        len(symbol_hits),
         list((where or {}).keys()),
     )
 
@@ -220,4 +264,5 @@ def retrieve(
         "top_k": topk,
         "used_where": where or {},
         "filename_boosted": filename_hits,
+        "symbol_boosted": symbol_hits,
     }

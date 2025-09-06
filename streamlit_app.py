@@ -516,7 +516,14 @@ def _rag_summary_from_steps(steps: List[dict]) -> Optional[str]:
                 md = c.get("metadata") or {}
                 fp = md.get("file_path") or md.get("relpath")
                 if fp: files.add(fp)
-        return f"RAG · retrievals={len(rsteps)} · chunks={total} · files={len(files)}"
+        # expose boosts if present
+        boosted = []
+        try:
+            boosted = (rsteps[-1].get("result") or {}).get("symbol_boosted") or []
+        except Exception:
+            pass
+        sym = f" · sym_boost={len(boosted)}" if boosted else ""
+        return f"RAG · retrievals={len(rsteps)} · chunks={total} · files={len(files)}{sym}"
     except Exception:
         return None
 

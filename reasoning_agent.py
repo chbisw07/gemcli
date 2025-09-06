@@ -70,7 +70,9 @@ class ReasoningAgent(Agent):
             "this","that","these","those","it","is","are","be","as","into","via","using",
             "make","create","build","generate","please","show","need","want","how","why",
             "plan","run","agent","llm","tools","rag","final","answer","step","steps",
-            "you","your","we","assistant","first","then","finish","only","order","constraints"
+            "you","your","we","assistant","first","then","finish","only","order","constraints",
+            # metadata-ish tokens that are not meaningful queries on their own
+            "start_line","end_line","line_start","line_end"
         }
         tokens = [w.lower() for w in re.findall(r"[A-Za-z0-9_]+", t)]
 
@@ -124,7 +126,7 @@ class ReasoningAgent(Agent):
         """
         Build a *small*, deterministic plan (no LLM planning).
         Steps are later filtered by a per-route allowlist.
-        Now: fan out several focused RAG sub-queries, then one broad RAG, then route steps → _answer.
+        Now: early broad-but-scoped RAG, then focused RAG sub-queries, then (for code/hybrid) call-graph → _answer.
         """
         route, _rag, _scores = self._route_and_seed(query)
 
@@ -195,21 +197,40 @@ class ReasoningAgent(Agent):
         
         plan: List[Dict[str, Any]] = []
 
-        # Focused RAG sub-queries (domain-agnostic)
+        # Early broad-but-scoped retrieval to prime good hits/caching
+        plan.append({
+            "tool": "rag_retrieve",
+            "args": {"query": query, "top_k": 12, "enable_filename_boost": True},
+            "description": "Broad retrieval for residual gaps (scoped)",
+            "critical": False,
+        })
+
+        # Focused RAG sub-queries (function/file oriented)
         for sub in self._keywordize(query, max_terms=8):
             plan.append({
                 "tool": "rag_retrieve",
-                "args": {"query": sub, "top_k": 8},
+                "args": {"query": sub, "top_k": 8, "enable_filename_boost": True},
                 "description": "Focused retrieval from sub-query",
                 "critical": False,
             })
-        # One broad retrieval for residual gaps
-        plan.append({
-            "tool": "rag_retrieve",
-            "args": {"query": query, "top_k": 12},
-            "description": "Broad retrieval for any residual gaps",
-            "critical": False,
-        })
+
+        # ---- Detect function-like targets for call-graph injection ----
+        low = (query or "").lower()
+        func_targets: List[str] = []
+        try:
+            # capture snake_case / camelCase names; keep unique order
+            raw_funcs = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", query or "")
+            seen = set()
+            for f in raw_funcs:
+                if f.endswith("_retrieve") or f.startswith("calculate_"):
+                    if f not in seen:
+                        seen.add(f)
+                        func_targets.append(f)
+        except Exception:
+            pass
+        # optional filename hint from the prompt (e.g., rag/retriever.py)
+        file_hints = re.findall(r"\b([A-Za-z0-9_\-]+\.py)\b", query or "") or []
+        file_hint = file_hints[0] if file_hints else ""
 
         if route == "code":
             plan += [
@@ -219,6 +240,17 @@ class ReasoningAgent(Agent):
                     "description": "Heuristically list likely files",
                     "critical": False,
                 },
+            ]
+            # NEW: auto call-graph steps when function-like tokens are present
+            if func_targets:
+                for fn in func_targets[:2]:
+                    plan.append({
+                        "tool": "call_graph_for_function",
+                        "args": {"function": fn, "file_hint": file_hint},
+                        "description": f"Build call graph for {fn}",
+                        "critical": False,
+                    })
+            plan += [
                 {
                     "tool": "search_code",
                     "args": {"query": query, "subdir": "", "exts": [".py"], "max_results": 200},
@@ -240,6 +272,17 @@ class ReasoningAgent(Agent):
                     "description": "Include code hits in addition to docs",
                     "critical": False,
                 },
+            ]
+            # NEW: auto call-graph steps for hybrid as well
+            if func_targets:
+                for fn in func_targets[:2]:
+                    plan.append({
+                        "tool": "call_graph_for_function",
+                        "args": {"function": fn, "file_hint": file_hint},
+                        "description": f"Build call graph for {fn}",
+                        "critical": False,
+                    })
+            plan += [
                 {
                     "tool": "_answer",
                     "args": {"prompt": query},
@@ -262,7 +305,8 @@ class ReasoningAgent(Agent):
         filtered: List[Dict[str, Any]] = []
         for step in plan:
             t = step.get("tool")
-            if t == "_answer" or t in allow:
+            # Keep _answer always; also keep call_graph in code/hybrid even if not in allowlist
+            if t == "_answer" or t in allow or (t == "call_graph_for_function" and route in ("code", "hybrid")):
                 filtered.append(step)
             else:
                 logger.debug("analyze_and_plan: dropping tool '{}' not allowed for route '{}'", t, route)
@@ -297,6 +341,21 @@ class ReasoningAgent(Agent):
                 extra.append(f"p.{md.get('page_number')}")
             if md.get("chunk_type"):
                 extra.append(md.get("chunk_type"))
+            # NEW: append start/end lines and retrieval score for easy auditing
+            try:
+                # prefer AST chunker keys; fall back to older names if present
+                sline = md.get("line_start") or md.get("start_line")
+                eline = md.get("line_end")   or md.get("end_line") or md.get("end")
+                if sline is not None or eline is not None:
+                    extra.append(f"L{(sline if sline is not None else '?')}–{(eline if eline is not None else '?')}")
+            except Exception:
+                pass
+            try:
+                sc = c.get("score", None)
+                if isinstance(sc, (int, float)):
+                    extra.append(f"score={sc:.3f}")
+            except Exception:
+                pass
             label = f"[{tag}{' ' + ', '.join(extra) if extra else ''}]"
             body = c.get("document") or ""
             docs.append(f"{label}\n{body}".strip())
@@ -351,8 +410,15 @@ class ReasoningAgent(Agent):
                 {"role": "system", "content": sys},
                 {"role": "user", "content": user},
             ])
-            content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "")
-            return content or "(no content)"
+            content = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "(no content)"
+            # If retriever exposed symbol boosts, append a compact summary for auditability
+            try:
+                sym = (rag.get("symbol_boosted") or [])
+                if sym:
+                    content = f"{content}\n\n---\nSymbol hits: " + ", ".join(sym[:6])
+            except Exception:
+                pass
+            return content
         except Exception as e:
             logger.exception("final LLM call failed: {}", e)
             return f"[error] {e}"
