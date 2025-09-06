@@ -326,16 +326,14 @@ with st.sidebar:
     else:
         st.info("No embedding models found in models.json.")
 
-    # Execution flags
-    enable_tools = st.checkbox("Enable tools (default on)", value=bool(ui.get("enable_tools", True)))
-    ui["enable_tools"] = enable_tools
-
-    # Enable planning UI only if ReasoningAgent is importable
-    enhanced = st.checkbox("Enhanced mode (planning, extra tools)",
-                           value=True if RAG_AGENT_AVAILABLE else False,
-                           disabled=not RAG_AGENT_AVAILABLE)
-
+    # Execution flags (hidden defaults)
+    # Always enable tools; Enhanced mode auto-on if ReasoningAgent is available.
+    enable_tools = True
+    ui["enable_tools"] = True
+    enhanced = bool(RAG_AGENT_AVAILABLE)
     ui["enhanced"] = enhanced
+    if not RAG_AGENT_AVAILABLE and RAG_AGENT_ERR:
+        st.caption("Enhanced mode unavailable — falling back to base Agent.")
 
     max_iters = st.number_input("Max tool iters (--max-iters)", 1, 20, int(ui.get("max_iters", 5)), 1)
     ui["max_iters"] = int(max_iters)
@@ -507,28 +505,30 @@ def _maybe_render_dot_from_text(text: str) -> bool:
 def _rag_summary_from_steps(steps: List[dict]) -> Optional[str]:
     try:
         rsteps = [s for s in steps if s.get("tool") == "rag_retrieve" and s.get("success")]
-        if not rsteps: return None
-        total = 0; files=set()
+        if not rsteps:
+            return None
+        total = 0
+        files = set()
         file_boost_cnt = 0
         for s in rsteps:
-            chunks = (s.get("result") or {}).get("chunks") or []
+            result = s.get("result") or {}
+            chunks = result.get("chunks") or []
             total += len(chunks)
             for c in chunks:
                 md = c.get("metadata") or {}
                 fp = md.get("file_path") or md.get("relpath")
-                if fp: files.add(fp)
-            # expose filename boosts if present
+                if fp:
+                    files.add(fp)
             try:
-                file_boost_cnt += len((s.get("result") or {}).get("filename_boosted") or [])
+                file_boost_cnt += len(result.get("filename_boosted") or [])
             except Exception:
                 pass
-        # expose symbol boosts if present (from last RAG step)
-        boosted = []
+        # symbol boosts from the last RAG step if present
         try:
-            boosted = (rsteps[-1].get("result") or {}).get("symbol_boosted") or []
+            boosted_syms = (rsteps[-1].get("result") or {}).get("symbol_boosted") or []
         except Exception:
-            pass
-        sym = f" · sym_boost={len(boosted)}" if boosted else ""
+            boosted_syms = []
+        sym = f" · sym_boost={len(boosted_syms)}" if boosted_syms else ""
         fboost = f" · file_boost={file_boost_cnt}" if file_boost_cnt else ""
         return f"RAG · retrievals={len(rsteps)} · chunks={total} · files={len(files)}{fboost}{sym}"
     except Exception:
@@ -735,6 +735,34 @@ if submit:
                 _rs = _rag_summary_from_steps(steps)
                 if _rs:
                     st.caption(_rs)
+
+                # Collated call-graph section (verifiable in one place)
+                try:
+                    cg_steps = [s for s in steps if s.get("tool") == "call_graph_for_function" and (s.get("result") or s.get("success"))]
+                    if cg_steps:
+                        with st.expander("Call graph (computed)", expanded=True):
+                            for s in cg_steps[-2:]:
+                                res = s.get("result") or {}
+                                fn = res.get("function") or s.get("args", {}).get("function") or "<function>"
+                                fpath = res.get("file") or s.get("args", {}).get("file_hint") or "<file>"
+                                st.markdown(f"**Function:** `{fn}`  \n**File:** `{fpath}`")
+                                calls = res.get("calls") or []
+                                if calls:
+                                    rows = [{"name": c.get("name"), "defined_in": c.get("defined_in")} for c in calls if isinstance(c, dict)]
+                                    if rows:
+                                        st.table(rows)
+                                edges = res.get("edges") or []
+                                if edges and isinstance(edges, list):
+                                    txt = ", ".join(f"{e[0]}→{e[1]}" for e in edges[:15] if isinstance(e, (list, tuple)) and len(e) >= 2)
+                                    if txt:
+                                        st.caption(f"Edges: {txt}")
+                                if isinstance(res.get("dot"), str):
+                                    try:
+                                        st.graphviz_chart(res["dot"])
+                                    except Exception:
+                                        pass
+                except Exception:
+                    pass
 
                 # Collated call-graph section (verifiable in one place)
                 try:
