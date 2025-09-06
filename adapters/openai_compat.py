@@ -88,6 +88,62 @@ class OpenAICompatAdapter:
             logger.error("openai_compat.chat: HTTP {} {}", status, server_text[:500])
             raise RuntimeError(f"OpenAI error {status}: {server_text}") from e
 
+
+    def chat_stream(self, messages: List[Dict], include_tools: bool = False, tool_choice_override: Optional[Dict] = None):
+        """
+        Stream chat completion tokens as plain strings.
+        Yields text chunks as they arrive. Designed for Direct Chat only.
+        """
+        url = (self.model.endpoint or "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+        payload = {
+            "model": self.model.resolved_model() if hasattr(self.model, "resolved_model") else self.model.name,
+            "messages": messages,
+            "temperature": getattr(self.model, "temperature", 0.4),
+            "stream": True,
+        }
+        if include_tools:
+            schemas = self._tool_schemas()
+            if schemas:
+                payload["tools"] = schemas
+                payload["tool_choice"] = tool_choice_override or "auto"
+
+        logger.info("openai_compat.chat_stream → url='{}' model='{}' include_tools={}", url, payload["model"], include_tools)
+        t0 = time.time()
+        resp = requests.post(url, headers=self._headers(), json=payload, stream=True, timeout=300)
+        try:
+            resp.raise_for_status()
+        except Exception as e:
+            try:
+                server_text = resp.text[:500]
+            except Exception:
+                server_text = "<no body>"
+            status = getattr(resp, "status_code", "<?>")
+            logger.error("openai_compat.chat_stream ✗ status={} body≈{}", status, server_text)
+            raise RuntimeError(f"OpenAI stream error {status}: {server_text}") from e
+
+        # SSE stream lines: each 'data: {...}' or 'data: [DONE]'
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line:
+                continue
+            if line.startswith("data: "):
+                data = line[6:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except Exception:
+                    continue
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                delta = (choices[0].get("delta") or {}) if "delta" in choices[0] else (choices[0].get("message") or {})
+                # Only stream user-facing text; ignore tool call deltas
+                text = delta.get("content")
+                if text:
+                    yield text
+        dt = (time.time() - t0) * 1000.0
+        logger.info("openai_compat.chat_stream ✓ time_ms≈{:.0f}", dt)
+
     def tool_loop(self, messages: List[Dict], max_iters: int = 3) -> str:
         logger.info("openai_compat.tool_loop: max_iters={}", max_iters)
         for it in range(max_iters):

@@ -378,7 +378,11 @@ with bar:
     with right:
         col1, col2, col3 = st.columns([1, 1, 1])
         with col1:
-            streaming = st.toggle("Streaming", value=False)
+            _agent_for_stream = st.session_state.get("agent")
+            _adapter_for_stream = getattr(_agent_for_stream, "adapter", None)
+            _has_stream = bool(getattr(_adapter_for_stream, "chat_stream", None))
+            can_stream = (mode == "Direct Chat") and _has_stream
+            streaming = st.toggle("Streaming", value=can_stream, disabled=not can_stream, help=("Streaming is only available in Direct Chat" if mode != "Direct Chat" else ("Adapter doesn't support streaming" if not _has_stream else None)))
         with col2:
             rag_on = st.toggle("RAG (use project data)", value=True)
         with col3:
@@ -604,10 +608,23 @@ if submit:
                         {"role":"user","content": prompt}]
                 try:
                     if streaming and hasattr(agent.adapter, "chat_stream"):
-                        out=[]
-                        for chunk in agent.adapter.chat_stream(msgs):
-                            out.append(chunk)
-                        render_response_with_latex("".join(out))
+                        placeholder = st.empty()
+                        buf = ""
+                        try:
+                            for chunk in agent.adapter.chat_stream(msgs):
+                                if not isinstance(chunk, str):
+                                    continue
+                                buf += chunk
+                                # Process text via sanitizer helpers before displaying
+                                s = _sanitize_latex_text(buf)
+                                s = _fix_common_latex_typos(s)
+                                s = _normalize_math_delimiters(s)
+                                placeholder.markdown(s)
+                        except Exception as _e:
+                            st.error(f"[stream error] {_e}")
+                        else:
+                            # final text remains rendered in placeholder
+                            pass
                     else:
                         resp = agent.adapter.chat(msgs)
                         answer = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
