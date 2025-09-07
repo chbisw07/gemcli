@@ -225,6 +225,11 @@ def _inject_css():
         }
         .stButton>button[kind="primary"]{ background:var(--accent); color:white; border:none; }
         .stTextArea textarea{ line-height:1.4; }
+        /* Indexing action area (no border/shadow) */
+        section[data-testid="stSidebar"] .index-actions{
+          padding:.25rem 0 .25rem 0;
+          background: transparent !important;
+        }
         /* Make the main prompt container visually flat (no border line showing above "Assistant Response") */
         .prompt-card{
           border: 0 !important;
@@ -337,8 +342,8 @@ with st.sidebar:
         # actions (Delta, Full, Stop) — honor Auto indexing and running state
         disabled_manual = bool(auto_index_flag or is_running)
 
-        # Place the buttons inside a small card and distribute evenly
-        st.markdown('<div class="card" style="padding:.5rem;">', unsafe_allow_html=True)
+        # Place the buttons inside a borderless container and distribute evenly
+        st.markdown('<div class="index-actions">', unsafe_allow_html=True)
         btn_cols = 3 if is_running else 2
         cols = st.columns(btn_cols, gap="small")
 
