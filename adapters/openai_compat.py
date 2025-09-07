@@ -65,7 +65,7 @@ class OpenAICompatAdapter:
         logger.info("openai_compat.chat → url='{}' model='{}' tools={} override={}",
                     url, payload["model"], len(schemas or []), bool(tool_choice_override))
         t0 = time.time()
-        resp = requests.post(url, headers=self._headers(), json=payload, timeout=300)  # CB
+        resp = requests.post(url, headers=self._headers(), json=payload, timeout=600)  # CB
         dt = (time.time() - t0) * 1000.0
         logger.info("openai_compat.chat ← status={} time_ms≈{:.0f}", resp.status_code, dt)
         try:

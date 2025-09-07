@@ -211,6 +211,11 @@ st.title(APP_TITLE)
 with st.sidebar:
     st.subheader("Configuration")
 
+    # Read cross-panel state early so we can conditionally disable controls here.
+    _mode_now = st.session_state.get("mode_radio", "Direct Chat")
+    _rag_enabled = bool(st.session_state.get("rag_on", True))
+    _is_direct_chat = (_mode_now == "Direct Chat")
+
     # Log level
     log_level = st.selectbox("Log level", ["INFO","DEBUG","WARNING","ERROR"], index=0)
     logging_setup.set_level(log_level)
@@ -219,7 +224,13 @@ with st.sidebar:
 
     # Project root
     default_root = str(Path.cwd())
-    project_root = st.text_input("Project root (--root)", value=ui.get("project_root", default_root))
+    # Disable when RAG is OFF (per request)
+    project_root = st.text_input(
+        "Project root (--root)",
+        value=ui.get("project_root", default_root),
+        disabled=not _rag_enabled,
+        help=None if _rag_enabled else "Disabled while RAG is OFF"
+    )
     ui["project_root"] = project_root
 
     # RAG / indexing controls
@@ -299,7 +310,7 @@ with st.sidebar:
         st.error(f"Failed to load models: {e}")
         st.stop()
 
-    # Embedding model
+    # Embedding model (disable picker when RAG is OFF)
     try:
         with open(models_config, "r", encoding="utf-8") as f:
             _models_cfg = json.load(f)
@@ -310,19 +321,24 @@ with st.sidebar:
         emb_list, emb_names, default_emb = [], [], ""
 
     if emb_names:
-        chosen_emb = st.selectbox("Embedding model (RAG / indexing)",
-                                  emb_names,
-                                  index=emb_names.index(default_emb) if default_emb in emb_names else 0)
-        ui["embedding_model"] = chosen_emb
-        st.session_state["embedding_model"] = chosen_emb
-        # mirror to rag.json
-        try:
-            cfg = load_rag(RAG_PATH)
-            cfg.setdefault("embedder", {})
-            cfg["embedder"]["selected_name"] = chosen_emb
-            save_rag(RAG_PATH, cfg)
-        except Exception:
-            pass
+        chosen_emb = st.selectbox(
+            "Embedding model (RAG / indexing)",
+            emb_names,
+            index=emb_names.index(default_emb) if default_emb in emb_names else 0,
+            disabled=not _rag_enabled,
+            help=None if _rag_enabled else "Disabled while RAG is OFF"
+        )
+        if _rag_enabled:
+            ui["embedding_model"] = chosen_emb
+            st.session_state["embedding_model"] = chosen_emb
+            # mirror to rag.json only when RAG is ON
+            try:
+                cfg = load_rag(RAG_PATH)
+                cfg.setdefault("embedder", {})
+                cfg["embedder"]["selected_name"] = chosen_emb
+                save_rag(RAG_PATH, cfg)
+            except Exception:
+                pass
     else:
         st.info("No embedding models found in models.json.")
 
@@ -335,13 +351,26 @@ with st.sidebar:
     if not RAG_AGENT_AVAILABLE and RAG_AGENT_ERR:
         st.caption("Enhanced mode unavailable — falling back to base Agent.")
 
-    max_iters = st.number_input("Max tool iters (--max-iters)", 1, 20, int(ui.get("max_iters", 5)), 1)
+    max_iters = st.number_input(
+        "Max tool iters (--max-iters)", 1, 20, int(ui.get("max_iters", 5)), 1,
+        disabled=_is_direct_chat,
+        help=None if not _is_direct_chat else "Disabled in Direct Chat"
+    )
     ui["max_iters"] = int(max_iters)
 
-    analysis_only = st.checkbox("Analysis-only (no writes)", value=bool(ui.get("analysis_only", True)))
+    analysis_only = st.checkbox(
+        "Analysis-only (no writes)",
+        value=bool(ui.get("analysis_only", True)),
+        disabled=_is_direct_chat,
+        help=None if not _is_direct_chat else "Disabled in Direct Chat"
+    )
     ui["analysis_only"] = analysis_only
 
-    callgraph_depth = st.number_input("Call graph depth (0 = full)", 0, 10, int(ui.get("callgraph_depth", 3)), 1)
+    callgraph_depth = st.number_input(
+        "Call graph depth (0 = full)", 0, 10, int(ui.get("callgraph_depth", 3)), 1,
+        disabled=_is_direct_chat,
+        help=None if not _is_direct_chat else "Disabled in Direct Chat"
+    )
     ui["callgraph_depth"] = int(callgraph_depth)
     st.session_state["callgraph_depth"] = int(callgraph_depth)
 
@@ -371,6 +400,12 @@ if "cancel" not in st.session_state:
     st.session_state["cancel"] = False
 if "progress_rows" not in st.session_state:
     st.session_state["progress_rows"] = []
+if "running" not in st.session_state:
+    st.session_state["running"] = False
+if "show_chart_gallery" not in st.session_state:
+    st.session_state["show_chart_gallery"] = False
+if "last_tools_used" not in st.session_state:
+    st.session_state["last_tools_used"] = set()
 
 
 # ============ TOP BAR (new UI) ============
@@ -391,46 +426,60 @@ with bar:
             streaming = st.toggle("Streaming", value=can_stream, disabled=not can_stream, help=("Streaming is only available in Direct Chat" if mode != "Direct Chat" else ("Adapter does not support streaming" if not _has_stream else None)))
         with col2:
             rag_on = st.toggle("RAG (use project data)", value=True)
+            # Keep in session for sidebar controls on next rerun
+            st.session_state["rag_on"] = rag_on
         with col3:
             complex_planning = st.toggle("Complex planning", value=False, disabled=(mode != "Agent Plan & Run"))
 
 # Prompt box + single Submit
 prompt = st.text_area(
-    "",  # no label; the row above acts like a header
+    "input_prompt",  # no label; the row above acts like a header
     height=140,
     placeholder="Type your instruction…",
 )
-left_btn, right_btn = st.columns([4,1])
+left_btn, right_btn = st.columns([5,0.0001])  # keep layout
 with left_btn:
-    submit = st.button("Submit", type="primary", use_container_width=True)
-with right_btn:
-    stop_now = st.button("Stop", type="secondary", use_container_width=True)
-    if stop_now:
-        st.session_state["cancel"] = True; st.toast("Stopping…", icon="🛑")
+    _action_label = "Stop" if st.session_state.get("running") else "Submit"
+    action_clicked = st.button(_action_label, type="primary", use_container_width=True, key="submit_stop_btn")
+    if action_clicked and st.session_state.get("running"):
+        st.session_state["cancel"] = True
+        st.toast("Stopping…", icon="🛑")
+        submit = False
+    else:
+        submit = bool(action_clicked and not st.session_state.get("running"))
 
 # Secondary panels
 st.markdown("### Assistant Response")
 
-# Tools visible (helpful when LLM Tools/Agent)
+# Tools visible (hide in Direct Chat; also mark actually-used tools)
 try:
     agent = st.session_state["agent"]
-    if ENHANCED_TOOLS_AVAILABLE and isinstance(agent, ReasoningAgent):  # type: ignore
+    if ENHANCED_TOOLS_AVAILABLE and isinstance(agent, ReasoningAgent) and mode != "Direct Chat":  # type: ignore
         with st.expander("Tools visible to the model (by route)", expanded=False):
             try:
                 names = agent.allowed_tool_names()
-                st.code("\n".join(names) if names else "(none)", language="text")
+                used = set(st.session_state.get("last_tools_used") or [])
+                if names:
+                    # Render with '*' for tools actually used in this run
+                    lines = [(f"* {n}" if n in used else f"  {n}") for n in names]
+                    st.code("\n".join(lines), language="text")
+                    if used:
+                        st.caption("Legend: '*' = used in this run")
+                else:
+                    st.code("(none)", language="text")
             except Exception:
                 st.caption("Tool list unavailable for this agent.")
 except Exception:
     pass
 
-# Chart gallery always visible
-try:
-    _root = Path(getattr(st.session_state["tools"], "root", Path.cwd()))
-    with st.expander("📈 Local chart gallery", expanded=False):
-        render_chart_gallery(_root, charts_subdir="charts")
-except Exception as _e:
-    logger.warning("Chart gallery failed: {}", _e)
+# Chart gallery: show ONLY if draw_chart_* was used
+if st.session_state.get("show_chart_gallery"):
+    try:
+        _root = Path(getattr(st.session_state["tools"], "root", Path.cwd()))
+        with st.expander("📈 Local chart gallery", expanded=False):
+            render_chart_gallery(_root, charts_subdir="charts")
+    except Exception as _e:
+        logger.warning("Chart gallery failed: {}", _e)
 
 # ------------- Auto-index preflight -------------
 def _ensure_index_ready(project_root: str, rag_path: str, embedder_name: Optional[str], auto: bool):
@@ -592,6 +641,10 @@ def _keywordize(text: str, max_terms: int = 8) -> list[str]:
 
 # Main click
 if submit:
+    st.session_state["running"] = True
+    # reset per-run markers
+    st.session_state["last_tools_used"] = set()
+    st.session_state["show_chart_gallery"] = False
     if not prompt.strip():
         st.warning("Please enter a prompt.")
         st.stop()
@@ -658,6 +711,14 @@ if submit:
                 line = f"{ts} {icon} **{event}** — " + ", ".join(f"{k}={v}" for k,v in data.items() if v is not None)
                 st.session_state["progress_rows"].append(line)
                 prog_ph.markdown("\n\n".join(st.session_state["progress_rows"]))
+                # Track tools used & enable chart gallery on the fly
+                tname = data.get("tool") or data.get("name")
+                if isinstance(tname, str) and tname:
+                    used = set(st.session_state.get("last_tools_used") or set())
+                    used.add(tname)
+                    st.session_state["last_tools_used"] = used
+                    if tname in {"draw_chart_csv","draw_chart_data"}:
+                        st.session_state["show_chart_gallery"] = True
                 return True
             # A single-turn ask that allows tools (your agent handles the loop)
             try:
@@ -692,6 +753,14 @@ if submit:
                 line = f"{ts} {icon} **{event}** — " + ", ".join(f"{k}={v}" for k,v in data.items() if v is not None)
                 st.session_state["progress_rows"].append(line)
                 prog_ph.markdown("\n\n".join(st.session_state["progress_rows"]))
+                # Track tools as they start; flip gallery when charting tools appear
+                tname = data.get("tool")
+                if isinstance(tname, str) and tname:
+                    used = set(st.session_state.get("last_tools_used") or set())
+                    used.add(tname)
+                    st.session_state["last_tools_used"] = used
+                    if tname in {"draw_chart_csv","draw_chart_data"}:
+                        st.session_state["show_chart_gallery"] = True
                 return True
             try:
                 # PLAN
@@ -787,6 +856,7 @@ if submit:
                     steps = []
                 finally:
                     st.session_state["cancel"] = False
+                    st.session_state["running"] = False
 
                 # tiny run banner + RAG summary
                 st.caption(f"Run · Planner={agent.__class__.__name__} · Executor={'agent' if hasattr(agent,'execute_plan') else 'local'} · RAG={'on' if rag_on else 'off'} · Steps={sum(1 for r in steps if r.get('success'))} ok / {sum(1 for r in steps if not r.get('success', False))} failed")
@@ -870,8 +940,21 @@ if submit:
                     ])
                     alt = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "(no content)"
                     render_response_with_latex(alt)
+
+                # After execution, compute tools-used set to decorate the sidebar expander
+                try:
+                    used_tools = {s.get("tool") for s in steps if isinstance(s, dict) and s.get("tool")}
+                    if used_tools:
+                        st.session_state["last_tools_used"] = set(used_tools)
+                    if any(t in {"draw_chart_csv","draw_chart_data"} for t in used_tools):
+                        st.session_state["show_chart_gallery"] = True
+                except Exception:
+                    pass
             except Exception as e:
                 st.error(f"[error] {e}")
 
     except Exception as e:
         st.error(f"[fatal] {e}")
+    finally:
+        st.session_state["running"] = False
+
