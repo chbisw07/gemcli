@@ -111,10 +111,11 @@ def _relpath(root: str, fp: str) -> str:
         return fp
 
 def _stop_flag_path(project_root: str) -> Path:
-    return project_rag_dir(project_root) / ".index_stop"
+    # project_rag_dir returns str in current config_home; cast to Path
+    return Path(project_rag_dir(project_root)) / ".index_stop"
 
 def _status_path(project_root: str) -> Path:
-    return project_rag_dir(project_root) / ".index_status.json"
+    return Path(project_rag_dir(project_root)) / ".index_status.json"
 
 def request_stop(project_root: str) -> Dict[str, bool]:
     """Create a stop flag; workers will finish in-flight and halt."""
@@ -194,7 +195,8 @@ def _chroma(project_root: str, cfg: dict):
                We embed client-side and pass vectors explicitly.
     The RAG store path is anchored to the *project root* for consistency with the app.
     """
-    rag_dir = project_rag_dir(project_root)
+    # Ensure we always operate on a real Path object (mkdir used below)
+    rag_dir = Path(project_rag_dir(project_root))
     rag_dir.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(rag_dir))
     coll_name = _collection_name_for(cfg)
@@ -432,7 +434,8 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
 
     # Stamp for delta indexing
     # Stamp lives under the project root alongside the DB
-    stamp_path = project_rag_dir(project_root) / ".last_index.json"
+    # Cast to Path to avoid 'str' has no attribute 'mkdir'
+    stamp_path = Path(project_rag_dir(project_root)) / ".last_index.json"
     try:
         stamp_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"ts": time.time(), "dirty": bool(dirty)}
@@ -476,7 +479,8 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
 
     # Read last stamp
     # Read the stamp co-located with the project-level DB
-    stamp_path = project_rag_dir(project_root) / ".last_index.json"
+    # Cast to Path to ensure proper path ops
+    stamp_path = Path(project_rag_dir(project_root)) / ".last_index.json"
     last = 0.0
     if os.path.exists(stamp_path):
         try:
