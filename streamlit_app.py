@@ -216,9 +216,24 @@ def _inject_css():
         div[data-baseweb="radio"] > div { flex-direction:row; gap:.75rem; }  /* horizontal radios */
         .stButton>button{
           border-radius:var(--radius); border:1px solid var(--ring); padding:.6rem 1rem;
+        }        
+        /* Sidebar buttons: same height + no wrapping so all align */
+        section[data-testid="stSidebar"] .stButton>button{
+          height: 44px;
+          white-space: nowrap;
+          text-overflow: ellipsis;
         }
         .stButton>button[kind="primary"]{ background:var(--accent); color:white; border:none; }
         .stTextArea textarea{ line-height:1.4; }
+        /* Make the main prompt container visually flat (no border line showing above "Assistant Response") */
+        .prompt-card{
+          border: 0 !important;
+          box-shadow: none !important;
+          padding: 0 !important;
+          background: transparent !important;
+          margin-bottom: .35rem !important; /* tighter gap to the next heading */
+        }
+
 
         /* Tarkash glyph (top-left) */
         .tarkash-logo{
@@ -312,35 +327,71 @@ with st.sidebar:
         )
         ui["rag_auto_index"] = auto_index_flag
 
-        # actions
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Reindex now (full)", use_container_width=True):
-                with st.spinner("Reindexing…"):
+        # determine current indexing status ONCE for both buttons & status text
+        try:
+            _st = index_status(project_root) or {}
+            is_running = (_st.get("state") == "running")
+        except Exception:
+            _st, is_running = {}, False
+
+        # actions (Delta, Full, Stop) — honor Auto indexing and running state
+        disabled_manual = bool(auto_index_flag or is_running)
+
+        # Place the buttons inside a small card and distribute evenly
+        st.markdown('<div class="card" style="padding:.5rem;">', unsafe_allow_html=True)
+        btn_cols = 3 if is_running else 2
+        cols = st.columns(btn_cols, gap="small")
+
+        # --- Delta index ---
+        with cols[0]:
+            if st.button("Delta index", use_container_width=True, disabled=disabled_manual):
+                with st.spinner("Delta indexing…"):
                     try:
-                        cfg = load_rag(per_rag_path)  # accept Path
+                        cfg = load_rag(per_rag_path)                     # Path ok
                         emb_name = ui.get("embedding_model")
                         cfg.setdefault("embedder", {})
                         if emb_name:
                             cfg["embedder"]["selected_name"] = emb_name
-                        cfg["chroma_dir"] = str(rag_index_dir)  # ensure per-project index dir
-                        save_rag(per_rag_path, cfg)   # accept Path
-                        res = full_reindex(project_root, per_rag_path)  # pass Path, not str
+                        cfg["chroma_dir"] = str(rag_index_dir)            # ensure per-project index dir
+                        save_rag(per_rag_path, cfg)                        # Path ok
+                        res = delta_index(project_root, per_rag_path)      # Path ok
+                        st.success(f"Delta index complete. Updated chunks: {res.get('added')}")
+                        st.caption(res)
+                    except Exception as e:
+                        st.error(f"Delta index failed: {e}")
+
+        # --- Full reindex ---
+        with cols[1]:
+            if st.button("Full reindex", use_container_width=True, disabled=disabled_manual):
+                with st.spinner("Reindexing…"):
+                    try:
+                        cfg = load_rag(per_rag_path)
+                        emb_name = ui.get("embedding_model")
+                        cfg.setdefault("embedder", {})
+                        if emb_name:
+                            cfg["embedder"]["selected_name"] = emb_name
+                        cfg["chroma_dir"] = str(rag_index_dir)
+                        save_rag(per_rag_path, cfg)
+                        res = full_reindex(project_root, per_rag_path)
                         st.success(f"Reindex complete. Added chunks: {res.get('added')}")
                         st.caption(res)
                     except Exception as e:
                         st.error(f"Reindex failed: {e}")
-        with c2:
-            if st.button("Stop indexing (graceful)", use_container_width=True):
-                try:
-                    st.warning("Stop requested; workers finish current files.")
-                    request_stop(project_root)
-                except Exception as e:
-                    st.error(f"Failed to request stop: {e}")
+
+        # --- Stop (only while running) ---
+        if is_running:
+            with cols[2]:
+                if st.button("Stop indexing", use_container_width=True):
+                    try:
+                        st.warning("Stop requested; workers finish current files.")
+                        request_stop(project_root)
+                    except Exception as e:
+                        st.error(f"Failed to request stop: {e}")
+
+        st.markdown('</div>', unsafe_allow_html=True)
 
         # status
         try:
-            _st = index_status(project_root) or {}
             if _st.get("dirty"):
                 st.markdown(
                     "<span style='color:#c00;font-size:0.85em'>Indexing status: DIRTY</span>",
@@ -349,6 +400,8 @@ with st.sidebar:
             if _st.get("state") == "running":
                 pf, tf = int(_st.get("processed_files", 0)), int(_st.get("total_files", 0) or 1)
                 st.caption(f"Indexing… {pf}/{tf} files")
+            elif not disabled_manual:
+                st.caption("Indexer is idle.")
         except Exception:
             pass
 
@@ -545,7 +598,7 @@ with top:
             )
 
 # Prompt + single primary action
-st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown('<div class="card prompt-card">', unsafe_allow_html=True)
 prompt = st.text_area("input_prompt", height=140, placeholder="Type your instruction…")
 b1, b2, _ = st.columns([1, 1, 6])
 with b1:
