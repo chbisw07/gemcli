@@ -230,6 +230,18 @@ def _inject_css():
           padding:.25rem 0 .25rem 0;
           background: transparent !important;
         }
+        /* Tarkash glyphs (corners + sidebar) */
+        .tarkash-logo{
+          position: fixed; top: 6px; left: 14px; z-index: 1000;
+          display:flex; align-items:center; gap:.35rem;
+          font-weight:600; color:var(--ink); opacity:.95; pointer-events:none;
+        }
+        .tarkash-logo-right{
+          position: fixed; top: 6px; right: 14px; z-index: 1000;
+          display:flex; align-items:center; gap:.35rem;
+          font-weight:600; color:var(--ink); opacity:.95; pointer-events:none;
+        }
+        .tarkash-logo svg, .tarkash-logo-right svg, .sidebar-logo svg{ width:28px; height:28px; }
         /* Make the main prompt container visually flat (no border line showing above "Assistant Response") */
         .prompt-card{
           border: 0 !important;
@@ -250,7 +262,7 @@ def _inject_css():
           font-weight:600; color:var(--ink); opacity:.95;
           pointer-events:none;
         }
-        .tarkash-logo svg{ width:18px; height:18px; }
+        .tarkash-logo svg{ width:28px; height:28px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -275,11 +287,44 @@ st.markdown(
     """,
     unsafe_allow_html=True)
 
+# Logo (top-right)
+st.markdown(
+    """
+    <div class="tarkash-logo-right" title="Tarkash">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="3" width="10" height="18" rx="2"></rect>
+        <path d="M7.5 6 L6 7.5 L9 7.5 Z"></path>
+        <path d="M11.5 5 L10 6.5 L13 6.5 Z"></path>
+        <path d="M8 8 V18"></path>
+        <path d="M12 7 V18"></path>
+      </svg>
+    </div>
+    """,
+    unsafe_allow_html=True)
+
 # =============================================================================
 # Sidebar — grouped, minimal-scrolling
 # =============================================================================
 
 with st.sidebar:
+    # Sidebar logo
+    st.markdown(
+        """
+        <div class="sidebar-logo" title="Tarkash">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="10" height="18" rx="2"></rect>
+            <path d="M7.5 6 L6 7.5 L9 7.5 Z"></path>
+            <path d="M11.5 5 L10 6.5 L13 6.5 Z"></path>
+            <path d="M8 8 V18"></path>
+            <path d="M12 7 V18"></path>
+          </svg>
+          <span>Tarkash</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.header("Configuration", anchor=False)
 
     # read cross-panel state early
