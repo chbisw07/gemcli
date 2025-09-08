@@ -102,6 +102,20 @@ logger.info("Environment loaded from {}", str(ENV_PATH.resolve()))
 # and add a Pandoc (+xelatex or tectonic) PDF path that runs only if found.
 PDF_EXPORT_ENABLED = True
 
+# ---------- Lightweight environment checks (for status pills) ----------
+def _have_import(mod: str) -> bool:
+    try:
+        __import__(mod)
+        return True
+    except Exception:
+        return False
+
+def _have_weasyprint() -> bool: return _have_import("weasyprint")
+def _have_xhtml2pdf() -> bool:  return _have_import("xhtml2pdf")
+def _have_pymupdf() -> bool:    return _have_import("fitz")
+def _have_wkhtmltopdf() -> bool: return bool(shutil.which("wkhtmltopdf"))
+
+
 # -------------------------------------------------------------------
 # Streamlit rerun compatibility (st.rerun in newer versions)
 # -------------------------------------------------------------------
@@ -590,7 +604,7 @@ def _pygments_css() -> str:
     except Exception:
         return ""
 
-def _build_export_html(project_name: str, rows: List[Dict[str, Any]]) -> str:
+def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include_katex: bool = False) -> str:
     """Compose a complete HTML document for selected chats (print-friendly)."""
     pyg_css = _pygments_css()
     # Print-grade CSS; WeasyPrint supports @page margin boxes + counters
@@ -637,11 +651,23 @@ def _build_export_html(project_name: str, rows: List[Dict[str, Any]]) -> str:
       font-family: STIXGeneral, 'DejaVu Serif', serif;
     }}
     """
+    # Optional KaTeX (only needed for wkhtmltopdf path with client-side math rendering)
+    katex_head = ""
+    if include_katex:
+        # Uses CDN; if your environment blocks external fetches, prefer Pandoc/WeasyPrint.
+        katex_head = """
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+        <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+        <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
+                onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});">
+        </script>
+        """
     now_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'>",
         "<meta name='viewport' content='width=device-width, initial-scale=1'>",
         f"<style>{css}</style>",
+        katex_head,
         "</head><body>",
         f"<div class='title'>Tarkash — Chat Export</div>",
         f"<div class='subtitle'>{html.escape(project_name)} · generated at {now_iso}</div>",
@@ -723,7 +749,7 @@ def _render_pdf_from_html(html_str: str) -> Optional[bytes]:
 
 def _export_chats_to_pdf_rich(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
     """End-to-end rich export using Markdown→HTML (+LaTeX cleanup) → PDF."""
-    html_doc = _build_export_html(project_name, rows)
+    html_doc = _build_export_html(project_name, rows, include_katex=False)
     return _render_pdf_from_html(html_doc)
 
 def _export_chats_to_markdown(project_name: str, rows: List[Dict[str, Any]]) -> bytes:
@@ -816,6 +842,30 @@ def _export_chats_to_pdf_pandoc(project_name: str, rows: List[Dict[str, Any]]) -
         logger.warning(f"pandoc export failed: {e}")
         return None
 
+def _export_chats_to_pdf_wkhtml(project_name: str, rows: List[Dict[str, Any]], *, inject_katex: bool) -> Optional[bytes]:
+    """Experimental: HTML → PDF using wkhtmltopdf. Good when pandoc/texlive are unavailable.
+       For math, KaTeX injection is optional and requires network access."""
+    if not _have_wkhtmltopdf():
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            html_doc = _build_export_html(project_name, rows, include_katex=inject_katex)
+            html_path = Path(td) / "export.html"
+            pdf_path  = Path(td) / "export.pdf"
+            html_path.write_text(html_doc, encoding="utf-8")
+            cmd = [
+                shutil.which("wkhtmltopdf"),
+                "--enable-local-file-access",
+                "-q",
+                str(html_path),
+                str(pdf_path),
+            ]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return pdf_path.read_bytes()
+    except Exception as e:
+        logger.warning(f"wkhtmltopdf export failed: {e}")
+        return None
+
 
 # ---------- PDF export (selected chats) ----------
 
@@ -855,76 +905,72 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     # ---------- Manager toolbar (now AFTER table, uses fresh selection) ----------
     if manager_ui:
         st.session_state.setdefault("hist_view_ids", set())
-        t1, t2, t3, t4 = st.columns([1.2, 1.5, 3.6, 5])
-        with t1:
-            if st.button("Select All"):
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+
+        # --- Row 1: selection + toggles ---
+        top_row = st.columns([1, 2])
+        with top_row[0]:
+            c1, c2 = st.columns(2, gap="small")
+            if c1.button("Select All", use_container_width=True, key="hist_select_all"):
                 st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
                 _rerun()
-        with t2:
-            if st.button("Clear Selection"):
+            if c2.button("Clear", use_container_width=True, key="hist_clear_selection"):
                 st.session_state["hist_view_ids"] = set()
                 _rerun()
-        with t3:
-            sel_ids = list(st.session_state.get("hist_view_ids", set()))
-            sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
-            disabled = (len(sel_rows) == 0)
-            # --- Exports ---
-            c_md, c_pdf = st.columns(2, gap="small")
-            with c_md:
-                export_md = st.button(
-                    "Export selected (.md)",
-                    disabled=disabled,
-                    help="Raw Markdown (best for Pandoc/LaTeX pipelines)",
-                    key="btn_export_md",
-                )
-                if export_md and not disabled:
-                    try:
-                        md_bytes = _export_chats_to_markdown(project_name, sel_rows)
-                        st.session_state["last_export_md"] = md_bytes
-                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                        st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
-                        st.success("Markdown prepared. Use the Download button →")
-                    except Exception as e:
-                        st.error(f"Markdown export failed: {e}")
-            with c_pdf:
-                have_pandoc = _pandoc_available()
-                export_pdf = st.button(
-                    "Export selected (PDF via Pandoc)",
-                    disabled=(disabled or not have_pandoc),
-                    help=("Builds a print-ready PDF with math & code highlighting"
-                          if have_pandoc else
-                          "Pandoc + xelatex/tectonic not found. Install locally or use the .md export."),
-                    key="btn_export_pdf_pandoc",
-                )
-                if export_pdf and not disabled and have_pandoc:
-                    pdf_bytes = _export_chats_to_pdf_pandoc(project_name, sel_rows)
-                    if not pdf_bytes:
-                        st.error("Pandoc export failed. Check logs or use the .md export.")
-                    else:
-                        st.session_state["last_export_pdf"] = pdf_bytes
-                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                        st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
-                        st.success("PDF prepared. Use the Download button →")
-        # Downloads
-        dlc1, dlc2 = t4.columns(2, gap="small")
-        with dlc1:
+        with top_row[1]:
+            save_to_project = st.checkbox(
+                "Save to project (exports/)",
+                value=st.session_state.get("save_exports_to_project", True),
+                key="save_exports_to_project",
+            )
+            inject_katex = st.checkbox(
+                "Inject KaTeX (wkhtmltopdf)",
+                value=st.session_state.get("inject_katex", False),
+                key="inject_katex",
+            )
+
+        # --- Row 2: exports + downloads ---
+        sel_ids = list(st.session_state.get("hist_view_ids", set()))
+        sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
+        disabled = (len(sel_rows) == 0)
+        bcol = st.columns(4, gap="small")
+        with bcol[0]:
+            if st.button("Export .md", disabled=disabled, use_container_width=True, key="btn_export_md"):
+                try:
+                    md_bytes = _export_chats_to_markdown(project_name, sel_rows)
+                    st.session_state["last_export_md"] = md_bytes
+                    tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                    st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
+                    st.success("Markdown prepared")
+                except Exception as e:
+                    st.error(f"MD export failed: {e}")
+        with bcol[1]:
+            have_pandoc = _pandoc_available()
+            if st.button("Export PDF", disabled=(disabled or not have_pandoc), use_container_width=True, key="btn_export_pdf_pandoc"):
+                pdf_bytes = _export_chats_to_pdf_pandoc(project_name, sel_rows)
+                if pdf_bytes:
+                    st.session_state["last_export_pdf"] = pdf_bytes
+                    tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                    st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                    st.success("PDF prepared")
+        with bcol[2]:
             if st.session_state.get("last_export_md"):
-                st.download_button(
-                    "Download .md",
-                    data=st.session_state["last_export_md"],
-                    file_name=st.session_state.get("last_export_md_name", "tarkash_chats.md"),
-                    mime="text/markdown",
-                    key="dl_hist_md",
-                )
-        with dlc2:
+                st.download_button("⬇ .md",
+                                   data=st.session_state["last_export_md"],
+                                   file_name=st.session_state["last_export_md_name"],
+                                   mime="text/markdown",
+                                   use_container_width=True,
+                                   key="dl_hist_md")
+        with bcol[3]:
             if st.session_state.get("last_export_pdf"):
-                st.download_button(
-                    "Download PDF",
-                    data=st.session_state["last_export_pdf"],
-                    file_name=st.session_state.get("last_export_pdf_name", "tarkash_chats.pdf"),
-                    mime="application/pdf",
-                    key="dl_hist_pdf",
-                )
+                st.download_button("⬇ PDF",
+                                   data=st.session_state["last_export_pdf"],
+                                   file_name=st.session_state["last_export_pdf_name"],
+                                   mime="application/pdf",
+                                   use_container_width=True,
+                                   key="dl_hist_pdf")
+
+        st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------- Rows as expanders ----------
     for row in chats:
@@ -971,6 +1017,23 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💎", layout="wide")
 
+def _env_pills():
+    # Compute environment once per render
+    have_pandoc = _pandoc_available()
+    engine = _pandoc_engine()
+    pills = []
+    pills.append(("Pandoc", "ok" if have_pandoc else "no",
+                  f"pandoc {'+'+engine if engine else ''}" if have_pandoc else "not found"))
+    pills.append(("TeX", "ok" if engine in ("xelatex","tectonic") else "no",
+                  engine or "no engine"))
+    pills.append(("WeasyPrint", "ok" if _have_weasyprint() else "no",
+                  "weasyprint"))
+    pills.append(("xhtml2pdf", "ok" if _have_xhtml2pdf() else "no", "xhtml2pdf"))
+    pills.append(("PyMuPDF", "ok" if _have_pymupdf() else "no", "fitz"))
+    pills.append(("wkhtmltopdf", "ok" if _have_wkhtmltopdf() else "no", "wkhtmltopdf"))
+    return pills
+
+
 def _inject_css():
     st.markdown(
         """
@@ -996,11 +1059,15 @@ def _inject_css():
           margin-bottom:.6rem;
         }
         .brand{ display:flex; gap:.6rem; align-items:center; }
+        .pills{ display:flex; gap:.4rem; flex-wrap: wrap; }
         .pill{
           border:1px solid var(--ring);
           padding:.25rem .6rem;
           border-radius:999px; font-size:.8rem; color:var(--muted); background:white;
         }
+        .pill.ok{ color:#065f46; border-color:#34d399; background:#ecfdf5; }     /* teal/green */
+        .pill.maybe{ color:#92400e; border-color:#fbbf24; background:#fffbeb; }  /* amber */
+        .pill.no{ color:#991b1b; border-color:#fca5a5; background:#fef2f2; }     /* red */
         .card{
           background:var(--card);
           border:1px solid var(--ring);
@@ -1098,6 +1165,23 @@ def _inject_css():
     )
 
 _inject_css()
+
+# Title + env pills bar
+with st.container():
+    c1, c2 = st.columns([1.2, 2])
+    with c1:
+        st.markdown(
+            "<div class='title-card'><div class='brand'><span style='font-weight:700'>Tarkash</span></div></div>",
+            unsafe_allow_html=True
+        )
+    with c2:
+        pills = _env_pills()
+        pill_html = "<div class='pills'>" + "".join(
+            [f"<span class='pill {cls}' title='{html.escape(tip)}'>{html.escape(label)}</span>"
+             for (label, cls, tip) in pills]
+        ) + "</div>"
+        st.markdown(pill_html, unsafe_allow_html=True)
+
 
 # Logo
 st.markdown(
@@ -1227,7 +1311,7 @@ with st.sidebar:
 
         # --- Delta index ---
         with cols[0]:
-            if st.button("Delta index", use_container_width=True, disabled=disabled_manual):
+            if st.button("Delta index", use_container_width=True, disabled=disabled_manual, key="btn_delta_index"):
                 with st.spinner("Delta indexing…"):
                     try:
                         cfg = load_rag(per_rag_path)                     # Path ok
@@ -1245,7 +1329,7 @@ with st.sidebar:
 
         # --- Full reindex ---
         with cols[1]:
-            if st.button("Full reindex", use_container_width=True, disabled=disabled_manual):
+            if st.button("Full reindex", use_container_width=True, disabled=disabled_manual, key="btn_full_reindex"):
                 with st.spinner("Reindexing…"):
                     try:
                         cfg = load_rag(per_rag_path)
@@ -1264,7 +1348,7 @@ with st.sidebar:
         # --- Stop (only while running) ---
         if is_running:
             with cols[2]:
-                if st.button("Stop indexing", use_container_width=True):
+                if st.button("Stop indexing", use_container_width=True, key="btn_stop_index"):
                     try:
                         st.warning("Stop requested; workers finish current files.")
                         request_stop(project_root)
@@ -1299,11 +1383,11 @@ with st.sidebar:
             rag_text = st.text_area("rag.json", json.dumps(cfg, indent=2), height=320, key="rag_textarea")
             cA, cB = st.columns(2)
             with cA:
-                if st.button("Save RAG settings"):
+                if st.button("Save RAG settings", key="btn_save_rag"):
                     save_rag(RAG_PATH, json.loads(rag_text))
                     st.success("Saved. Re-run app to apply.")
             with cB:
-                if st.button("Reload from disk"):
+                if st.button("Reload from disk", key="btn_reload_rag"):
                     _rerun()
         except Exception as e:
             st.error(f"Failed to load rag.json: {e}")
@@ -1487,10 +1571,10 @@ with st.sidebar:
             # Optional: clear all
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("Refresh"):
+                if st.button("Refresh", key="btn_history_refresh"):
                     _rerun()
             with c2:
-                if st.button("Delete all"):
+                if st.button("Delete all", key="btn_history_delete_all"):
                     try:
                         dbp = _chat_db_path(project_name)
                         if dbp.exists():
@@ -1596,7 +1680,7 @@ with b1:
     main_label = "Stop" if st.session_state.get("running") else "Submit"
     action_clicked = st.button(main_label, type="primary", use_container_width=True, key="submit_stop_btn")
 with b2:
-    clear = st.button("Clear", use_container_width=True)
+    clear = st.button("Clear", use_container_width=True, key="btn_clear_prompt")
 st.markdown("</div>", unsafe_allow_html=True)
 
 if clear:
