@@ -419,6 +419,47 @@ def _epoch_from_date_str(s: Optional[str]) -> Optional[float]:
     except Exception:
         return None
 
+# ---------- Conversation context helpers ----------
+def _build_context_messages(project_name: str, ui: Dict[str, Any], prompt: str) -> List[Dict[str, str]]:
+    """
+    Build LLM messages with optional conversational context.
+    Priority:
+      1) If per-project history is enabled, pull last N turns from SQLite.
+      2) Else, use a transient in-memory buffer in st.session_state (this session only).
+    """
+    msgs: List[Dict[str, str]] = []
+    ctx_on = bool(ui.get("ctx_on", False))      # default OFF unless user enables
+    ctx_n = int(ui.get("ctx_turns", 4))
+    ctx_n = max(0, min(ctx_n, 10))              # clamp 0..10
+    if not ctx_on or ctx_n == 0:
+        msgs.append({"role": "user", "content": prompt})
+        return msgs
+
+    hist_enabled = bool(ui.get("history_enabled", False))
+    rows: List[Dict[str, Any]] = []
+    if hist_enabled:
+        # Use latest N project rows from DB
+        try:
+            rows = list_chats(project_name, filter_mode="top_n", n=ctx_n)
+        except Exception:
+            rows = []
+    else:
+        # Fall back to transient session buffer
+        buf = st.session_state.get("transient_turns", [])
+        # keep the last N
+        rows = buf[-ctx_n:] if buf else []
+
+    # Oldest -> newest sequence for correct dialogue order
+    for r in list(reversed(rows)):
+        up = r.get("prompt") or r.get("user") or ""
+        an = r.get("answer") or r.get("assistant") or ""
+        if up:
+            msgs.append({"role": "user", "content": up})
+        if an:
+            msgs.append({"role": "assistant", "content": an})
+    msgs.append({"role": "user", "content": prompt})
+    return msgs
+
 
 # ---------- History table helpers ----------
 def _history_dataframe(project_name: str, *, flt: dict) -> pd.DataFrame:
@@ -992,6 +1033,9 @@ with st.sidebar:
             ui["history_regex"] = bool(regex)
 
             # Mode selector
+            st.caption(" ")
+            st.caption("**Time window**")
+
             FILTER_OPTS = {
                 "All": "all",
                 "Top N (most recent)": "top_n",
@@ -1028,6 +1072,22 @@ with st.sidebar:
                 if isinstance(dr, tuple) and len(dr) == 2:
                     ui["history_date_from"] = dr[0].isoformat()
                     ui["history_date_to"]   = dr[1].isoformat()
+
+            st.divider()
+            st.caption("**Conversation context**")
+            ctx_on = st.toggle(
+                "Use context in replies",
+                value=bool(ui.get("ctx_on", False)),
+                help="When on, your last N Q→A turns are prepended before the new prompt so the assistant can follow the conversation."
+            )
+            ui["ctx_on"] = bool(ctx_on)
+            if ctx_on:
+                ctx_turns = st.number_input(
+                    "Context turns (Q→A pairs)",
+                    min_value=1, max_value=10, value=int(ui.get("ctx_turns", 4)), step=1,
+                    help="How many most recent Q→A pairs to include as context."
+                )
+                ui["ctx_turns"] = int(ctx_turns)
 
             # Optional: clear all
             c1, c2 = st.columns(2)
@@ -1165,6 +1225,19 @@ chat_tab, history_tab = st.tabs(["Chat", "History"])
 with chat_tab:
     st.markdown("### Assistant Response")
     response_area = st.empty()
+
+# --- transient conversation buffer (used when history is OFF) ---
+if "transient_turns" not in st.session_state:
+    st.session_state["transient_turns"] = []
+
+def _push_transient_turn(prompt_text: str, answer_text: str, limit: int = 10):
+    """
+    Store a Q→A pair in session memory so context can work even if
+    history persistence is disabled for the project.
+    """
+    buf = list(st.session_state.get("transient_turns", []))
+    buf.append({"prompt": prompt_text, "answer": answer_text})
+    st.session_state["transient_turns"] = buf[-limit:]
 
 final_answer_text_for_history: Optional[str] = None
 def _looks_like_tool_blob(text: str) -> Optional[Any]:
@@ -1370,9 +1443,11 @@ if submit:
                 _render_call_graph_payload(res) or st.json(res)
             else:
                 msgs = [
-                    {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": prompt},
+                    {"role": "system", "content": "You are a helpful assistant."}
                 ]
+                # Build conversation-aware messages (uses SQLite if history is ON,
+                # otherwise falls back to a transient session buffer).
+                msgs += _build_context_messages(current_project_name_for_history or current_project, ui, prompt)
                 try:
                     _adapter = getattr(agent, "adapter", None)
                     if _adapter and hasattr(_adapter, "chat_stream"):
@@ -1386,6 +1461,7 @@ if submit:
                                 s = _normalize_math_delimiters(_fix_common_latex_typos(_sanitize_latex_text(buf)))
                                 placeholder.markdown(s)
                             final_answer_text_for_history = buf
+                            _push_transient_turn(prompt, buf)
                         except Exception as _e:
                             st.error(f"[stream error] {_e}")
                     else:
@@ -1395,6 +1471,7 @@ if submit:
                         if not _maybe_render_dot_from_text(answer):
                             # render final text into Chat tab area
                             render_response_with_latex(answer)
+                        _push_transient_turn(prompt, answer)
                 except Exception as e:
                     st.error(f"[error] {e}")
 
@@ -1457,6 +1534,7 @@ if submit:
                 if not _maybe_render_dot_from_text(final_answer_text_for_history):
                     # ensure rendering stays inside Chat tab
                     render_response_with_latex(final_answer_text_for_history)
+                _push_transient_turn(prompt, final_answer_text_for_history)
 
         # ---------------------- Agent Plan & Run ----------------------
         else:
@@ -1608,6 +1686,7 @@ if submit:
                     final_answer_text_for_history = final_answer.strip()
                     # render inside Chat tab
                     render_response_with_latex(final_answer_text_for_history)
+                    _push_transient_turn(prompt, final_answer_text_for_history)
                 else:
                     results_json = json.dumps(steps, indent=2)
                     synth_prompt = intents._build_synth_prompt(prompt, results_json)
@@ -1621,6 +1700,7 @@ if submit:
                     final_answer_text_for_history = alt
                     # render inside Chat tab
                     render_response_with_latex(final_answer_text_for_history)
+                    _push_transient_turn(prompt, final_answer_text_for_history)
 
             except Exception as e:
                 st.error(f"[error] {e}")
