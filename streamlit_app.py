@@ -114,6 +114,21 @@ def _have_weasyprint() -> bool: return _have_import("weasyprint")
 def _have_xhtml2pdf() -> bool:  return _have_import("xhtml2pdf")
 def _have_pymupdf() -> bool:    return _have_import("fitz")
 def _have_wkhtmltopdf() -> bool: return bool(shutil.which("wkhtmltopdf"))
+def _log_env_status():
+    try:
+        have_pandoc = _pandoc_available()
+        engine = _pandoc_engine() or "-"
+        weasy = _have_weasyprint()
+        x2pdf = _have_xhtml2pdf()
+        pymu = _have_pymupdf()
+        wk = _have_wkhtmltopdf()
+        logger.info(
+            "Env: pandoc=%s engine=%s weasyprint=%s xhtml2pdf=%s pymupdf=%s wkhtmltopdf=%s",
+            have_pandoc, engine, weasy, x2pdf, pymu, wk
+        )
+    except Exception as e:
+        logger.info("Env status check failed: %s", e)
+
 
 
 # -------------------------------------------------------------------
@@ -752,7 +767,89 @@ def _export_chats_to_pdf_rich(project_name: str, rows: List[Dict[str, Any]]) -> 
     html_doc = _build_export_html(project_name, rows, include_katex=False)
     return _render_pdf_from_html(html_doc)
 
-def _export_chats_to_markdown(project_name: str, rows: List[Dict[str, Any]]) -> bytes:
+# --- Math preparation specifically for Pandoc→(xe)latex
+def _prepare_math_for_pandoc(text: str) -> str:
+    """
+    Robust normalizer that prevents mixed/nested delimiters:
+      1) Fix common typos/unicode.
+      2) Strip any stray '$' **inside existing math** ($…$, $$…$$, \\[…\\], \\(…\\)).
+      3) Stash code + existing math so we won't touch them further.
+      4) Targeted inline wrap for safe short tokens (\\triangle, \\angle, degrees like 90^\\circ).
+      5) Whole-line wrap only if the line looks like a standalone equation and has no delimiters.
+    """
+    if not text:
+        return text
+    s = text
+
+    # (1) sanitize + common typos
+    s = _sanitize_latex_text(s)
+    s = _fix_common_latex_typos(s)
+    s = s.replace(r"\left$", r"\left(").replace(r"\right$", r"\right)")
+
+    # (2) strip stray dollars **inside** existing math spans
+    def _strip_inside(pattern: str, opener: str, closer: str):
+        nonlocal s
+        def _repl(m: re.Match) -> str:
+            inner = m.group(1).replace("$", "")
+            return f"{opener}{inner}{closer}"
+        s = re.sub(pattern, _repl, s, flags=re.S)
+    _strip_inside(r"\$\$(.+?)\$\$", "$$", "$$")    # $$…$$
+    _strip_inside(r"\$(.+?)\$", "$", "$")          # $…$
+    _strip_inside(r"\\\[(.+?)\\\]", r"\[", r"\]")  # \[…]
+    _strip_inside(r"\\\((.+?)\\\)", r"\(", r"\)")  # \(...)
+
+    # (3) stash code + existing math (after cleanup)
+    placeholders: dict[str, str] = {}
+    def _stash(pattern: str):
+        nonlocal s
+        def _ph(m: re.Match) -> str:
+            k = f"__PH_{len(placeholders)}__"
+            placeholders[k] = m.group(0)
+            return k
+        s = re.sub(pattern, _ph, s, flags=re.S)
+    _stash(r"```.*?```")          # fenced code
+    _stash(r"`[^`]*`")            # inline code
+    _stash(r"\$\$.*?\$\$")        # display math
+    _stash(r"\$[^$]*\$")          # inline math
+    _stash(r"\\\[[\s\S]*?\\\]")   # \[…]
+    _stash(r"\\\([\s\S]*?\\\)")   # \(...)
+
+    # (4) targeted inline wrap for *isolated* safe tokens
+    def _wrap_token(pat: str):
+        nonlocal s
+        s = re.sub(pat, lambda m: f"${m.group(0)}$", s)
+    # \triangle, \angle
+    _wrap_token(r"(?<![\$\\])\\(?:triangle|angle)\b|(?<!\$)\\(?:triangle|angle)\b")
+    # degrees like 90^\circ or 90^circ
+    def _deg_repl(m: re.Match) -> str:
+        num = m.group(1)
+        return f"${num}^\\circ$"
+    s = re.sub(r"(?<!\$)(\d+)\s*\^\s*(?:\\?circ)\b", _deg_repl, s)
+
+    # (5) whole-line wrap only for strong equation-like lines with no delimiters/PH
+    def _has_delim(t: str) -> bool:
+        return bool(re.search(r"\$|\\\(|\\\)|\\\[|\\\]|__PH_", t))
+    def _looks_equation(t: str) -> bool:
+        if re.search(r"^\s*(\\begin\{|\\frac|\\sqrt|\\sum|\\int|\\prod|\\lim|\\displaystyle|\\[A-Za-z]+)\b", t):
+            return True
+        if re.search(r"=|\\frac|\\sqrt|\\binom", t) and not re.search(r"[A-Za-z]{3,}\s+[A-Za-z]{3,}", t):
+            return True
+        # density heuristic
+        mathish = len(re.findall(r"[\\^_{}+\-*/=<>]|[0-9]", t))
+        return (mathish / max(len(t), 1)) >= 0.40
+    lines = s.splitlines()
+    for i, ln in enumerate(lines):
+        t = ln.strip()
+        if t and not _has_delim(t) and _looks_equation(t):
+            lines[i] = f"${ln}$"
+    s = "\n".join(lines)
+
+    # restore stashed segments
+    for k, v in placeholders.items():
+        s = s.replace(k, v)
+    return s
+
+def _export_chats_to_markdown(project_name: str, rows: List[Dict[str, Any]], *, for_pdf: bool = False) -> bytes:
     """
     Build a single Markdown file containing the selected chats.
     Keeps prompts/answers as-is (so your external MD->PDF toolchain can render
@@ -774,6 +871,10 @@ def _export_chats_to_markdown(project_name: str, rows: List[Dict[str, Any]]) -> 
         streaming = "on" if r.get("streaming") else "off"
         prompt = (r.get("prompt") or "").rstrip()
         answer = (r.get("answer") or "").rstrip()
+
+        if for_pdf:
+            prompt = _prepare_math_for_pandoc(prompt)
+            answer = _prepare_math_for_pandoc(answer)
 
         lines.append(f"## Chat #{cid} — {ts_iso}")
         lines.append(f"`{mode}` · model=`{model}` · emb=`{embedder}` · RAG={rag_on} · stream={streaming}")
@@ -818,7 +919,7 @@ def _export_chats_to_pdf_pandoc(project_name: str, rows: List[Dict[str, Any]]) -
     if not _pandoc_available():
         return None
     try:
-        md_bytes = _export_chats_to_markdown(project_name, rows)
+        md_bytes = _export_chats_to_markdown(project_name, rows, for_pdf=True)
         with tempfile.TemporaryDirectory() as td:
             md_path = Path(td) / "chats.md"
             pdf_path = Path(td) / "out.pdf"
@@ -829,17 +930,18 @@ def _export_chats_to_pdf_pandoc(project_name: str, rows: List[Dict[str, Any]]) -
                 str(md_path),
                 "-o", str(pdf_path),
                 "--standalone",
-                "--from", "markdown+tex_math_dollars+raw_tex",
+                "--from", "markdown+tex_math_dollars+tex_math_single_backslash+raw_tex",
                 "--pdf-engine", engine,
+                # keep geometry but avoid hardcoding fonts that may not exist on Windows
                 "-V", "geometry:margin=1in",
-                "-V", "mainfont=DejaVu Serif",
-                "-V", "monofont=DejaVu Sans Mono",
             ]
-            # capture output so errors surface in the UI
-            subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            proc = subprocess.run(args, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if proc.returncode != 0:
+                st.error("Pandoc PDF export failed.\n\n```\n" + (proc.stderr or b"").decode("utf-8","ignore")[-1200:] + "\n```")
+                return None
             return pdf_path.read_bytes()
     except Exception as e:
-        logger.warning(f"pandoc export failed: {e}")
+        st.error(f"Pandoc PDF export failed.\n\n```\n{e}\n```")
         return None
 
 def _export_chats_to_pdf_wkhtml(project_name: str, rows: List[Dict[str, Any]], *, inject_katex: bool) -> Optional[bytes]:
@@ -933,7 +1035,8 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         sel_ids = list(st.session_state.get("hist_view_ids", set()))
         sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
         disabled = (len(sel_rows) == 0)
-        bcol = st.columns(4, gap="small")
+        # Columns: MD | PDF (Pandoc) | PDF (wkhtml) | ⬇ .md | ⬇ PDF
+        bcol = st.columns(5, gap="small")
         with bcol[0]:
             if st.button("Export .md", disabled=disabled, use_container_width=True, key="btn_export_md"):
                 try:
@@ -942,6 +1045,11 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
                     st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
                     st.success("Markdown prepared")
+                    if save_to_project:
+                        export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
+                        export_dir.mkdir(parents=True, exist_ok=True)
+                        (export_dir/st.session_state["last_export_md_name"]).write_bytes(md_bytes)
+                        st.caption(f"Saved: `{export_dir/st.session_state['last_export_md_name']}`")
                 except Exception as e:
                     st.error(f"MD export failed: {e}")
         with bcol[1]:
@@ -953,7 +1061,34 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
                     st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
                     st.success("PDF prepared")
+                    if save_to_project:
+                        export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
+                        export_dir.mkdir(parents=True, exist_ok=True)
+                        (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
+                        st.caption(f"Saved: `{export_dir/st.session_state['last_export_pdf_name']}`")
+                else:
+                    err = st.session_state.get("pandoc_error") or "Pandoc/LaTeX failed. Ensure pandoc + (xelatex or tectonic) are installed and in PATH."
+                    st.error(f"Pandoc PDF export failed.\n\n```\n{err}\n```")
         with bcol[2]:
+            have_wk = _have_wkhtmltopdf()
+            help_txt = ("HTML→PDF via wkhtmltopdf. Turn on 'Inject KaTeX' if your content has math."
+                        if have_wk else "wkhtmltopdf not found in PATH.")
+            if st.button("Export (wkhtml)", disabled=(disabled or not have_wk), use_container_width=True, key="btn_export_pdf_wkhtml"):
+                pdf_bytes = _export_chats_to_pdf_wkhtml(project_name, sel_rows, inject_katex=bool(st.session_state.get("inject_katex", False)))
+                if pdf_bytes:
+                    st.session_state["last_export_pdf"] = pdf_bytes
+                    tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                    st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                    st.success("PDF prepared (wkhtmltopdf)")
+                    if save_to_project:
+                        export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
+                        export_dir.mkdir(parents=True, exist_ok=True)
+                        (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
+                        st.caption(f"Saved: `{export_dir/st.session_state['last_export_pdf_name']}`")
+                else:
+                    st.error("wkhtmltopdf export failed. Check that wkhtmltopdf is installed and accessible.")
+            st.caption(help_txt)
+        with bcol[3]:
             if st.session_state.get("last_export_md"):
                 st.download_button("⬇ .md",
                                    data=st.session_state["last_export_md"],
@@ -961,7 +1096,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                                    mime="text/markdown",
                                    use_container_width=True,
                                    key="dl_hist_md")
-        with bcol[3]:
+        with bcol[4]:
             if st.session_state.get("last_export_pdf"):
                 st.download_button("⬇ PDF",
                                    data=st.session_state["last_export_pdf"],
@@ -1016,6 +1151,8 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
 # =============================================================================
 
 st.set_page_config(page_title=APP_TITLE, page_icon="💎", layout="wide")
+
+_log_env_status()
 
 def _env_pills():
     # Compute environment once per render
@@ -1166,21 +1303,12 @@ def _inject_css():
 
 _inject_css()
 
-# Title + env pills bar
+# Title bar (env pills removed; status is logged instead)
 with st.container():
-    c1, c2 = st.columns([1.2, 2])
-    with c1:
-        st.markdown(
-            "<div class='title-card'><div class='brand'><span style='font-weight:700'>Tarkash</span></div></div>",
-            unsafe_allow_html=True
-        )
-    with c2:
-        pills = _env_pills()
-        pill_html = "<div class='pills'>" + "".join(
-            [f"<span class='pill {cls}' title='{html.escape(tip)}'>{html.escape(label)}</span>"
-             for (label, cls, tip) in pills]
-        ) + "</div>"
-        st.markdown(pill_html, unsafe_allow_html=True)
+    st.markdown(
+        "<div class='title-card'><div class='brand'><span style='font-weight:700'>Tarkash</span></div></div>",
+        unsafe_allow_html=True
+    )
 
 
 # Logo
@@ -1697,6 +1825,66 @@ if action_clicked and st.session_state.get("running"):
 else:
     submit = bool(action_clicked and not st.session_state.get("running"))
 
+# ---------------------- System prompt controls (below user prompt) ----------------------
+# Per-project persistence: read the current project's ui_settings.json
+def _current_project_name_and_paths():
+    _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
+    name = _g.get("project_name") or Path.cwd().name
+    return name, project_paths(name)
+
+proj_name_for_ui, _paths_for_ui = _current_project_name_and_paths()
+_ui_for_ui = _read_json(_paths_for_ui["ui_settings"])
+
+# simple separator (no boxed card)
+st.divider()
+
+# Initialize session_state once from disk, then drive the widgets from it.
+if "sys_prompt_on" not in st.session_state:
+    st.session_state["sys_prompt_on"] = bool(_ui_for_ui.get("sys_prompt_on", False))
+if "sys_prompt_text" not in st.session_state:
+    st.session_state["sys_prompt_text"] = _ui_for_ui.get("sys_prompt_text", "")
+
+# Bind widgets directly to session_state (no `value=` to avoid double-click/flicker)
+st.toggle(
+    "System prompt",
+    key="sys_prompt_on",
+    help="When ON, the text below is sent as a system message (merged with internal system instructions).",
+)
+if st.session_state["sys_prompt_on"]:
+    st.text_area(
+        "system_prompt",
+        key="sys_prompt_text",
+        height=72,  # ~3 lines
+        placeholder="e.g., Be concise; answer strictly with steps; prefer KaTeX for math…",
+    )
+
+# Persist per-project immediately from session_state
+_ui_for_ui["sys_prompt_on"] = bool(st.session_state["sys_prompt_on"])
+_ui_for_ui["sys_prompt_text"] = st.session_state.get("sys_prompt_text", "")
+_write_json(_paths_for_ui["ui_settings"], _ui_for_ui)
+
+# Compose the effective system prompt each run
+def _compose_system_prompt(ui_dict: dict, mode_label: str) -> str:
+    # Internal baseline (dynamic bits kept minimal & safe)
+    lines = ["You are a helpful assistant."]
+    if bool(st.session_state.get("rag_on", False)):
+        lines.append("Use retrieved project documents when relevant; prefer code citations with file:line.")
+    if mode_label in ("LLM Tools", "Agent Plan & Run") and bool(ui_dict.get("analysis_only", True)):
+        lines.append("Operate in analysis-only mode unless explicitly instructed otherwise.")
+    internal = "\n".join(lines).strip()
+    # Optional user addendum
+    user_add = (ui_dict.get("sys_prompt_text") or "").strip() if bool(ui_dict.get("sys_prompt_on")) else ""
+    if user_add:
+        return internal + "\n\n" + user_add
+    return internal
+
+# Helper: for adapters that only take a single user string (no system role)
+def _prefix_with_system(user_prompt: str, system_text: str) -> str:
+    if not (system_text and system_text.strip()):
+        return user_prompt
+    return f"[SYSTEM]\n{system_text.strip()}\n\n[USER]\n{user_prompt}"
+
+
 # Tabs: keep chat UI as-is in “Chat”, move history into its own tab
 chat_tab, history_tab = st.tabs(["Chat", "History"])
 
@@ -1921,9 +2109,11 @@ if submit:
                 res = tools.call("call_graph_for_function", function=fn, depth=depth)
                 _render_call_graph_payload(res) or st.json(res)
             else:
-                msgs = [
-                    {"role": "system", "content": "You are a helpful assistant."}
-                ]
+                # Compose system prompt (internal + user)
+                eff_system = _compose_system_prompt(ui, mode)
+                msgs = []
+                if eff_system:
+                    msgs.append({"role": "system", "content": eff_system})
                 # Build conversation-aware messages (uses SQLite if history is ON,
                 # otherwise falls back to a transient session buffer).
                 msgs += _build_context_messages(current_project_name_for_history or current_project, ui, prompt)
@@ -1987,8 +2177,11 @@ if submit:
                 return True
 
             try:
+                # Prefix user prompt so adapters that only accept a single string still get system guidance.
+                eff_system = _compose_system_prompt(ui, mode)
+                prompt_for_llm = _prefix_with_system(prompt, eff_system)
                 answer = agent.ask_once(
-                    prompt, max_iters=int(st.session_state.get("max_iters", 5)), progress_cb=_progress_cb
+                    prompt_for_llm, max_iters=int(st.session_state.get("max_iters", 5)), progress_cb=_progress_cb
                 )
             except Exception as e:
                 answer = f"[error] {e}"
@@ -2114,12 +2307,12 @@ if submit:
                             break
                     results_json = json.dumps(steps, indent=2)
                     synth_prompt = intents._build_synth_prompt(prompt, results_json)
-                    resp = agent.adapter.chat(
-                        [
-                            {"role": "system", "content": "Be concrete, cite code (file:line)."},
-                            {"role": "user", "content": synth_prompt},
-                        ]
-                    )
+                    eff_system = _compose_system_prompt(ui, mode)
+                    sys_msgs = []
+                    if eff_system:
+                        sys_msgs.append({"role": "system", "content": eff_system})
+                    sys_msgs.append({"role": "system", "content": "Be concrete, cite code (file:line)."})
+                    resp = agent.adapter.chat(sys_msgs + [{"role": "user", "content": synth_prompt}])
                     exec_json = json.dumps(
                         steps
                         + [
@@ -2169,12 +2362,12 @@ if submit:
                 else:
                     results_json = json.dumps(steps, indent=2)
                     synth_prompt = intents._build_synth_prompt(prompt, results_json)
-                    resp = agent.adapter.chat(
-                        [
-                            {"role": "system", "content": "Be concrete, cite code (file:line)."},
-                            {"role": "user", "content": synth_prompt},
-                        ]
-                    )
+                    eff_system = _compose_system_prompt(ui, mode)
+                    sys_msgs = []
+                    if eff_system:
+                        sys_msgs.append({"role": "system", "content": eff_system})
+                    sys_msgs.append({"role": "system", "content": "Be concrete, cite code (file:line)."})
+                    resp = agent.adapter.chat(sys_msgs + [{"role": "user", "content": synth_prompt}])
                     alt = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "(no content)"
                     final_answer_text_for_history = alt
                     # render inside Chat tab
