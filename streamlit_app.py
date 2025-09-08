@@ -11,7 +11,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import sqlite3
+import base64
+import pandas as pd
+
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from loguru import logger
 
@@ -85,6 +90,19 @@ EDIT_TOOLS = {
 # --- Load .env from Tarkash home ---
 load_dotenv(dotenv_path=ENV_PATH)
 logger.info("Environment loaded from {}", str(ENV_PATH.resolve()))
+
+# -------------------------------------------------------------------
+# Streamlit rerun compatibility (st.rerun in newer versions)
+# -------------------------------------------------------------------
+def _rerun() -> None:
+    """Call st.rerun() if available, else fall back to st.experimental_rerun()."""
+    try:
+        # New API (Streamlit >= 1.25)
+        st.rerun()
+    except Exception:
+        # Older API
+        try: st.experimental_rerun()
+        except Exception: pass
 
 # =============================================================================
 # Utilities (formatting, LaTeX, charts, UI state)
@@ -170,6 +188,348 @@ def _write_json(p: Path, d: dict) -> None:
         logger.warning("Failed to save json '{}': {}", str(p), e)
 
 # =============================================================================
+# Chat history — SQLite (per project under ~/.tarkash/<project>/chat_history/chat.db)
+# =============================================================================
+def _safe_name(name: str) -> str:
+    import re
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", (name or "default"))[:80]
+
+def _chat_db_path(project_name: str) -> Path:
+    """
+    New layout per request:
+      ~/.tarkash/projects/<project_name>/chat_history/chat.db
+    """
+    base = Path.home() / ".tarkash" / "projects" / _safe_name(project_name) / "chat_history"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "chat.db"
+
+def _chat_db_init(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db_path) as con:
+        cur = con.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,                 -- unix epoch
+                ts_iso TEXT,                      -- readable timestamp
+                project TEXT NOT NULL,            -- project name
+                project_path TEXT,                -- project root path
+                mode TEXT NOT NULL,               -- Direct Chat / LLM Tools / Agent Plan & Run
+                streaming INTEGER DEFAULT 0,      -- 0/1
+                rag_on INTEGER DEFAULT 0,         -- 0/1
+                model TEXT,                       -- LLM name
+                embedder TEXT,                    -- Embedding model
+                prompt TEXT NOT NULL,             -- user input
+                answer TEXT NOT NULL              -- final response
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_chats_project_ts ON chats(project, ts DESC)")
+        # Add missing columns for older DBs (safe to re-run)
+        cols = {r[1] for r in cur.execute("PRAGMA table_info(chats)").fetchall()}
+        wanted = {
+            "ts_iso":"TEXT","project_path":"TEXT","streaming":"INTEGER","rag_on":"INTEGER",
+            "model":"TEXT","embedder":"TEXT"
+        }
+        for k, typ in wanted.items():
+            if k not in cols:
+                try:
+                    cur.execute(f"ALTER TABLE chats ADD COLUMN {k} {typ}")
+                except Exception:
+                    pass
+        con.commit()
+
+def save_chat(
+    *,
+    project_name: str,
+    project_path: str,
+    mode: str,
+    prompt: str,
+    answer: str,
+    streaming: bool,
+    rag_on: bool,
+    model: Optional[str],
+    embedder: Optional[str],
+) -> None:
+    if not (project_name and isinstance(answer, str) and answer.strip()):
+        return
+    db_path = _chat_db_path(project_name)
+    _chat_db_init(db_path)
+    with sqlite3.connect(db_path) as con:
+        now = time.time()
+        iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now))
+        con.execute(
+            """
+            INSERT INTO chats(ts, ts_iso, project, project_path, mode, streaming, rag_on, model, embedder, prompt, answer)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                now, iso, project_name, project_path, mode,
+                1 if streaming else 0, 1 if rag_on else 0,
+                model or "", embedder or "", prompt, answer
+            ),
+        )
+        con.commit()
+
+def list_chats(
+    project_name: str,
+    *,
+    query: str = "",
+    regex: bool = False,
+    filter_mode: str = "top_n",   # all | top_n | last_n | past_7d | past_30d | date_range
+    n: int = 20,
+    date_from: Optional[str] = None,   # "YYYY-MM-DD"
+    date_to: Optional[str] = None,     # "YYYY-MM-DD"
+) -> List[Dict[str, Any]]:
+    db_path = _chat_db_path(project_name)
+    if not db_path.exists():
+        return []
+    import datetime as _dt
+    now = _dt.datetime.now().timestamp()
+    start_ts: Optional[float] = None
+    end_ts: Optional[float] = None
+
+    # resolve filter preset
+    fm = (filter_mode or "top_n").lower()
+    if fm == "past_7d":
+        start_ts = now - 7*86400
+    elif fm == "past_30d":
+        start_ts = now - 30*86400
+    elif fm == "date_range":
+        start_ts = _epoch_from_date_str(date_from)
+        # end of day for 'to'
+        et = _epoch_from_date_str(date_to)
+        if et is not None:
+            end_ts = et + 86399.0
+    # else: for all/top_n/last_n we leave start/end None
+
+    with sqlite3.connect(db_path) as con:
+        con.row_factory = sqlite3.Row
+        # optional REGEXP for sqlite
+        if regex:
+            def _re(x, y):
+                try:
+                    return 1 if re.search(y, x or "", re.IGNORECASE) else 0
+                except Exception:
+                    return 0
+            con.create_function("REGEXP", 2, _re)
+
+        where = ["project=?"]
+        params: List[Any] = [project_name]
+
+        # time window
+        if start_ts is not None:
+            where.append("ts >= ?")
+            params.append(float(start_ts))
+        if end_ts is not None:
+            where.append("ts <= ?")
+            params.append(float(end_ts))
+
+        # search
+        if query:
+            q = query.strip()
+            if regex:
+                where.append("(prompt REGEXP ? OR answer REGEXP ? OR mode REGEXP ? OR model REGEXP ? OR embedder REGEXP ?)")
+                params.extend([q, q, q, q, q])
+            else:
+                like = f"%{q}%"
+                where.append("(prompt LIKE ? OR answer LIKE ? OR mode LIKE ? OR model LIKE ? OR embedder LIKE ?)")
+                params.extend([like, like, like, like, like])
+
+        # sort + limit
+        order_sql = "ORDER BY ts DESC"
+        limit_sql = ""
+        if fm == "last_n":
+            order_sql = "ORDER BY ts ASC"
+            limit_sql = "LIMIT ?"
+            params.append(int(max(1, n)))
+        elif fm == "top_n":
+            order_sql = "ORDER BY ts DESC"
+            limit_sql = "LIMIT ?"
+            params.append(int(max(1, n)))
+        elif fm in ("past_7d", "past_30d", "date_range", "all"):
+            order_sql = "ORDER BY ts DESC"
+            # no limit for these (user can still search to constrain)
+
+        where_sql = " AND ".join(where)
+        sql = f"""
+            SELECT id, ts, ts_iso, mode, prompt, answer, model, embedder, rag_on, streaming, project_path
+            FROM chats
+            WHERE {where_sql}
+            {order_sql}
+            {limit_sql}
+        """
+        rows = con.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+def delete_chat(project_name: str, chat_id: int) -> None:
+    db_path = _chat_db_path(project_name)
+    if not db_path.exists():
+        return
+    with sqlite3.connect(db_path) as con:
+        con.execute("DELETE FROM chats WHERE project=? AND id=?", (project_name, int(chat_id)))
+        con.commit()
+
+def _copy_button_html(text: str, key: str) -> str:
+    """
+    Small JS copy-to-clipboard button. Text is base64-encoded to avoid escaping issues.
+    """
+    b64 = base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+    return f"""
+    <button class="copy-btn" onclick="navigator.clipboard.writeText(atob('{b64}'))" title="Copy to clipboard" id="{key}">
+      Copy
+    </button>
+    """
+
+def _copy_button(text: str, key: str) -> None:
+    """
+    More reliable copy using a tiny components.html widget.
+    Works well under Streamlit's CSP and sandboxing.
+    """
+    b64 = base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+    components.html(
+        f"""
+        <div style="width:100%;">
+          <button style="width:100%;height:36px;border:1px solid #e2e8f0;border-radius:8px;background:#fff;cursor:pointer"
+            onclick="navigator.clipboard.writeText(atob('{b64}'))">
+            Copy
+          </button>
+        </div>
+        """,
+        height=42,
+    )
+
+def _shorten_one_line(text: str, max_chars: int = 90) -> str:
+    """Return a single-line, ellipsized preview."""
+    if not text:
+        return ""
+    s = " ".join(str(text).split())  # collapse whitespace/newlines
+    return s if len(s) <= max_chars else (s[: max_chars - 1] + "…")
+
+# ---------- Time helpers ----------
+def _epoch_from_date_str(s: Optional[str]) -> Optional[float]:
+    if not s:
+        return None
+    try:
+        import datetime as _dt
+        d = _dt.datetime.strptime(s, "%Y-%m-%d")
+        # interpret as start of day local time
+        return d.timestamp()
+    except Exception:
+        return None
+
+
+# ---------- History table helpers ----------
+def _history_dataframe(project_name: str, *, flt: dict) -> pd.DataFrame:
+    rows = list_chats(project_name, **flt)
+    # compact snippets for the grid
+    recs = []
+    for r in rows:
+        recs.append({
+            "id": int(r["id"]),
+            "prompt": _shorten_one_line(r.get("prompt",""), 110),
+            "answer": _shorten_one_line(r.get("answer",""), 110),
+        })
+    df = pd.DataFrame(recs, columns=["id","prompt","answer"])
+    # attach a 'view' flag bound to session selection
+    sel = set(st.session_state.get("hist_view_ids", set()))
+    df["view"] = df["id"].apply(lambda i: (i in sel))
+    return df
+
+def _update_history_selection_from_editor(df_ret: pd.DataFrame):
+    ids = set(df_ret.loc[df_ret["view"] == True, "id"].tolist())
+    st.session_state["hist_view_ids"] = ids
+
+
+def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = True) -> None:
+    chats = list_chats(project_name, **flt)
+    if not chats:
+        return
+    st.markdown("#### History")
+    # Wrap history area so we can scope CSS reliably
+    st.markdown('<div class="hist-root">', unsafe_allow_html=True)
+
+    # ---------- Manager toolbar ----------
+    displayed_ids = [int(r["id"]) for r in chats]
+    if manager_ui:
+        st.session_state.setdefault("hist_view_ids", set())
+        # Toolbar: Select/Clear act on the 'view' column
+        t1, t2, t3 = st.columns([1.3, 1.4, 6])
+        with t1:
+            if st.button("Select All"):
+                st.session_state["hist_view_ids"] = set(displayed_ids)
+                _rerun()
+        with t2:
+            if st.button("Clear Selection"):
+                st.session_state["hist_view_ids"] = set()
+                _rerun()
+        # spacer t3
+
+    # ---------- Data table ----------
+    df = _history_dataframe(project_name, flt=flt)
+    df_ret = st.data_editor(
+        df,
+        hide_index=True,
+        num_rows="fixed",
+        use_container_width=True,
+        disabled=["id","prompt","answer"],  # only 'view' is editable
+        column_config={
+            "id": st.column_config.NumberColumn(
+                "id", help="Chat ID", width="small", format="%d"
+            ),
+            "prompt": st.column_config.TextColumn(
+                "prompt", width="medium", help="User prompt (truncated)"
+            ),
+            "answer": st.column_config.TextColumn(
+                "answer", width="large", help="Assistant answer (truncated)"
+            ),
+            "view": st.column_config.CheckboxColumn("view", width="small", help="Show details below"),
+        },
+        key="history_table",
+    )
+    _update_history_selection_from_editor(df_ret)
+
+    # ---------- Rows as expanders ----------
+    for row in chats:
+        cid = int(row["id"])
+        if cid not in st.session_state.get("hist_view_ids", set()):
+            continue
+        ts = row.get("ts")
+        ts_iso = row.get("ts_iso") or _human_dt(ts)
+        mode = row.get("mode", "")
+        prompt = row.get("prompt", "")
+        answer = row.get("answer", "")
+        model = row.get("model") or ""
+        embedder = row.get("embedder") or ""
+        rag_on = "on" if row.get("rag_on") else "off"
+        streaming = "on" if row.get("streaming") else "off"
+        proj_path = row.get("project_path") or ""
+
+        # Detail expander label
+        label = f"#{cid} — {_shorten_one_line(prompt)}"
+        with st.expander(label, expanded=False):
+            # Meta
+            st.caption(f"{ts_iso} · {mode} · model={model} · emb={embedder} · RAG={rag_on} · stream={streaming}")
+            if proj_path:
+                st.caption(f"root: {proj_path}")
+            # Actions
+            ac1, ac2 = st.columns([1, 1], gap="small")
+            with ac1:
+                _copy_button(answer, f"copy_{cid}")
+            with ac2:
+                if st.button("Delete", key=f"del_{cid}", help="Delete this chat"):
+                    delete_chat(project_name, cid)
+                    _rerun()
+            # Content
+            st.markdown("**You:**")
+            st.markdown(prompt)
+            st.markdown("**Assistant:**")
+            render_response_with_latex(answer)
+    st.markdown("</div>", unsafe_allow_html=True)  # close .hist-root
+
+
+# =============================================================================
 # Page & CSS
 # =============================================================================
 
@@ -229,6 +589,39 @@ def _inject_css():
         section[data-testid="stSidebar"] .index-actions{
           padding:.25rem 0 .25rem 0;
           background: transparent !important;
+        }
+        history-note{ font-size:.8rem; color:var(--muted); margin-top:.25rem; }
+        /* Chat history cards */
+        .chat-card{
+          background:var(--card);
+          border:1px solid var(--ring);
+          border-radius:var(--radius);
+          padding:.8rem 1rem;
+          margin:.75rem 0;
+          box-shadow:0 1px 2px rgba(2,6,23,.05);
+        }
+        .copy-btn{
+          /* match Streamlit button look & height */
+          display:inline-flex;
+          align-items:center;
+          justify-content:center;
+          width:100%;
+          height:36px;
+          font-size:.85rem;
+          padding:0 .6rem;
+          border-radius:8px;
+          border:1px solid var(--ring);
+          background:white;
+          cursor:pointer;
+          transition: background .15s ease;
+        }
+        .copy-btn:hover{ background:#f3f4f6; }
+        /* History area: align Copy/Delete and unify button sizes */
+        .hist-root .stButton>button{
+          height:36px;
+          width:100%;
+          border-radius:8px;
+        }
         }
         /* Tarkash glyphs (corners + sidebar) */
         .tarkash-logo{
@@ -329,7 +722,7 @@ with st.sidebar:
 
     # read cross-panel state early
     _mode_now = st.session_state.get("mode_radio", "Direct Chat")
-    _rag_enabled = bool(st.session_state.get("rag_on", True))
+    _rag_enabled = bool(st.session_state.get("rag_on", False))
     _is_direct_chat = (_mode_now == "Direct Chat")
 
     # Log level
@@ -378,14 +771,18 @@ with st.sidebar:
         ui["rag_auto_index"] = auto_index_flag
 
         # determine current indexing status ONCE for both buttons & status text
-        try:
-            _st = index_status(project_root) or {}
-            is_running = (_st.get("state") == "running")
-        except Exception:
+        if _rag_enabled:
+            try:
+                _st = index_status(project_root) or {}
+                is_running = (_st.get("state") == "running")
+            except Exception:
+                _st, is_running = {}, False
+        else:
             _st, is_running = {}, False
 
         # actions (Delta, Full, Stop) — honor Auto indexing and running state
-        disabled_manual = bool(auto_index_flag or is_running)
+        # Also disable when RAG is OFF
+        disabled_manual = (not _rag_enabled) or bool(auto_index_flag or is_running)
 
         # Place the buttons inside a borderless container and distribute evenly
         st.markdown('<div class="index-actions">', unsafe_allow_html=True)
@@ -471,7 +868,7 @@ with st.sidebar:
                     st.success("Saved. Re-run app to apply.")
             with cB:
                 if st.button("Reload from disk"):
-                    st.experimental_rerun()
+                    _rerun()
         except Exception as e:
             st.error(f"Failed to load rag.json: {e}")
 
@@ -572,7 +969,86 @@ with st.sidebar:
         ui["callgraph_depth"] = int(callgraph_depth)
         st.session_state["callgraph_depth"] = int(callgraph_depth)
 
+    # --- History (sidebar) ---
+    with st.expander("History", expanded=False):
+        # Default OFF
+        history_on = st.checkbox(
+            "Enable history (persist chats in SQLite)",
+            value=bool(ui.get("history_enabled", False)),
+            help="When OFF, chats are not saved and history is hidden."
+        )
+        ui["history_enabled"] = history_on
+
+        # Options visible only when enabled
+        if history_on:
+            st.caption("Filter")
+            # Search + regex toggle
+            csa, csb = st.columns([3,1])
+            with csa:
+                search_q = st.text_input("Search prompt/answer/mode", value=ui.get("history_search", ""))
+            with csb:
+                regex = st.checkbox("Regex", value=bool(ui.get("history_regex", False)))
+            ui["history_search"] = search_q
+            ui["history_regex"] = bool(regex)
+
+            # Mode selector
+            FILTER_OPTS = {
+                "All": "all",
+                "Top N (most recent)": "top_n",
+                "Last N (oldest first)": "last_n",
+                "Past 7 days": "past_7d",
+                "Past 30 days": "past_30d",
+                "Date range…": "date_range",
+            }
+            human_to_code = {k:v for k,v in FILTER_OPTS.items()}
+            code_to_human = {v:k for k,v in FILTER_OPTS.items()}
+            sel = ui.get("history_filter_mode", "top_n")
+            filter_label = st.selectbox(
+                "Choose filter",
+                list(FILTER_OPTS.keys()),
+                index=list(FILTER_OPTS.values()).index(sel) if sel in FILTER_OPTS.values() else 1,
+            )
+            ui["history_filter_mode"] = human_to_code[filter_label]
+
+            # N (for top/last)
+            if ui["history_filter_mode"] in ("top_n", "last_n"):
+                n_val = int(ui.get("history_n", 20))
+                n_val = st.number_input("N", min_value=1, max_value=1000, value=n_val, step=1)
+                ui["history_n"] = int(n_val)
+
+            # Date presets don't need inputs. Custom range does:
+            if ui["history_filter_mode"] == "date_range":
+                import datetime as _dt
+                df_str = ui.get("history_date_from")
+                dt_str = ui.get("history_date_to")
+                today = _dt.date.today()
+                default_from = _dt.date.fromisoformat(df_str) if df_str else today
+                default_to   = _dt.date.fromisoformat(dt_str) if dt_str else today
+                dr = st.date_input("Date range", value=(default_from, default_to))
+                if isinstance(dr, tuple) and len(dr) == 2:
+                    ui["history_date_from"] = dr[0].isoformat()
+                    ui["history_date_to"]   = dr[1].isoformat()
+
+            # Optional: clear all
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("Refresh"):
+                    _rerun()
+            with c2:
+                if st.button("Delete all"):
+                    try:
+                        dbp = _chat_db_path(project_name)
+                        if dbp.exists():
+                            with sqlite3.connect(dbp) as con:
+                                con.execute("DELETE FROM chats WHERE project=?", (project_name,))
+                                con.commit()
+                        st.success("History cleared for this project.")
+                    except Exception as e:
+                        st.error(f"Failed to clear history: {e}")
+
     # Persist per-project UI + remember last project globally
+    # (Moved to AFTER History controls so the latest toggle/search/N values are saved
+    #  before the main pane reads them to decide whether to render history.)
     _write_json(per_ui_path, ui)
     _write_json(GLOBAL_UI_SETTINGS_PATH, {"project_name": project_name})
 
@@ -604,6 +1080,8 @@ with st.sidebar:
 # =============================================================================
 # Main — Mode bar, toggles, prompt, response
 # =============================================================================
+
+current_project_name_for_history = None
 
 # Init run-state keys
 for key, default in [
@@ -639,8 +1117,12 @@ with top:
                     else ("Adapter does not support streaming" if not _has_stream else None)
                 ),
             )
+            st.session_state["streaming_enabled"] = bool(streaming)
         with col2:
-            rag_on = st.toggle("RAG (use project data)", value=True)
+            # Default OFF; preserve prior choice if already set
+            rag_on = st.toggle(
+                "RAG (use project data)", value=bool(st.session_state.get("rag_on", False))
+            )
             st.session_state["rag_on"] = rag_on
         with col3:
             complex_planning = st.toggle(
@@ -662,7 +1144,7 @@ if clear:
     st.session_state["progress_rows"] = []
     st.session_state["last_tools_used"] = set()
     st.session_state["show_chart_gallery"] = False
-    st.experimental_rerun()
+    _rerun()
 
 # Interpret action button
 if action_clicked and st.session_state.get("running"):
@@ -672,9 +1154,15 @@ if action_clicked and st.session_state.get("running"):
 else:
     submit = bool(action_clicked and not st.session_state.get("running"))
 
-st.markdown("### Assistant Response")
-response_area = st.empty()
+# Tabs: keep chat UI as-is in “Chat”, move history into its own tab
+chat_tab, history_tab = st.tabs(["Chat", "History"])
 
+# --- Chat tab: current response UI as before ---
+with chat_tab:
+    st.markdown("### Assistant Response")
+    response_area = st.empty()
+
+final_answer_text_for_history: Optional[str] = None
 def _looks_like_tool_blob(text: str) -> Optional[Any]:
     if not text:
         return None
@@ -841,20 +1329,23 @@ if submit:
     st.session_state["last_tools_used"] = set()
     st.session_state["show_chart_gallery"] = False
 
-    if not prompt.strip():
-        st.warning("Please enter a prompt.")
-        st.stop()
+    # Render everything from this point inside the Chat tab
+    with chat_tab:
+        if not prompt.strip():
+            st.warning("Please enter a prompt.")
+            st.stop()
 
     # Recompute per-project paths (sidebar variables not in scope here)
     global_ui = _read_json(GLOBAL_UI_SETTINGS_PATH)
     current_project = global_ui.get("project_name") or Path.cwd().name
     scaff = project_paths(current_project)
+    current_project_name_for_history = current_project
     ui = _read_json(scaff["ui_settings"])
     project_root = ui.get("project_root") or str(Path.cwd())
     per_rag_path = scaff["rag"]
     rag_index_dir = scaff["rag_index_dir"]
 
-    if st.session_state.get("rag_on", True):
+    if st.session_state.get("rag_on", False):
         _ensure_index_ready(
             project_root, per_rag_path, st.session_state.get("embedding_model"), ui.get("rag_auto_index", True), rag_index_dir
         )
@@ -881,7 +1372,7 @@ if submit:
                 try:
                     _adapter = getattr(agent, "adapter", None)
                     if _adapter and hasattr(_adapter, "chat_stream"):
-                        placeholder = st.empty()
+                        placeholder = response_area.empty()
                         buf = ""
                         try:
                             for chunk in _adapter.chat_stream(msgs):
@@ -890,12 +1381,15 @@ if submit:
                                 buf += chunk
                                 s = _normalize_math_delimiters(_fix_common_latex_typos(_sanitize_latex_text(buf)))
                                 placeholder.markdown(s)
+                            final_answer_text_for_history = buf
                         except Exception as _e:
                             st.error(f"[stream error] {_e}")
                     else:
                         resp = agent.adapter.chat(msgs)
                         answer = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
+                        final_answer_text_for_history = answer
                         if not _maybe_render_dot_from_text(answer):
+                            # render final text into Chat tab area
                             render_response_with_latex(answer)
                 except Exception as e:
                     st.error(f"[error] {e}")
@@ -948,10 +1442,17 @@ if submit:
                 if isinstance(parsed, dict) and "diff" in parsed:
                     st.code(parsed.get("diff") or "(no diff)", language="diff")
                 elif not _render_call_graph_payload(parsed):
+                    try:
+                        pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+                    except Exception:
+                        pretty = str(parsed)
                     st.json(parsed)
+                    final_answer_text_for_history = pretty
             else:
-                if not _maybe_render_dot_from_text(answer):
-                    render_response_with_latex(answer)
+                final_answer_text_for_history = answer if isinstance(answer, str) else str(answer)
+                if not _maybe_render_dot_from_text(final_answer_text_for_history):
+                    # ensure rendering stays inside Chat tab
+                    render_response_with_latex(final_answer_text_for_history)
 
         # ---------------------- Agent Plan & Run ----------------------
         else:
@@ -1100,7 +1601,9 @@ if submit:
                     (r.get("result") for r in reversed(steps) if r.get("tool") == "_answer" and r.get("success")), None
                 )
                 if isinstance(final_answer, str) and final_answer.strip():
-                    render_response_with_latex(final_answer.strip())
+                    final_answer_text_for_history = final_answer.strip()
+                    # render inside Chat tab
+                    render_response_with_latex(final_answer_text_for_history)
                 else:
                     results_json = json.dumps(steps, indent=2)
                     synth_prompt = intents._build_synth_prompt(prompt, results_json)
@@ -1111,7 +1614,9 @@ if submit:
                         ]
                     )
                     alt = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "(no content)"
-                    render_response_with_latex(alt)
+                    final_answer_text_for_history = alt
+                    # render inside Chat tab
+                    render_response_with_latex(final_answer_text_for_history)
 
             except Exception as e:
                 st.error(f"[error] {e}")
@@ -1120,3 +1625,59 @@ if submit:
         st.error(f"[fatal] {e}")
     finally:
         st.session_state["running"] = False
+
+
+# =============================================================================
+# Persist + render chat history (only when enabled)
+# =============================================================================
+try:
+    # Determine active project to show history even when not submitting
+    if not current_project_name_for_history:
+        _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
+        current_project_name_for_history = _g.get("project_name") or Path.cwd().name
+    # Load per-project UI to read history settings
+    _scaff = project_paths(current_project_name_for_history)
+    _ui = _read_json(_scaff["ui_settings"])
+    _history_on = bool(_ui.get("history_enabled", False))
+    _history_q = _ui.get("history_search", "")
+    _history_n = int(_ui.get("history_show_n", 20))
+
+    # Save the just-finished exchange (only if ON)
+    if _history_on and submit and current_project_name_for_history and final_answer_text_for_history:
+        save_chat(
+            project_name=current_project_name_for_history,
+            project_path=_ui.get("project_root", ""),
+            mode=mode,
+            prompt=prompt,
+            answer=final_answer_text_for_history,
+            streaming=bool(st.session_state.get("streaming_enabled", False)),
+            rag_on=bool(st.session_state.get("rag_on", True)),
+            model=_ui.get("llm_model"),
+            embedder=_ui.get("embedding_model"),
+        )
+except Exception as _persist_e:
+    logger.warning("chat persistence skipped: {}", _persist_e)
+
+# Show history only inside the History tab
+with history_tab:
+    try:
+        _scaff2 = project_paths(current_project_name_for_history or "")
+        _ui2 = _read_json(_scaff2["ui_settings"]) if current_project_name_for_history else {}
+        if bool(_ui2.get("history_enabled", False)):
+            # Build filter dict from per-project UI
+            flt = {
+                "query": _ui2.get("history_search", "") or "",
+                "regex": bool(_ui2.get("history_regex", False)),
+                "filter_mode": _ui2.get("history_filter_mode", "top_n"),
+                "n": int(_ui2.get("history_n", 20)),
+                "date_from": _ui2.get("history_date_from"),
+                "date_to": _ui2.get("history_date_to"),
+            }
+            _render_history_cards(current_project_name_for_history or "", flt=flt, manager_ui=True)
+        else:
+            st.caption(
+                "<span class='history-note'>History is disabled. Enable it from the sidebar ▸ History to persist and view past chats.</span>",
+                unsafe_allow_html=True,
+            )
+    except Exception as _hist_e:
+        logger.warning("history render skipped: {}", _hist_e)
