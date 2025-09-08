@@ -1,0 +1,13 @@
+# ---- Core for high-quality PDF export (Pandoc route) ----
+pandoc
+tectonic
+fonts-dejavu
+
+# ---- (Optional) keep if you still use WeasyPrint anywhere ----
+libcairo2
+libpango-1.0-0
+libgdk-pixbuf-2.0-0
+
+# ---- (Optional) tools used by optional Python libs below ----
+graphviz          # if you use the python 'graphviz' package
+tesseract-ocr     # if you use 'pytesseract'

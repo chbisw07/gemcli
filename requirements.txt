@@ -6,9 +6,8 @@ requests>=2.31
 
 # --- Data / utilities ---
 pandas>=2.2,<3           # pulls a compatible numpy
-pypdf>=4.2
-PyMuPDF>=1.24            # a.k.a. pymupdf (prebuilt wheels available)
-weasyprint>=62
+
+# --- Markdown / export helpers (MD → HTML, code fences, etc.) ---
 markdown-it-py>=3.0.0
 mdit-py-plugins>=0.4.0
 pygments>=2.17
@@ -17,10 +16,17 @@ pygments>=2.17
 chromadb>=0.5.4
 chroma-hnswlib>=0.7.3
 
-# --- Plotting (only if you use charts in responses; safe to keep) ---
+# --- Optional visualization ---
 matplotlib>=3.8
 
-# sentence-transformers>=2.6   # pulls torch; very heavy on Streamlit Cloud
-openai>=1.40                 # only if you call OpenAI APIs directly
-graphviz>=0.20               # ALSO requires the system Graphviz binary
-pytesseract>=0.3             # ALSO requires the system 'tesseract-ocr' binary
+# --- Optional PDF/Doc tooling (only if you still use them somewhere) ---
+# pypdf>=4.2              # PDF merge/split after export, if needed
+# PyMuPDF>=1.24           # alternate HTML→PDF/ops; not needed for Pandoc path
+# weasyprint>=62          # if you keep any server-side HTML→PDF code around
+
+# --- Model providers (include only what you use) ---
+# openai>=1.40            # if you call OpenAI APIs
+
+# --- Graph/vision OCR (require system binaries in packages.txt) ---
+# graphviz>=0.20          # needs 'graphviz' OS package
+# pytesseract>=0.3        # needs 'tesseract-ocr' OS package
