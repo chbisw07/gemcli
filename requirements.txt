@@ -1,21 +1,26 @@
-# requirements.txt
-requests>=2.31.0
-streamlit>=1.30.0
-black>=24.3.0  # optional: used by format_python_files
-graphviz
+# --- Core runtime ---
+streamlit>=1.31,<2
+python-dotenv>=1.0.1
+loguru>=0.7.2
+requests>=2.31
 
-# Optional future extensions:
-openai
-# google-generativeai
-# deepseek
+# --- Data / utilities ---
+pandas>=2.2,<3           # pulls a compatible numpy
+pypdf>=4.2
+PyMuPDF>=1.24            # a.k.a. pymupdf (prebuilt wheels available)
+weasyprint>=62
+markdown-it-py>=3.0.0
+mdit-py-plugins>=0.4.0
+pygments>=2.17
 
-chroma-hnswlib
-chromadb
-sentence-transformers
-PyMuPDF
-pypdf
-pytesseract
+# --- RAG / Vector store ---
+chromadb>=0.5.4
+chroma-hnswlib>=0.7.3
 
-matplotlib
-pandas
+# --- Plotting (only if you use charts in responses; safe to keep) ---
+matplotlib>=3.8
 
+# sentence-transformers>=2.6   # pulls torch; very heavy on Streamlit Cloud
+openai>=1.40                 # only if you call OpenAI APIs directly
+graphviz>=0.20               # ALSO requires the system Graphviz binary
+pytesseract>=0.3             # ALSO requires the system 'tesseract-ocr' binary

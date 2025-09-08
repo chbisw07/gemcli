@@ -10,6 +10,9 @@ import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from io import BytesIO
+import html
+from functools import lru_cache
 
 import sqlite3
 import base64
@@ -90,6 +93,11 @@ EDIT_TOOLS = {
 # --- Load .env from Tarkash home ---
 load_dotenv(dotenv_path=ENV_PATH)
 logger.info("Environment loaded from {}", str(ENV_PATH.resolve()))
+
+# ========= Feature flags =========
+# Disable in-app PDF export (use Markdown export + your external MD→PDF tool)
+PDF_EXPORT_ENABLED = False
+# Flip to True later if you want to re-enable in-app PDF rendering.
 
 # -------------------------------------------------------------------
 # Streamlit rerun compatibility (st.rerun in newer versions)
@@ -482,6 +490,369 @@ def _update_history_selection_from_editor(df_ret: pd.DataFrame):
     ids = set(df_ret.loc[df_ret["view"] == True, "id"].tolist())
     st.session_state["hist_view_ids"] = ids
 
+# ---------- Small text cleanups for PDF ----------
+def _fix_common_encoding_glitches(s: str) -> str:
+    if not s: return s
+    # Common UTF-8 seen as Latin-1 glitch for degree symbol
+    return s.replace("Â°", "°")
+
+
+# ======================= RICH PDF EXPORT (Markdown → HTML → PDF) =======================
+def _clean_markdown_for_pdf(text: str) -> str:
+    """Apply LaTeX/markdown sanitizers and encoding fixes before HTML conversion."""
+    s = text or ""
+    try:
+        s = _normalize_math_delimiters(s)
+    except Exception:
+        pass
+    try:
+        s = _fix_common_latex_typos(s)
+    except Exception:
+        pass
+    try:
+        s = _sanitize_latex_text(s)
+    except Exception:
+        pass
+    s = _fix_common_encoding_glitches(s)
+    return s
+
+@lru_cache(maxsize=1)
+def _pygments_formatter():
+    try:
+        from pygments.formatters import HtmlFormatter
+        return HtmlFormatter(nowrap=False)
+    except Exception:
+        return None
+
+def _pygments_css() -> str:
+    fmt = _pygments_formatter()
+    if not fmt:
+        return ""
+    try:
+        return fmt.get_style_defs(".codehilite")
+    except Exception:
+        return ""
+
+@lru_cache(maxsize=1)
+def _md_renderer():
+    """
+    Build a markdown-it renderer with useful plugins and a pygments highlighter.
+    Math is rendered to MathML via texmath, so WeasyPrint can print it.
+    """
+    from markdown_it import MarkdownIt
+    from mdit_py_plugins.table import table_plugin
+    from mdit_py_plugins.deflist import deflist_plugin
+    from mdit_py_plugins.tasklists import tasklists_plugin
+    from mdit_py_plugins.anchors import anchors_plugin
+    from mdit_py_plugins.attrs import attrs_plugin
+    from mdit_py_plugins.texmath import texmath_plugin
+    md = MarkdownIt("commonmark", {"typographer": True})
+    # Plugins
+    md.use(table_plugin)
+    md.use(deflist_plugin)
+    md.use(tasklists_plugin, enabled=True)
+    md.use(anchors_plugin, max_level=3)
+    md.use(attrs_plugin)
+    # Math → MathML (no JS needed)
+    md.use(texmath_plugin, renderer="mathml")
+    # Pygments highlighting
+    fmt = _pygments_formatter()
+    if fmt:
+        from pygments import highlight
+        from pygments.lexers import get_lexer_by_name, TextLexer
+        def _hl(code: str, lang: str, attrs: str) -> str:
+            try:
+                lexer = get_lexer_by_name(lang or "", stripall=True)
+            except Exception:
+                lexer = TextLexer(stripall=True)
+            return f'<pre class="codehilite">{highlight(code, lexer, fmt)}</pre>'
+        md.options["highlight"] = _hl
+    return md
+
+
+def _md_to_html(md_text: str) -> str:
+    """Convert Markdown (incl. tables/code/lists) to HTML with MathML + Pygments."""
+    src = _clean_markdown_for_pdf(md_text or "")
+    try:
+        md = _md_renderer()
+        return md.render(src)
+    except Exception:
+        return f"<pre>{html.escape(src)}</pre>"
+
+def _pygments_css() -> str:
+    """Inline Pygments CSS for codehilite blocks (no external files, no JS)."""
+    try:
+        from pygments.formatters import HtmlFormatter
+        return HtmlFormatter(style="default").get_style_defs(".codehilite")
+    except Exception:
+        return ""
+
+def _build_export_html(project_name: str, rows: List[Dict[str, Any]]) -> str:
+    """Compose a complete HTML document for selected chats (print-friendly)."""
+    pyg_css = _pygments_css()
+    # Print-grade CSS; WeasyPrint supports @page margin boxes + counters
+    css = f"""
+    @page {{
+      size: A4;
+      margin: 18mm 16mm 18mm 16mm;
+      @bottom-right {{
+        content: "Page " counter(page);
+        color: #777;
+        font-size: 9pt;
+      }}
+    }}
+    html, body {{ height: 100%; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+      Arial, 'Noto Sans', 'Liberation Sans', sans-serif; color: #111;
+      -webkit-print-color-adjust: exact; print-color-adjust: exact;
+    }}
+    h1, h2, h3 {{ margin: 0 0 6px 0; }}
+    h1 {{ font-size: 20px; }}
+    h2 {{ font-size: 16px; margin-top: 20px; }}
+    h3 {{ font-size: 14px; }}
+    .meta {{ color:#666; font-size: 11px; margin: 2px 0 10px; }}
+    .chat {{ page-break-before: always; }}
+    .chat:first-child {{ page-break-before: auto; }}
+    .label {{ font-weight: 700; margin: 10px 0 4px; }}
+    p {{ line-height: 1.38; margin: 6px 0; }}
+    ul, ol {{ margin: 6px 0 6px 20px; }}
+    table {{ border-collapse: collapse; width: 100%; margin: 6px 0; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px 8px; font-size: 12px; }}
+    th {{ background: #f7f7f7; }}
+    code {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace; }}
+    pre, pre code {{ white-space: pre-wrap; word-wrap: break-word; }}
+    pre {{ border: 1px solid #eee; background: #fafafa; padding: 10px; border-radius: 6px; font-size: 12px; }}
+    hr {{ border:0; border-top:1px solid #eee; margin: 14px 0; }}
+    .title {{ font-size: 22px; font-weight: 800; margin: 0 0 6px 0; }}
+    .subtitle {{ color:#666; font-size: 12px; margin-bottom: 12px; }}
+    img {{ max-width: 100%; height: auto; }}
+    /* Pygments for codehilite */
+    {pyg_css}
+    /* MathML tweaks (WeasyPrint) */
+    math, mrow, mi, mo, mn, mfrac, msup, msub, msubsup, mtable, mtr, mtd {{
+      font-family: STIXGeneral, 'DejaVu Serif', serif;
+    }}
+    """
+    now_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+    parts = [
+        "<!doctype html><html><head><meta charset='utf-8'>",
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>",
+        f"<style>{css}</style>",
+        "</head><body>",
+        f"<div class='title'>Tarkash — Chat Export</div>",
+        f"<div class='subtitle'>{html.escape(project_name)} · generated at {now_iso}</div>",
+    ]
+    for r in rows:
+        cid = r.get("id")
+        ts = r.get("ts"); ts_iso = r.get("ts_iso") or _human_dt(ts)
+        mode = r.get("mode", "")
+        model = r.get("model") or ""
+        embedder = r.get("embedder") or ""
+        rag_on = "on" if r.get("rag_on") else "off"
+        streaming = "on" if r.get("streaming") else "off"
+        prompt_md = (r.get("prompt") or "").rstrip()
+        answer_md = (r.get("answer") or "").rstrip()
+        # Convert markdown → HTML
+        prompt_html = _md_to_html(prompt_md)
+        answer_html = _md_to_html(answer_md)
+        parts.append("<div class='chat'>")
+        parts.append(f"<h2>Chat #{cid} — {html.escape(ts_iso)}</h2>")
+        parts.append(f"<div class='meta'>{html.escape(mode)} · model={html.escape(model)} · emb={html.escape(embedder)} · RAG={rag_on} · stream={streaming}</div>")
+        parts.append("<div class='label'>You:</div>")
+        parts.append(prompt_html)
+        parts.append("<div class='label'>Assistant:</div>")
+        parts.append(answer_html)
+        parts.append("</div>")
+    parts.append("</body></html>")
+    return "".join(parts)
+
+def _render_pdf_from_html(html_str: str) -> Optional[bytes]:
+    """Render HTML → PDF with server-side engines only (WeasyPrint → xhtml2pdf → PyMuPDF).
+       Respect feature flag to allow disabling PDF completely."""
+    # Early exit when PDF export is disabled
+    if not PDF_EXPORT_ENABLED:
+        logger.info("PDF export disabled by flag; skipping render.")
+        return None
+    # 1) WeasyPrint (best fidelity)
+    try:
+        from weasyprint import HTML
+        pdf_bytes = HTML(string=html_str).write_pdf()
+        logger.info("PDF export via WeasyPrint (%d bytes)", len(pdf_bytes) if pdf_bytes else 0)
+        return pdf_bytes
+    except Exception as e:
+        logger.info(f"WeasyPrint unavailable/failed: {e}")
+    # 2) xhtml2pdf (pure Python)
+    try:
+        from xhtml2pdf import pisa
+        buf = BytesIO()
+        ok = pisa.CreatePDF(html_str, dest=buf, encoding="utf-8")
+        if not ok.err:
+            out = buf.getvalue()
+            logger.info("PDF export via xhtml2pdf (%d bytes)", len(out))
+            return out
+    except Exception as e:
+        logger.info(f"xhtml2pdf unavailable/failed: {e}")
+    # 3) PyMuPDF (section-per-page HTML)
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open()
+        chats = re.findall(r"(<div class='chat'>.*?</div>)", html_str, flags=re.S)
+        head = re.search(r"<head>(.*?)</head>", html_str, flags=re.S)
+        head_html = head.group(1) if head else ""
+        if not chats:
+            chats = ["<div class='chat'><p>No content</p></div>"]
+        for sec in chats:
+            page = doc.new_page()
+            w, h = page.rect.width, page.rect.height
+            rect = fitz.Rect(45, 56, w - 45, h - 56)
+            snippet = f"<!doctype html><html><head>{head_html}</head><body>{sec}</body></html>"
+            try:
+                page.insert_htmlbox(rect, snippet)  # PyMuPDF ≥ 1.22
+            except Exception:
+                page.insert_textbox(rect, "Rendering failed", fontsize=11)
+        out = doc.tobytes()
+        logger.info("PDF export via PyMuPDF (%d bytes)", len(out))
+        return out
+    except Exception as e:
+        logger.warning(f"PyMuPDF HTML export failed: {e}")
+        return None
+
+def _export_chats_to_pdf_rich(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
+    """End-to-end rich export using Markdown→HTML (+LaTeX cleanup) → PDF."""
+    html_doc = _build_export_html(project_name, rows)
+    return _render_pdf_from_html(html_doc)
+
+def _export_chats_to_markdown(project_name: str, rows: List[Dict[str, Any]]) -> bytes:
+    """
+    Build a single Markdown file containing the selected chats.
+    Keeps prompts/answers as-is (so your external MD->PDF toolchain can render
+    headings, code fences, and LaTeX).
+    """
+    lines: list[str] = []
+    now_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+    title = f"# Tarkash — Chat Export"
+    sub   = f"*{project_name} · generated at {now_iso}*"
+    lines.extend([title, sub, ""])
+    for r in rows:
+        cid = r.get("id")
+        ts  = r.get("ts")
+        ts_iso = r.get("ts_iso") or _human_dt(ts)
+        mode = r.get("mode", "")
+        model = r.get("model") or ""
+        embedder = r.get("embedder") or ""
+        rag_on = "on" if r.get("rag_on") else "off"
+        streaming = "on" if r.get("streaming") else "off"
+        prompt = (r.get("prompt") or "").rstrip()
+        answer = (r.get("answer") or "").rstrip()
+
+        lines.append(f"## Chat #{cid} — {ts_iso}")
+        lines.append(f"`{mode}` · model=`{model}` · emb=`{embedder}` · RAG={rag_on} · stream={streaming}")
+        lines.append("")
+        lines.append("**You**")
+        lines.append("")
+        lines.append(prompt)
+        lines.append("")
+        lines.append("**Assistant**")
+        lines.append("")
+        lines.append(answer)
+        lines.append("\n---\n")
+    content = "\n".join(lines).strip() + "\n"
+    return content.encode("utf-8")
+
+
+# ---------- PDF export (selected chats) ----------
+def _export_chats_to_pdf(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
+    """
+    Create a neat PDF for selected chats (prompt+answer only, no UI).
+    Returns PDF bytes or None if ReportLab is unavailable.
+    """
+    try:
+        # Lazy imports so the app runs even if reportlab isn't installed yet.
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.units import cm
+        from reportlab.lib import colors
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import (
+            SimpleDocTemplate, Paragraph, Spacer, XPreformatted, PageBreak, KeepTogether
+        )
+    except Exception as e:
+        logger.warning("ReportLab import failed: {}", e)
+        return None
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=1.7*cm, rightMargin=1.7*cm, topMargin=1.5*cm, bottomMargin=1.5*cm,
+        title=f"Tarkash Chat Export — {project_name}"
+    )
+    styles = getSampleStyleSheet()
+    # Base styles
+    title = ParagraphStyle(
+        "title", parent=styles["Title"], fontSize=18, leading=22, spaceAfter=10
+    )
+    meta = ParagraphStyle(
+        "meta", parent=styles["Normal"], fontSize=9, textColor=colors.gray
+    )
+    h = ParagraphStyle(
+        "h", parent=styles["Heading3"], fontSize=12, spaceBefore=6, spaceAfter=4
+    )
+    pre = ParagraphStyle(
+        "pre", parent=styles["Code"], fontName="Courier", fontSize=9, leading=12
+    )
+
+    def _on_page(canvas, _doc):
+        # footer: page number right; project left
+        canvas.saveState()
+        w, h_page = A4
+        canvas.setFont("Helvetica", 8)
+        canvas.setFillGray(0.4)
+        canvas.drawString(1.7*cm, 1.0*cm, f"Project: {project_name}")
+        canvas.drawRightString(w - 1.7*cm, 1.0*cm, f"Page {_doc.page}")
+        canvas.restoreState()
+
+    story: List[Any] = []
+
+    # Title
+    ts_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+    story.append(Paragraph(f"Tarkash — Chat Export", title))
+    story.append(Paragraph(f"{project_name} · generated at {ts_iso}", meta))
+    story.append(Spacer(1, 10))
+
+    # Each chat section
+    for r in rows:
+        cid = r.get("id")
+        ts = r.get("ts")
+        ts_iso = r.get("ts_iso") or _human_dt(ts)
+        mode = r.get("mode", "")
+        model = r.get("model") or ""
+        embedder = r.get("embedder") or ""
+        rag_on = "on" if r.get("rag_on") else "off"
+        streaming = "on" if r.get("streaming") else "off"
+        prompt = (r.get("prompt") or "").rstrip()
+        answer = (r.get("answer") or "").rstrip()
+
+        header = Paragraph(f"Chat #{cid} — {ts_iso}", h)
+        meta_line = Paragraph(
+            f"{mode} · model={model} · emb={embedder} · RAG={rag_on} · stream={streaming}",
+            meta
+        )
+        # Use monospaced block to preserve formatting/code fences
+        you_lbl = Paragraph("<b>You:</b>", styles["Normal"])
+        you_txt = XPreformatted(prompt or "(empty)", pre)
+        asst_lbl = Paragraph("<b>Assistant:</b>", styles["Normal"])
+        asst_txt = XPreformatted(answer or "(empty)", pre)
+
+        block = [
+            header, meta_line, Spacer(1, 6),
+            you_lbl, Spacer(1, 2), you_txt, Spacer(1, 6),
+            asst_lbl, Spacer(1, 2), asst_txt, Spacer(1, 12),
+        ]
+        story.append(KeepTogether(block))
+
+    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
+    return buf.getvalue()
 
 def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = True) -> None:
     chats = list_chats(project_name, **flt)
@@ -491,23 +862,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     # Wrap history area so we can scope CSS reliably
     st.markdown('<div class="hist-root">', unsafe_allow_html=True)
 
-    # ---------- Manager toolbar ----------
-    displayed_ids = [int(r["id"]) for r in chats]
-    if manager_ui:
-        st.session_state.setdefault("hist_view_ids", set())
-        # Toolbar: Select/Clear act on the 'view' column
-        t1, t2, t3 = st.columns([1.3, 1.4, 6])
-        with t1:
-            if st.button("Select All"):
-                st.session_state["hist_view_ids"] = set(displayed_ids)
-                _rerun()
-        with t2:
-            if st.button("Clear Selection"):
-                st.session_state["hist_view_ids"] = set()
-                _rerun()
-        # spacer t3
-
-    # ---------- Data table ----------
+    # ---------- Data table (run FIRST so selection state is fresh) ----------
     df = _history_dataframe(project_name, flt=flt)
     df_ret = st.data_editor(
         df,
@@ -530,6 +885,92 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         key="history_table",
     )
     _update_history_selection_from_editor(df_ret)
+    displayed_ids = df_ret["id"].tolist() if "id" in df_ret.columns else [int(r["id"]) for r in chats]
+
+    # ---------- Manager toolbar (now AFTER table, uses fresh selection) ----------
+    if manager_ui:
+        st.session_state.setdefault("hist_view_ids", set())
+        t1, t2, t3, t4 = st.columns([1.2, 1.5, 3.6, 5])
+        with t1:
+            if st.button("Select All"):
+                st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
+                _rerun()
+        with t2:
+            if st.button("Clear Selection"):
+                st.session_state["hist_view_ids"] = set()
+                _rerun()
+        with t3:
+            sel_ids = list(st.session_state.get("hist_view_ids", set()))
+            sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
+            disabled = (len(sel_rows) == 0)
+            # --- Exports ---
+            if PDF_EXPORT_ENABLED:
+                c_md, c_pdf = st.columns(2, gap="small")
+                with c_md:
+                    export_md = st.button("Export selected (.md)", disabled=disabled, help="Raw Markdown for external MD→PDF tooling", key="btn_export_md")
+                    if export_md and not disabled:
+                        try:
+                            md_bytes = _export_chats_to_markdown(project_name, sel_rows)
+                            st.session_state["last_export_md"] = md_bytes
+                            tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                            st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
+                            st.success("Markdown prepared. Use the Download button →")
+                        except Exception as e:
+                            st.error(f"Markdown export failed: {e}")
+                with c_pdf:
+                    export_pdf = st.button("Export selected (PDF)", disabled=disabled, help="Render Markdown/Math to PDF server-side", key="btn_export_pdf")
+                    if export_pdf and not disabled:
+                        pdf_bytes = _export_chats_to_pdf_rich(project_name, sel_rows)
+                        if not pdf_bytes:
+                            st.error("Could not render PDF. Ensure WeasyPrint is installed, or add xhtml2pdf / PyMuPDF as fallbacks.")
+                        else:
+                            st.session_state["last_export_pdf"] = pdf_bytes
+                            tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                            st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                            st.success("PDF prepared. Use the Download button →")
+            else:
+                # Markdown-only export (PDF path disabled)
+                export_md = st.button("Export selected (.md)", disabled=disabled, help="Raw Markdown for external MD→PDF tooling", key="btn_export_md")
+                if export_md and not disabled:
+                    try:
+                        md_bytes = _export_chats_to_markdown(project_name, sel_rows)
+                        st.session_state["last_export_md"] = md_bytes
+                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                        st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
+                        st.success("Markdown prepared. Use the Download button →")
+                    except Exception as e:
+                        st.error(f"Markdown export failed: {e}")
+        # Downloads
+        if PDF_EXPORT_ENABLED:
+            dlc1, dlc2 = t4.columns(2, gap="small")
+            with dlc1:
+                if st.session_state.get("last_export_md"):
+                    st.download_button(
+                        "Download .md",
+                        data=st.session_state["last_export_md"],
+                        file_name=st.session_state.get("last_export_md_name", "tarkash_chats.md"),
+                        mime="text/markdown",
+                        key="dl_hist_md",
+                    )
+            with dlc2:
+                if st.session_state.get("last_export_pdf"):
+                    st.download_button(
+                        "Download PDF",
+                        data=st.session_state["last_export_pdf"],
+                        file_name=st.session_state.get("last_export_pdf_name", "tarkash_chats.pdf"),
+                        mime="application/pdf",
+                        key="dl_hist_pdf",
+                    )
+        else:
+            # Markdown-only download button
+            if st.session_state.get("last_export_md"):
+                st.download_button(
+                    "Download .md",
+                    data=st.session_state["last_export_md"],
+                    file_name=st.session_state.get("last_export_md_name", "tarkash_chats.md"),
+                    mime="text/markdown",
+                    key="dl_hist_md",
+                )
 
     # ---------- Rows as expanders ----------
     for row in chats:
