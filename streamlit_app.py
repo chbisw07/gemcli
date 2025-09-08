@@ -11,6 +11,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from io import BytesIO
+import subprocess
+import shutil
+import tempfile
 import html
 from functools import lru_cache
 
@@ -95,9 +98,9 @@ load_dotenv(dotenv_path=ENV_PATH)
 logger.info("Environment loaded from {}", str(ENV_PATH.resolve()))
 
 # ========= Feature flags =========
-# Disable in-app PDF export (use Markdown export + your external MD→PDF tool)
-PDF_EXPORT_ENABLED = False
-# Flip to True later if you want to re-enable in-app PDF rendering.
+# We no longer try headless browser PDF. We keep Markdown export always-on,
+# and add a Pandoc (+xelatex or tectonic) PDF path that runs only if found.
+PDF_EXPORT_ENABLED = True
 
 # -------------------------------------------------------------------
 # Streamlit rerun compatibility (st.rerun in newer versions)
@@ -760,99 +763,61 @@ def _export_chats_to_markdown(project_name: str, rows: List[Dict[str, Any]]) -> 
     content = "\n".join(lines).strip() + "\n"
     return content.encode("utf-8")
 
-
-# ---------- PDF export (selected chats) ----------
-def _export_chats_to_pdf(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
-    """
-    Create a neat PDF for selected chats (prompt+answer only, no UI).
-    Returns PDF bytes or None if ReportLab is unavailable.
-    """
+#
+# -------- Pandoc (+xelatex/tectonic) PDF export --------
+#
+def _which(cmd: str) -> Optional[str]:
     try:
-        # Lazy imports so the app runs even if reportlab isn't installed yet.
-        from reportlab.lib.pagesizes import A4
-        from reportlab.lib.units import cm
-        from reportlab.lib import colors
-        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-        from reportlab.platypus import (
-            SimpleDocTemplate, Paragraph, Spacer, XPreformatted, PageBreak, KeepTogether
-        )
-    except Exception as e:
-        logger.warning("ReportLab import failed: {}", e)
+        return shutil.which(cmd)
+    except Exception:
         return None
 
-    buf = BytesIO()
-    doc = SimpleDocTemplate(
-        buf,
-        pagesize=A4,
-        leftMargin=1.7*cm, rightMargin=1.7*cm, topMargin=1.5*cm, bottomMargin=1.5*cm,
-        title=f"Tarkash Chat Export — {project_name}"
-    )
-    styles = getSampleStyleSheet()
-    # Base styles
-    title = ParagraphStyle(
-        "title", parent=styles["Title"], fontSize=18, leading=22, spaceAfter=10
-    )
-    meta = ParagraphStyle(
-        "meta", parent=styles["Normal"], fontSize=9, textColor=colors.gray
-    )
-    h = ParagraphStyle(
-        "h", parent=styles["Heading3"], fontSize=12, spaceBefore=6, spaceAfter=4
-    )
-    pre = ParagraphStyle(
-        "pre", parent=styles["Code"], fontName="Courier", fontSize=9, leading=12
-    )
+def _pandoc_engine() -> Optional[str]:
+    """Prefer xelatex; fall back to tectonic if installed."""
+    if _which("xelatex"):
+        return "xelatex"
+    if _which("tectonic"):
+        return "tectonic"
+    return None
 
-    def _on_page(canvas, _doc):
-        # footer: page number right; project left
-        canvas.saveState()
-        w, h_page = A4
-        canvas.setFont("Helvetica", 8)
-        canvas.setFillGray(0.4)
-        canvas.drawString(1.7*cm, 1.0*cm, f"Project: {project_name}")
-        canvas.drawRightString(w - 1.7*cm, 1.0*cm, f"Page {_doc.page}")
-        canvas.restoreState()
+def _pandoc_available() -> bool:
+    return bool(_which("pandoc") and _pandoc_engine())
 
-    story: List[Any] = []
+def _export_chats_to_pdf_pandoc(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
+    """
+    Convert our Markdown export to PDF using pandoc + xelatex/tectonic.
+    - Works great locally (you already tested `pandoc … --pdf-engine=xelatex`)
+    - On Streamlit Cloud (no TeX/Pandoc), we simply won’t enable the PDF button.
+    """
+    if not _pandoc_available():
+        return None
+    try:
+        md_bytes = _export_chats_to_markdown(project_name, rows)
+        with tempfile.TemporaryDirectory() as td:
+            md_path = Path(td) / "chats.md"
+            pdf_path = Path(td) / "out.pdf"
+            md_path.write_bytes(md_bytes)
+            engine = _pandoc_engine() or "xelatex"
+            args = [
+                _which("pandoc"),
+                str(md_path),
+                "-o", str(pdf_path),
+                "--standalone",
+                "--from", "markdown+tex_math_dollars+raw_tex",
+                "--pdf-engine", engine,
+                "-V", "geometry:margin=1in",
+                "-V", "mainfont=DejaVu Serif",
+                "-V", "monofont=DejaVu Sans Mono",
+            ]
+            # capture output so errors surface in the UI
+            subprocess.run(args, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return pdf_path.read_bytes()
+    except Exception as e:
+        logger.warning(f"pandoc export failed: {e}")
+        return None
 
-    # Title
-    ts_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
-    story.append(Paragraph(f"Tarkash — Chat Export", title))
-    story.append(Paragraph(f"{project_name} · generated at {ts_iso}", meta))
-    story.append(Spacer(1, 10))
 
-    # Each chat section
-    for r in rows:
-        cid = r.get("id")
-        ts = r.get("ts")
-        ts_iso = r.get("ts_iso") or _human_dt(ts)
-        mode = r.get("mode", "")
-        model = r.get("model") or ""
-        embedder = r.get("embedder") or ""
-        rag_on = "on" if r.get("rag_on") else "off"
-        streaming = "on" if r.get("streaming") else "off"
-        prompt = (r.get("prompt") or "").rstrip()
-        answer = (r.get("answer") or "").rstrip()
-
-        header = Paragraph(f"Chat #{cid} — {ts_iso}", h)
-        meta_line = Paragraph(
-            f"{mode} · model={model} · emb={embedder} · RAG={rag_on} · stream={streaming}",
-            meta
-        )
-        # Use monospaced block to preserve formatting/code fences
-        you_lbl = Paragraph("<b>You:</b>", styles["Normal"])
-        you_txt = XPreformatted(prompt or "(empty)", pre)
-        asst_lbl = Paragraph("<b>Assistant:</b>", styles["Normal"])
-        asst_txt = XPreformatted(answer or "(empty)", pre)
-
-        block = [
-            header, meta_line, Spacer(1, 6),
-            you_lbl, Spacer(1, 2), you_txt, Spacer(1, 6),
-            asst_lbl, Spacer(1, 2), asst_txt, Spacer(1, 12),
-        ]
-        story.append(KeepTogether(block))
-
-    doc.build(story, onFirstPage=_on_page, onLaterPages=_on_page)
-    return buf.getvalue()
+# ---------- PDF export (selected chats) ----------
 
 def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = True) -> None:
     chats = list_chats(project_name, **flt)
@@ -904,33 +869,14 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
             disabled = (len(sel_rows) == 0)
             # --- Exports ---
-            if PDF_EXPORT_ENABLED:
-                c_md, c_pdf = st.columns(2, gap="small")
-                with c_md:
-                    export_md = st.button("Export selected (.md)", disabled=disabled, help="Raw Markdown for external MD→PDF tooling", key="btn_export_md")
-                    if export_md and not disabled:
-                        try:
-                            md_bytes = _export_chats_to_markdown(project_name, sel_rows)
-                            st.session_state["last_export_md"] = md_bytes
-                            tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                            st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
-                            st.success("Markdown prepared. Use the Download button →")
-                        except Exception as e:
-                            st.error(f"Markdown export failed: {e}")
-                with c_pdf:
-                    export_pdf = st.button("Export selected (PDF)", disabled=disabled, help="Render Markdown/Math to PDF server-side", key="btn_export_pdf")
-                    if export_pdf and not disabled:
-                        pdf_bytes = _export_chats_to_pdf_rich(project_name, sel_rows)
-                        if not pdf_bytes:
-                            st.error("Could not render PDF. Ensure WeasyPrint is installed, or add xhtml2pdf / PyMuPDF as fallbacks.")
-                        else:
-                            st.session_state["last_export_pdf"] = pdf_bytes
-                            tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                            st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
-                            st.success("PDF prepared. Use the Download button →")
-            else:
-                # Markdown-only export (PDF path disabled)
-                export_md = st.button("Export selected (.md)", disabled=disabled, help="Raw Markdown for external MD→PDF tooling", key="btn_export_md")
+            c_md, c_pdf = st.columns(2, gap="small")
+            with c_md:
+                export_md = st.button(
+                    "Export selected (.md)",
+                    disabled=disabled,
+                    help="Raw Markdown (best for Pandoc/LaTeX pipelines)",
+                    key="btn_export_md",
+                )
                 if export_md and not disabled:
                     try:
                         md_bytes = _export_chats_to_markdown(project_name, sel_rows)
@@ -940,29 +886,28 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                         st.success("Markdown prepared. Use the Download button →")
                     except Exception as e:
                         st.error(f"Markdown export failed: {e}")
+            with c_pdf:
+                have_pandoc = _pandoc_available()
+                export_pdf = st.button(
+                    "Export selected (PDF via Pandoc)",
+                    disabled=(disabled or not have_pandoc),
+                    help=("Builds a print-ready PDF with math & code highlighting"
+                          if have_pandoc else
+                          "Pandoc + xelatex/tectonic not found. Install locally or use the .md export."),
+                    key="btn_export_pdf_pandoc",
+                )
+                if export_pdf and not disabled and have_pandoc:
+                    pdf_bytes = _export_chats_to_pdf_pandoc(project_name, sel_rows)
+                    if not pdf_bytes:
+                        st.error("Pandoc export failed. Check logs or use the .md export.")
+                    else:
+                        st.session_state["last_export_pdf"] = pdf_bytes
+                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                        st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                        st.success("PDF prepared. Use the Download button →")
         # Downloads
-        if PDF_EXPORT_ENABLED:
-            dlc1, dlc2 = t4.columns(2, gap="small")
-            with dlc1:
-                if st.session_state.get("last_export_md"):
-                    st.download_button(
-                        "Download .md",
-                        data=st.session_state["last_export_md"],
-                        file_name=st.session_state.get("last_export_md_name", "tarkash_chats.md"),
-                        mime="text/markdown",
-                        key="dl_hist_md",
-                    )
-            with dlc2:
-                if st.session_state.get("last_export_pdf"):
-                    st.download_button(
-                        "Download PDF",
-                        data=st.session_state["last_export_pdf"],
-                        file_name=st.session_state.get("last_export_pdf_name", "tarkash_chats.pdf"),
-                        mime="application/pdf",
-                        key="dl_hist_pdf",
-                    )
-        else:
-            # Markdown-only download button
+        dlc1, dlc2 = t4.columns(2, gap="small")
+        with dlc1:
             if st.session_state.get("last_export_md"):
                 st.download_button(
                     "Download .md",
@@ -970,6 +915,15 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     file_name=st.session_state.get("last_export_md_name", "tarkash_chats.md"),
                     mime="text/markdown",
                     key="dl_hist_md",
+                )
+        with dlc2:
+            if st.session_state.get("last_export_pdf"):
+                st.download_button(
+                    "Download PDF",
+                    data=st.session_state["last_export_pdf"],
+                    file_name=st.session_state.get("last_export_pdf_name", "tarkash_chats.pdf"),
+                    mime="application/pdf",
+                    key="dl_hist_pdf",
                 )
 
     # ---------- Rows as expanders ----------
