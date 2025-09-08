@@ -1120,8 +1120,12 @@ with top:
             st.session_state["streaming_enabled"] = bool(streaming)
         with col2:
             # Default OFF; preserve prior choice if already set
+            # Label shortened to "RAG" with a minimal help tooltip explaining usage.
             rag_on = st.toggle(
-                "RAG (use project data)", value=bool(st.session_state.get("rag_on", False))
+                "RAG",
+                value=bool(st.session_state.get("rag_on", False)),
+                help="Use this project's indexed documents in answers. "
+                     "Set the Project name & root in the sidebar; indexing controls live there and enable when RAG is on."
             )
             st.session_state["rag_on"] = rag_on
         with col3:
