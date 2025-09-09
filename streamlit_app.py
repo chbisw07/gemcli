@@ -1585,14 +1585,25 @@ with st.sidebar:
                         cfg["chroma_dir"] = str(rag_index_dir)            # ensure per-project index dir
                         save_rag(per_rag_path, cfg)                        # Path ok
                         res = delta_index(project_root, per_rag_path)      # Path ok
-                        # Robust summary across possible keys the indexer might return
-                        files_changed = int(res.get("changed_files") or res.get("files_changed") or 0)
+                        # Robust summary across possible keys that the indexer may return
+                        files_changed = int(res.get("files_changed") or res.get("changed_files") or 0)
                         added         = int(res.get("added") or res.get("chunks_added") or 0)
                         updated       = int(res.get("updated") or res.get("chunks_updated") or res.get("modified") or 0)
                         deleted       = int(res.get("deleted") or res.get("removed") or res.get("chunks_removed") or 0)
                         st.success(
-                            f"Delta index complete · files_changed={files_changed}, added={added}, updated={updated}, deleted={deleted}"
+                            f"Delta index complete · added={added}, updated={updated}, deleted={deleted}, changed(existing)={files_changed}"
                         )
+                        # Optional: quick details panel
+                        with st.expander("Delta details"):
+                            st.write({
+                                "added_files":   res.get("added_files")   or [],
+                                "changed_files": res.get("changed_files") or [],
+                                "deleted_files": res.get("deleted_files") or [],
+                            })
+                            per_file = res.get("files") or {}
+                            if per_file:
+                                st.write("Per-file chunk counts:", per_file)
+                        # Keep the full raw dict for debugging
                         st.caption(res)
                     except Exception as e:
                         st.error(f"Delta index failed: {e}")

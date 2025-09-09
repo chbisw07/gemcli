@@ -174,6 +174,14 @@ def _rekey(chunks: List[dict], project_root: str, root: str, fp: str) -> List[di
         seq += 1
         c = dict(ch)
         c["id"] = f"{proj}::{rel}::{mtime}::{seq}"
+        # Guarantee a normalized 'document' field so downstream code/DB is consistent
+        if "document" not in c:
+            c["document"] = _as_doc_text(c)
+        elif not isinstance(c["document"], str):
+            try:
+                c["document"] = str(c["document"] or "")
+            except Exception:
+                c["document"] = ""
         md = dict(c.get("metadata") or {})
         md.setdefault("relpath", rel)
         md.setdefault("mtime", mtime)
@@ -254,6 +262,21 @@ def _is_meaningful(text: str) -> bool:
     if len(s) < _min_chunk_chars():
         return False
     return bool(_HAS_ALNUM.search(s))
+
+def _as_doc_text(chunk: dict) -> str:
+    """
+    Extract the chunk text consistently:
+    prefer 'document', fall back to 'text', then clean & trim.
+    """
+    txt = chunk.get("document", None)
+    if txt is None:
+        txt = chunk.get("text", "")
+    if not isinstance(txt, str):
+        try:
+            txt = str(txt or "")
+        except Exception:
+            txt = ""
+    return _clean_for_embed(txt)
 
 
 # ----------------------------- chroma collection ------------------------------
@@ -369,7 +392,25 @@ def _embed_and_upsert(coll, embed_fn, ids, docs, metas, upsert_batch: int = 64):
     Embed texts client-side (micro-batching is handled inside embed_fn)
     and upsert vectors to Chroma in straightforward batches.
     """
-    # Embed once for this batch
+    # Normalize & filter before embedding (belt & suspenders)
+    keep = []
+    for i in range(len(docs)):
+        try:
+            s = "" if docs[i] is None else str(docs[i])
+        except Exception:
+            s = ""
+        s = _clean_for_embed(s)
+        docs[i] = s
+        if _is_meaningful(s):
+            keep.append(i)
+    if not keep:
+        logger.debug("_embed_and_upsert: nothing meaningful to embed")
+        return
+    ids   = [ids[i]   for i in keep]
+    docs  = [docs[i]  for i in keep]
+    metas = [metas[i] for i in keep]
+
+    # Embed once for this filtered batch
     logger.debug("_embed_and_upsert: embedding {} text(s)", len(docs))
     vectors = embed_fn(docs)
     if len(vectors) != len(docs):
@@ -382,11 +423,7 @@ def _embed_and_upsert(coll, embed_fn, ids, docs, metas, upsert_batch: int = 64):
         md = dict(metas[k] or {})
         md["chunk_id"] = ids[k]
         metas[k] = _sanitize_metadata(md)
-        # also guarantee document is a string
-        try:
-            docs[k] = "" if docs[k] is None else str(docs[k])
-        except Exception:
-            docs[k] = ""
+        # docs already normalized above
 
     # Upsert in simple fixed-size chunks
     n = len(ids)
@@ -487,25 +524,21 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
             except Exception: pass
             continue
 
-        # sanitize & filter chunks before enqueue
-        kept = 0
-        sanitized = []
+        # sanitize & filter chunks before enqueue (standardize to 'document')
+        sanitized: List[dict] = []
         for c in chunks:
-            txt = c.get("text") or ""
-            if not _is_meaningful(txt):
+            doc = _as_doc_text(c)
+            if not _is_meaningful(doc):
                 continue
-            c["text"] = _clean_for_embed(txt)
-            sanitized.append(c)
-            kept += 1
-        logger.info("chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), kept, elapsed)
-        per_file_stats[rel] = kept
+            sanitized.append({"document": doc, "metadata": c.get("metadata", {})})
+        logger.info("chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), len(sanitized), elapsed)
+        per_file_stats[rel] = len(sanitized)
         status["processed_files"] += 1
         try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
         except Exception: pass
 
         # rekey + buffer
-        chunks2 = _rekey(sanitized, project_root, root, fp)
-        for c in chunks2:
+        for c in _rekey(sanitized, project_root, root, fp):
             buf_ids.append(c["id"])
             buf_docs.append(c["document"])
             buf_meta.append(c["metadata"])
@@ -521,21 +554,14 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     _apply_max_chars(buf_docs, buf_meta, cfg)
     _flush()
 
-    # Stamp for delta indexing
-    # Stamp lives under the project root alongside the DB
-    # Cast to Path to avoid 'str' has no attribute 'mkdir'
-    stamp_path = Path(project_rag_dir(project_root)) / ".last_index.json"
+    # Persist manifest for delta baseline (and keep legacy stamp)
     try:
-        stamp_path.parent.mkdir(parents=True, exist_ok=True)
-        # Write the most recent file mtime we observed to avoid skipping edits
-        # that happen during/around indexing on coarse FS timestamps.
-        stamp_ts = max_seen_mtime or time.time()
-        payload = {"ts": stamp_ts, "dirty": bool(dirty)}
-        with stamp_path.open("w") as f:
-            json.dump(payload, f)
-        logger.info("Index stamp updated at '{}' dirty={}", str(stamp_path), bool(dirty))
+        cur_manifest = _scan_current_manifest(root, cfg)
+        _save_manifest_file(project_root, cur_manifest,
+                            stamp_ts=(max_seen_mtime or time.time()),
+                            dirty=bool(dirty))
     except Exception as e:
-        logger.warning("Failed to write index stamp '{}': {}", str(stamp_path), e)
+        logger.warning("Failed to save manifest/stamp: {}", e)
 
     # update status file (final)
     status.update({"state": "stopped" if dirty else "complete", "dirty": bool(dirty), "ended": time.time()})
@@ -613,6 +639,7 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
         nonlocal buf_ids, buf_docs, buf_meta
         if not buf_docs:
             return
+        _apply_max_chars(buf_docs, buf_meta, cfg)
         _embed_and_upsert(coll, embed_fn, buf_ids, buf_docs, buf_meta, upsert_batch=upsert_batch)
         buf_ids.clear(); buf_docs.clear(); buf_meta.clear()
 
@@ -625,18 +652,15 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
             except Exception: pass
             continue
 
-        # sanitize & filter chunks before enqueue
-        kept = 0
-        sanitized = []
+        # sanitize & filter chunks before enqueue (standardize to 'document')
+        sanitized: List[dict] = []
         for c in chunks:
-            txt = c.get("text") or ""
-            if not _is_meaningful(txt):
+            doc = _as_doc_text(c)
+            if not _is_meaningful(doc):
                 continue
-            c["text"] = _clean_for_embed(txt)
-            sanitized.append(c)
-            kept += 1
-        logger.info("delta chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), kept, elapsed)
-        per_file_stats[rel] = kept
+            sanitized.append({"document": doc, "metadata": c.get("metadata", {})})
+        logger.info("delta chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), len(sanitized), elapsed)
+        per_file_stats[rel] = len(sanitized)
         status["processed_files"] += 1
         try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
         except Exception: pass
@@ -647,9 +671,10 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
         except Exception as e:
             logger.debug("delete before upsert skipped/failed for rel='{}': {}", rel, e)
 
-        chunks2 = _rekey(sanitized, project_root, root, fp)
-        for c in chunks2:
-            buf_ids.append(c["id"]); buf_docs.append(c.get("text") or ""); buf_meta.append(c.get("metadata") or {})
+        for c in _rekey(sanitized, project_root, root, fp):
+            buf_ids.append(c["id"])
+            buf_docs.append(c["document"])
+            buf_meta.append(c.get("metadata") or {})
             if len(buf_docs) >= max_pending:
                 _flush()
 
