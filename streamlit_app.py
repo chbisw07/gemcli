@@ -84,7 +84,7 @@ except Exception as e:
     logger.info("EnhancedToolRegistry unavailable: {}", e)
 
 # --- App constants ---
-APP_TITLE = "gemcli — Code Assistant"
+APP_TITLE = "Tarkash — Code Assistant"
 EDIT_TOOLS = {
     "replace_in_file",
     "bulk_edit",
@@ -96,6 +96,68 @@ EDIT_TOOLS = {
 # --- Load .env from Tarkash home ---
 load_dotenv(dotenv_path=ENV_PATH)
 logger.info("Environment loaded from {}", str(ENV_PATH.resolve()))
+
+# -------------------------- Markdown / LaTeX helpers --------------------------
+
+_SVG_FENCE_RE = re.compile(r"```(?:svg|SVG)\s+([\s\S]*?)\s*```", re.MULTILINE)
+_SVG_TAG_RE   = re.compile(r"<svg[\s\S]*?</svg>", re.IGNORECASE)
+_DATA_URI_RE  = re.compile(r"data:image/(png|jpeg|jpg|gif|webp);base64,([A-Za-z0-9+/=]+)")
+_IMG_DATA_URI_TAG_RE = re.compile(
+    r"<img[^>]+src=[\"'](data:image/(?:png|jpeg|jpg|gif|webp);base64,[A-Za-z0-9+/=]+)[\"'][^>]*>",
+    re.IGNORECASE
+)
+
+def _render_images_and_svg_from_text(text: str) -> str:
+    """
+    Detect and render inline images (SVG blocks and base64 data URIs) and return
+    the remaining markdown text (with those image blobs removed/replaced).
+    This lets models like Gemini 2.5 Flash show visuals directly in Streamlit.
+    """
+    if not text or not isinstance(text, str):
+        return text or ""
+
+    clean = text
+
+    # 1) Fenced ```svg ... ``` blocks
+    for m in list(_SVG_FENCE_RE.finditer(clean)):
+        svg = m.group(1).strip()
+        if svg:
+            # Render the SVG inline
+            st.markdown(svg, unsafe_allow_html=True)
+        # Remove block from text
+        clean = clean.replace(m.group(0), "")
+
+    # 2) Raw <svg>...</svg> tags
+    for m in list(_SVG_TAG_RE.finditer(clean)):
+        svg = m.group(0)
+        st.markdown(svg, unsafe_allow_html=True)
+        clean = clean.replace(svg, "")
+
+    # 3) <img src="data:image/..."> tags
+    for m in list(_IMG_DATA_URI_TAG_RE.finditer(clean)):
+        uri = m.group(1)
+        m2 = _DATA_URI_RE.search(uri)
+        if m2:
+            try:
+                ext = m2.group(1).lower()
+                b   = base64.b64decode(m2.group(2))
+                st.image(BytesIO(b), use_column_width=True)
+            except Exception:
+                pass
+        clean = clean.replace(m.group(0), "")
+
+    # 4) Bare data:image/... URIs inside text
+    for m in list(_DATA_URI_RE.finditer(clean)):
+        try:
+            b = base64.b64decode(m.group(2))
+            st.image(BytesIO(b), use_column_width=True)
+        except Exception:
+            pass
+        # Replace the data URI to avoid duplication in the markdown below
+        clean = clean.replace(m.group(0), "")
+
+    return clean.strip()
+
 
 # ========= Feature flags =========
 # We no longer try headless browser PDF. We keep Markdown export always-on,
@@ -1141,8 +1203,8 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             # Content
             st.markdown("**You:**")
             st.markdown(prompt)
-            st.markdown("**Assistant:**")
-            render_response_with_latex(answer)
+            _md = _render_images_and_svg_from_text(answer)
+            render_response_with_latex(_md)
     st.markdown("</div>", unsafe_allow_html=True)  # close .hist-root
 
 
@@ -2130,6 +2192,10 @@ if submit:
                                 s = _normalize_math_delimiters(_fix_common_latex_typos(_sanitize_latex_text(buf)))
                                 placeholder.markdown(s)
                             final_answer_text_for_history = buf
+                            # Re-render fully so inline SVG / base64 images display
+                            response_area.empty()
+                            _md = _render_images_and_svg_from_text(buf)
+                            render_response_with_latex(_md)
                             _push_transient_turn(prompt, buf)
                         except Exception as _e:
                             st.error(f"[stream error] {_e}")
@@ -2138,8 +2204,9 @@ if submit:
                         answer = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or ""
                         final_answer_text_for_history = answer
                         if not _maybe_render_dot_from_text(answer):
-                            # render final text into Chat tab area
-                            render_response_with_latex(answer)
+                            # render final text into Chat tab area (with images/SVG)
+                            _md = _render_images_and_svg_from_text(answer)
+                            render_response_with_latex(_md)
                         _push_transient_turn(prompt, answer)
                 except Exception as e:
                     st.error(f"[error] {e}")
@@ -2204,8 +2271,9 @@ if submit:
             else:
                 final_answer_text_for_history = answer if isinstance(answer, str) else str(answer)
                 if not _maybe_render_dot_from_text(final_answer_text_for_history):
-                    # ensure rendering stays inside Chat tab
-                    render_response_with_latex(final_answer_text_for_history)
+                    # ensure rendering stays inside Chat tab (with images/SVG)
+                    _md = _render_images_and_svg_from_text(final_answer_text_for_history)
+                    render_response_with_latex(_md)
                 _push_transient_turn(prompt, final_answer_text_for_history)
 
         # ---------------------- Agent Plan & Run ----------------------
@@ -2356,8 +2424,9 @@ if submit:
                 )
                 if isinstance(final_answer, str) and final_answer.strip():
                     final_answer_text_for_history = final_answer.strip()
-                    # render inside Chat tab
-                    render_response_with_latex(final_answer_text_for_history)
+                    # render inside Chat tab (with images/SVG)
+                    _md = _render_images_and_svg_from_text(final_answer_text_for_history)
+                    render_response_with_latex(_md)
                     _push_transient_turn(prompt, final_answer_text_for_history)
                 else:
                     results_json = json.dumps(steps, indent=2)
@@ -2370,8 +2439,9 @@ if submit:
                     resp = agent.adapter.chat(sys_msgs + [{"role": "user", "content": synth_prompt}])
                     alt = (resp.get("choices", [{}])[0].get("message", {}) or {}).get("content", "") or "(no content)"
                     final_answer_text_for_history = alt
-                    # render inside Chat tab
-                    render_response_with_latex(final_answer_text_for_history)
+                    # render inside Chat tab (with images/SVG)
+                    _md = _render_images_and_svg_from_text(final_answer_text_for_history)
+                    render_response_with_latex(_md)
                     _push_transient_turn(prompt, final_answer_text_for_history)
 
             except Exception as e:

@@ -27,16 +27,16 @@
       "group": ["paid"]
     },
     {
-      "name": "gemini-2.5-pro",
+      "name": "gemini-2.5-flash",
       "provider": "google",
       "endpoint": "https://generativelanguage.googleapis.com/v1beta/",
       "model": "models/gemini-2.5-flash",
-      "temperature": 0.7,
+      "temperature": 0.5,
       "system_prompt": "You are a helpful assistant powered by Google Gemini 2.5 Flash. Provide fast, accurate, and cost-efficient responses.",
       "max_context_tokens": 1048576,
       "api_key_reqd": true,
       "api_key_env": "GEMINI_API_KEY",
-      "tags": ["general", "google", "tools"],
+      "tags": ["general", "google", "tools", "fast"],
       "group": ["premium"]
     },
     {
