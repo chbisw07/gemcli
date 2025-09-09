@@ -1,7 +1,7 @@
 # indexing/indexer.py
 from __future__ import annotations
 
-import os, json, time, hashlib, traceback
+import re, os, json, time, hashlib, traceback
 from typing import Dict, List
 from pathlib import Path
 
@@ -184,6 +184,76 @@ def _rekey(chunks: List[dict], project_root: str, root: str, fp: str) -> List[di
         c["metadata"] = md
         out.append(c)
     return out
+
+ # ------------------------- manifest helpers for delta -------------------------
+def _manifest_path(project_root: str) -> Path:
+    return Path(project_rag_dir(project_root)) / ".manifest.json"
+
+def _load_manifest_file(project_root: str) -> dict:
+    p = _manifest_path(project_root)
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+def _save_manifest_file(project_root: str, manifest: dict, stamp_ts: float | None = None, dirty: bool = False) -> None:
+    # persist manifest and also refresh the legacy stamp used by UI
+    p = _manifest_path(project_root)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("Failed to write manifest '{}': {}", str(p), e)
+    # also write .last_index.json for backward compatibility
+    try:
+        ts = float(stamp_ts) if stamp_ts is not None else max([v.get("mtime", 0) for v in manifest.values()] + [time.time()])
+        stamp = {"ts": ts, "dirty": bool(dirty)}
+        (_status_path(project_root).parent / ".last_index.json").write_text(json.dumps(stamp), encoding="utf-8")
+    except Exception as e:
+        logger.debug("Save stamp failed: {}", e)
+
+def _scan_current_manifest(root: str, cfg: dict) -> dict:
+    cur: dict = {}
+    for fp in iter_files(root, cfg):
+        try:
+            mt = int(os.path.getmtime(fp))
+            sz = int(os.path.getsize(fp))
+        except FileNotFoundError:
+            continue
+        rel = _relpath(root, fp)
+        cur[rel] = {"mtime": mt, "size": sz}
+    return cur
+
+
+# ----------------------------- chunk sanitization ------------------------------
+_HAS_ALNUM = re.compile(r"[A-Za-z0-9]")
+_WS_MULTI = re.compile(r"\s+")
+
+def _min_chunk_chars() -> int:
+    # allow override; default 8 chars to skip pure noise
+    try:
+        return int(os.environ.get("TARKASH_MIN_CHUNK_CHARS", "8"))
+    except Exception:
+        return 8
+
+def _clean_for_embed(text: str) -> str:
+    """Collapse whitespace and trim; keep content otherwise intact."""
+    if not text:
+        return ""
+    return _WS_MULTI.sub(" ", text).strip()
+
+def _is_meaningful(text: str) -> bool:
+    """Heuristic: non-empty after trim, has at least one alpha/num, and length threshold."""
+    if not text:
+        return False
+    s = text.strip()
+    if len(s) < _min_chunk_chars():
+        return False
+    return bool(_HAS_ALNUM.search(s))
 
 
 # ----------------------------- chroma collection ------------------------------
@@ -383,6 +453,8 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
         pass
 
     added, per_file_stats = 0, {}
+    # Track the newest mtime we actually process; stamp with this at the end.
+    max_seen_mtime: float = 0.0
     buf_ids: List[str] = []
     buf_docs: List[str] = []
     buf_meta: List[dict] = []
@@ -400,6 +472,13 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
 
     for fp, chunks, elapsed, err in _parallel_chunk_stream(files, cfg, workers, project_root):
         rel = _relpath(root, fp)
+        # update max mtime for the stamp
+        try:
+            _mt = os.path.getmtime(fp)
+            if _mt > max_seen_mtime:
+                max_seen_mtime = _mt
+        except Exception:
+            pass
         if err:
             logger.error("chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
             # still update progress and continue
@@ -408,15 +487,25 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
             except Exception: pass
             continue
 
-        logger.info("chunk OK   '{}' chunks={} time={:.1f}s", rel, len(chunks), elapsed)
-        per_file_stats[rel] = len(chunks)
+        # sanitize & filter chunks before enqueue
+        kept = 0
+        sanitized = []
+        for c in chunks:
+            txt = c.get("text") or ""
+            if not _is_meaningful(txt):
+                continue
+            c["text"] = _clean_for_embed(txt)
+            sanitized.append(c)
+            kept += 1
+        logger.info("chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), kept, elapsed)
+        per_file_stats[rel] = kept
         status["processed_files"] += 1
         try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
         except Exception: pass
 
         # rekey + buffer
-        chunks = _rekey(chunks, project_root, root, fp)
-        for c in chunks:
+        chunks2 = _rekey(sanitized, project_root, root, fp)
+        for c in chunks2:
             buf_ids.append(c["id"])
             buf_docs.append(c["document"])
             buf_meta.append(c["metadata"])
@@ -438,7 +527,10 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     stamp_path = Path(project_rag_dir(project_root)) / ".last_index.json"
     try:
         stamp_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"ts": time.time(), "dirty": bool(dirty)}
+        # Write the most recent file mtime we observed to avoid skipping edits
+        # that happen during/around indexing on coarse FS timestamps.
+        stamp_ts = max_seen_mtime or time.time()
+        payload = {"ts": stamp_ts, "dirty": bool(dirty)}
         with stamp_path.open("w") as f:
             json.dump(payload, f)
         logger.info("Index stamp updated at '{}' dirty={}", str(stamp_path), bool(dirty))
@@ -459,13 +551,14 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
 
 def delta_index(project_root: str, rag_path: str | None) -> Dict:
     """
-    Delta indexing:
-      - Find files with mtime > last stamp
-      - For each changed file: delete its old chunks by relpath, re-chunk and upsert
-    Returns: {"ok": True, "added": <int>, "changed_files": [relpath, ...]}
+    Delta indexing (manifest-based):
+      - Build current manifest { rel: {mtime,size} }
+      - Compare with previous manifest to find added/changed/deleted
+      - deleted: purge by relpath
+      - added/changed: purge old by relpath, re-chunk, embed, upsert
     """
-    logger.info("delta_index: begin project_root='{}' rag='{}'", project_root, rag_path)
-    _load_env_for_project(project_root)  # make sure keys from .env are visible
+    logger.info("delta_index(manifest): begin project_root='{}' rag='{}'", project_root, rag_path)
+    _load_env_for_project(project_root)
 
     cfg = load_settings(rag_path)
     root = os.path.join(project_root, cfg["index_root"])
@@ -475,60 +568,54 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
     models_path = _resolve_models_json_path(project_root)
     logger.info("models.json resolved: '{}'", models_path)
     embed_fn = resolve_embedder(models_path, cfg)
-    logger.info("Embedder resolved for selected='{}'", (cfg.get("embedder") or {}).get("selected_name") or (cfg.get("embedder") or {}).get("model_key"))
+    logger.info("Embedder resolved for selected='{}'", (cfg.get("embedder") or {}).get("selected_name"))
 
-    # Read last stamp
-    # Read the stamp co-located with the project-level DB
-    # Cast to Path to ensure proper path ops
-    stamp_path = Path(project_rag_dir(project_root)) / ".last_index.json"
-    last = 0.0
-    if os.path.exists(stamp_path):
-        try:
-            with open(stamp_path, "r") as f:
-                last = json.load(f).get("ts", 0.0)
-            logger.info("Last index stamp: ts={} ({})", last, time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(last)))
-        except Exception as e:
-            last = 0.0
-            logger.warning("Failed to read index stamp '{}': {}", str(stamp_path), e)
-    else:
-        logger.info("No previous index stamp found (full delta)")
+    prev = _load_manifest_file(project_root)
+    cur  = _scan_current_manifest(root, cfg)
 
-    changed, added = [], 0
-    now = time.time()
-    upsert_batch = int(cfg.get("upsert_batch_size") or 64)
-    workers = _auto_workers(cfg)
-    max_pending = int(cfg.get("max_pending_chunks") or 2000)
-    logger.info("Batch params: upsert_batch_size={}", upsert_batch)
+    prev_keys = set(prev.keys())
+    cur_keys  = set(cur.keys())
+    deleted = sorted(list(prev_keys - cur_keys))
+    added   = sorted(list(cur_keys - prev_keys))
+    changed = sorted([r for r in (cur_keys & prev_keys)
+                      if (prev[r].get("mtime") != cur[r].get("mtime")
+                          or prev[r].get("size")  != cur[r].get("size"))])
 
-    # Build list of candidates that actually changed since last
-    candidates: List[str] = []
-    for fp in iter_files(root, cfg):
-        try:
-            mtime = os.path.getmtime(fp)
-        except FileNotFoundError:
-            continue
-        if mtime <= last:
-            continue
-        candidates.append(fp)
+    logger.info("delta_index(manifest): diff added={} changed={} deleted={}", len(added), len(changed), len(deleted))
 
+    candidates = [os.path.join(root, r) for r in (added + changed)]
     status = {"state": "running", "dirty": False, "processed_files": 0,
               "total_files": len(candidates), "started": time.time()}
-    try:
-        _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
-    except Exception:
-        pass
+    try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+    except Exception: pass
 
-    buf_ids: List[str] = []; buf_docs: List[str] = []; buf_meta: List[dict] = []
+    # purge deletions upfront
+    for rel in deleted:
+        try:
+            coll.delete(where={"relpath": rel})
+            logger.info("delta_index: purged deleted relpath='{}'", rel)
+        except Exception as e:
+            logger.warning("delta_index: purge failed for rel='{}': {}", rel, e)
+
+    # chunk + upsert for added/changed
+    workers = _auto_workers(cfg)
+    upsert_batch = int(cfg.get("upsert_batch_size") or 64)
+    max_pending = int(cfg.get("max_pending_chunks") or 2000)
+    logger.info("Parallel chunking delta: files={} workers={} upsert_batch={}", len(candidates), workers, upsert_batch)
+
+    dirty = False
+    per_file_stats = {}
+    buf_ids: List[str] = []
+    buf_docs: List[str] = []
+    buf_meta: List[dict] = []
+
     def _flush():
-        nonlocal added, buf_ids, buf_docs, buf_meta
+        nonlocal buf_ids, buf_docs, buf_meta
         if not buf_docs:
             return
         _embed_and_upsert(coll, embed_fn, buf_ids, buf_docs, buf_meta, upsert_batch=upsert_batch)
-        added += len(buf_docs)
         buf_ids.clear(); buf_docs.clear(); buf_meta.clear()
 
-    dirty = False
-    stop_flag = _stop_flag_path(project_root)
     for fp, chunks, elapsed, err in _parallel_chunk_stream(candidates, cfg, workers, project_root):
         rel = _relpath(root, fp)
         if err:
@@ -538,43 +625,56 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
             except Exception: pass
             continue
 
-        logger.info("delta chunk OK   '{}' chunks={} time={:.1f}s", rel, len(chunks), elapsed)
-        # purge old chunks for this file before inserting new
-        try:
-            coll.delete(where={"relpath": rel})
-        except Exception as e:
-            logger.debug("delta delete old failed for '{}': {}", rel, e)
-        changed.append(rel)
-
-        chunks = _rekey(chunks, project_root, root, fp)
+        # sanitize & filter chunks before enqueue
+        kept = 0
+        sanitized = []
         for c in chunks:
-            buf_ids.append(c["id"]); buf_docs.append(c["document"]); buf_meta.append(c["metadata"])
-            if len(buf_docs) >= upsert_batch or len(buf_docs) >= max_pending:
-                _apply_max_chars(buf_docs, buf_meta, cfg); _flush()
-
+            txt = c.get("text") or ""
+            if not _is_meaningful(txt):
+                continue
+            c["text"] = _clean_for_embed(txt)
+            sanitized.append(c)
+            kept += 1
+        logger.info("delta chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), kept, elapsed)
+        per_file_stats[rel] = kept
         status["processed_files"] += 1
         try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
         except Exception: pass
-        if stop_flag.exists():
-            dirty = True
 
-    _apply_max_chars(buf_docs, buf_meta, cfg); _flush()
+        # purge existing chunks for this relpath, then upsert
+        try:
+            coll.delete(where={"relpath": rel})
+        except Exception as e:
+            logger.debug("delete before upsert skipped/failed for rel='{}': {}", rel, e)
 
-    # Update stamp
-    try:
-        stamp_path.parent.mkdir(parents=True, exist_ok=True)
-        with stamp_path.open("w") as f:
-            json.dump({"ts": now, "dirty": bool(dirty)}, f)
-        logger.info("Index stamp updated at '{}' dirty={}", str(stamp_path), bool(dirty))
-    except Exception as e:
-        logger.warning("Failed to write index stamp '{}': {}", str(stamp_path), e)
-        
+        chunks2 = _rekey(sanitized, project_root, root, fp)
+        for c in chunks2:
+            buf_ids.append(c["id"]); buf_docs.append(c.get("text") or ""); buf_meta.append(c.get("metadata") or {})
+            if len(buf_docs) >= max_pending:
+                _flush()
+
+    _flush()
+
+    # persist new manifest & legacy stamp
+    stamp_ts = max([v.get("mtime", 0) for v in cur.values()] + [time.time()])
+    _save_manifest_file(project_root, cur, stamp_ts=stamp_ts, dirty=dirty)
+
     status.update({"state": "stopped" if dirty else "complete", "dirty": bool(dirty), "ended": time.time()})
-    try:
-        _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
-    except Exception:
-        pass
+    try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
+    except Exception: pass
 
-    logger.info("delta_index: done added={} changed_files={} dirty={}", added, len(changed), bool(dirty))
-    return {"ok": True, "added": added, "changed_files": changed, "dirty": bool(dirty),
-            "processed_files": status["processed_files"], "total_files": status["total_files"]}
+    summary = {
+        "ok": True,
+        "files_changed": len(changed),
+        "added": len(added),
+        "updated": len(changed),
+        "deleted": len(deleted),
+        "processed_files": status["processed_files"],
+        "total_files": status["total_files"],
+        "changed_files": changed,
+        "added_files": added,
+        "deleted_files": deleted,
+        "files": per_file_stats,
+    }
+    logger.info("delta_index(manifest): done {}", summary)
+    return summary

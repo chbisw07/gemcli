@@ -1537,7 +1537,13 @@ with st.sidebar:
             disabled=not _rag_enabled,
             help=None if _rag_enabled else "Disabled while RAG is OFF",
         )
-        ui["project_root"] = project_root
+        # Canonicalize now to keep indexer/status keys consistent
+        try:
+            project_root_resolved = str(Path(project_root).expanduser().resolve())
+        except Exception:
+            project_root_resolved = project_root
+        project_root = project_root_resolved
+        ui["project_root"] = project_root_resolved
 
         # auto-index controls
         auto_index_flag = st.checkbox(
@@ -1579,7 +1585,14 @@ with st.sidebar:
                         cfg["chroma_dir"] = str(rag_index_dir)            # ensure per-project index dir
                         save_rag(per_rag_path, cfg)                        # Path ok
                         res = delta_index(project_root, per_rag_path)      # Path ok
-                        st.success(f"Delta index complete. Updated chunks: {res.get('added')}")
+                        # Robust summary across possible keys the indexer might return
+                        files_changed = int(res.get("changed_files") or res.get("files_changed") or 0)
+                        added         = int(res.get("added") or res.get("chunks_added") or 0)
+                        updated       = int(res.get("updated") or res.get("chunks_updated") or res.get("modified") or 0)
+                        deleted       = int(res.get("deleted") or res.get("removed") or res.get("chunks_removed") or 0)
+                        st.success(
+                            f"Delta index complete · files_changed={files_changed}, added={added}, updated={updated}, deleted={deleted}"
+                        )
                         st.caption(res)
                     except Exception as e:
                         st.error(f"Delta index failed: {e}")
@@ -1597,7 +1610,9 @@ with st.sidebar:
                         cfg["chroma_dir"] = str(rag_index_dir)
                         save_rag(per_rag_path, cfg)
                         res = full_reindex(project_root, per_rag_path)
-                        st.success(f"Reindex complete. Added chunks: {res.get('added')}")
+                        added   = int(res.get("added") or res.get("chunks_added") or 0)
+                        deleted = int(res.get("deleted") or res.get("removed") or res.get("chunks_removed") or 0)
+                        st.success(f"Reindex complete · added={added}" + (f", deleted={deleted}" if deleted else ""))
                         st.caption(res)
                     except Exception as e:
                         st.error(f"Reindex failed: {e}")
