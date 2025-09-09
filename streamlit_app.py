@@ -26,6 +26,8 @@ import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from loguru import logger
 
+import markdown
+
 # --- Logging (existing helper) ---
 import logging_setup
 
@@ -158,6 +160,15 @@ def _render_images_and_svg_from_text(text: str) -> str:
 
     return clean.strip()
 
+# -------------------------- Markdown / LaTeX helpers --------------------------
+
+# Detect math delimiters to auto-enable KaTeX in HTML->PDF
+_MATH_DELIMS_RE = re.compile(r"(\\\(|\\\)|\\\[|\\\]|\$\$[^$]+\$\$|\$[^$]+\$)")
+
+def _md_has_math(s: str) -> bool:
+    if not s:
+        return False
+    return bool(_MATH_DELIMS_RE.search(s))
 
 # ========= Feature flags =========
 # We no longer try headless browser PDF. We keep Markdown export always-on,
@@ -610,28 +621,29 @@ def _clean_markdown_for_pdf(text: str) -> str:
     s = _fix_common_encoding_glitches(s)
     return s
 
-@lru_cache(maxsize=1)
-def _pygments_formatter():
-    try:
-        from pygments.formatters import HtmlFormatter
-        return HtmlFormatter(nowrap=False)
-    except Exception:
-        return None
+# @lru_cache(maxsize=1)
+# def _pygments_formatter():
+#     try:
+#         from pygments.formatters import HtmlFormatter
+#         return HtmlFormatter(nowrap=False)
+#     except Exception:
+#         return None
 
-def _pygments_css() -> str:
-    fmt = _pygments_formatter()
-    if not fmt:
-        return ""
-    try:
-        return fmt.get_style_defs(".codehilite")
-    except Exception:
-        return ""
+# def _pygments_css() -> str:
+#     fmt = _pygments_formatter()
+#     if not fmt:
+#         return ""
+#     try:
+#         return fmt.get_style_defs(".codehilite")
+#     except Exception:
+#         return ""
 
-@lru_cache(maxsize=1)
-def _md_renderer():
+@lru_cache(maxsize=2)
+def _md_renderer(use_mathml: bool):
     """
     Build a markdown-it renderer with useful plugins and a pygments highlighter.
-    Math is rendered to MathML via texmath, so WeasyPrint can print it.
+    When use_mathml=True we convert math to MathML (for Weasy/xhtml2pdf).
+    When use_mathml=False we LEAVE $…$ delimiters intact (for KaTeX+wkhtml).
     """
     from markdown_it import MarkdownIt
     from mdit_py_plugins.table import table_plugin
@@ -639,7 +651,8 @@ def _md_renderer():
     from mdit_py_plugins.tasklists import tasklists_plugin
     from mdit_py_plugins.anchors import anchors_plugin
     from mdit_py_plugins.attrs import attrs_plugin
-    from mdit_py_plugins.texmath import texmath_plugin
+    if use_mathml:
+        from mdit_py_plugins.texmath import texmath_plugin
     md = MarkdownIt("commonmark", {"typographer": True})
     # Plugins
     md.use(table_plugin)
@@ -647,9 +660,10 @@ def _md_renderer():
     md.use(tasklists_plugin, enabled=True)
     md.use(anchors_plugin, max_level=3)
     md.use(attrs_plugin)
-    # Math → MathML (no JS needed)
-    md.use(texmath_plugin, renderer="mathml")
-    # Pygments highlighting
+    # Math handling
+    if use_mathml:
+        md.use(texmath_plugin, renderer="mathml")  # Weasy/xhtml2pdf route
+    # Pygments highlighting (works for fenced code)
     fmt = _pygments_formatter()
     if fmt:
         from pygments import highlight
@@ -664,14 +678,24 @@ def _md_renderer():
     return md
 
 
-def _md_to_html(md_text: str) -> str:
-    """Convert Markdown (incl. tables/code/lists) to HTML with MathML + Pygments."""
+def _md_to_html(md_text: str, *, use_mathml: bool) -> str:
+    """Convert Markdown to HTML with plugins + Pygments.
+       use_mathml=True: convert math to MathML (Weasy/xhtml2pdf)
+       use_mathml=False: keep $…$ so KaTeX can render (wkhtml)"""
     src = _clean_markdown_for_pdf(md_text or "")
     try:
-        md = _md_renderer()
+        md = _md_renderer(use_mathml)
         return md.render(src)
     except Exception:
         return f"<pre>{html.escape(src)}</pre>"
+    
+@lru_cache(maxsize=1)
+def _pygments_formatter():
+    try:
+        from pygments.formatters import HtmlFormatter
+        return HtmlFormatter(style="default", nowrap=False)
+    except Exception:
+        return None
 
 def _pygments_css() -> str:
     """Inline Pygments CSS for codehilite blocks (no external files, no JS)."""
@@ -682,9 +706,13 @@ def _pygments_css() -> str:
         return ""
 
 def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include_katex: bool = False) -> str:
-    """Compose a complete HTML document for selected chats (print-friendly)."""
+    """Compose a complete HTML document for selected chats (print-friendly).
+       - Promotes fenced ```svg blocks to raw <svg> so they render as graphics
+         (wkhtmltopdf would otherwise print them as code).
+       - Adds print-grade CSS (tables, code, images/SVG).
+       - Optionally injects KaTeX and signals readiness via window.status."""
     pyg_css = _pygments_css()
-    # Print-grade CSS; WeasyPrint supports @page margin boxes + counters
+    # Print-grade CSS; WeasyPrint supports @page, wkhtml respects much of base CSS
     css = f"""
     @page {{
       size: A4;
@@ -709,7 +737,8 @@ def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include
     .chat {{ page-break-before: always; }}
     .chat:first-child {{ page-break-before: auto; }}
     .label {{ font-weight: 700; margin: 10px 0 4px; }}
-    p {{ line-height: 1.38; margin: 6px 0; }}
+    p {{ line-height: 1.38; margin: 6px 0; white-space: normal; }}
+    li {{ white-space: normal; }}
     ul, ol {{ margin: 6px 0 6px 20px; }}
     table {{ border-collapse: collapse; width: 100%; margin: 6px 0; }}
     th, td {{ border: 1px solid #ddd; padding: 6px 8px; font-size: 12px; }}
@@ -720,7 +749,11 @@ def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include
     hr {{ border:0; border-top:1px solid #eee; margin: 14px 0; }}
     .title {{ font-size: 22px; font-weight: 800; margin: 0 0 6px 0; }}
     .subtitle {{ color:#666; font-size: 12px; margin-bottom: 12px; }}
-    img {{ max-width: 100%; height: auto; }}
+    img, svg {{ max-width: 100%; height: auto; display:block; }}
+    /* common inline markup */
+    mark {{ background: #fffd8a; padding: 0 .15em; }}
+    sub {{ vertical-align: sub; font-size: 75%; }}
+    sup {{ vertical-align: super; font-size: 75%; }}
     /* Pygments for codehilite */
     {pyg_css}
     /* MathML tweaks (WeasyPrint) */
@@ -728,15 +761,29 @@ def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include
       font-family: STIXGeneral, 'DejaVu Serif', serif;
     }}
     """
-    # Optional KaTeX (only needed for wkhtmltopdf path with client-side math rendering)
+    # Optional KaTeX (for wkhtmltopdf path with client-side math rendering).
+    # We set window.status='katex-done' so wkhtml can wait until math is rendered.
     katex_head = ""
     if include_katex:
         # Uses CDN; if your environment blocks external fetches, prefer Pandoc/WeasyPrint.
         katex_head = """
         <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+        <script>window.status='katex-loading';</script>
         <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
         <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"
-                onload="renderMathInElement(document.body,{delimiters:[{left:'$$',right:'$$',display:true},{left:'$',right:'$',display:false}]});">
+                onload="try{
+                  renderMathInElement(document.body,{
+                    delimiters:[
+                      {left:'$$',right:'$$',display:true},
+                      {left:'$', right:'$', display:false},
+                      {left:'\\(', right:'\\)', display:false},
+                      {left:'\\[', right:'\\]', display:true}
+                    ]
+                  });
+                }catch(e){}finally{
+                  window.status='katex-done';
+                  setTimeout(function(){ if(window.status!=='katex-done'){window.status='katex-done';}},300);
+                }">
         </script>
         """
     now_iso = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
@@ -749,6 +796,16 @@ def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include
         f"<div class='title'>Tarkash — Chat Export</div>",
         f"<div class='subtitle'>{html.escape(project_name)} · generated at {now_iso}</div>",
     ]
+    # Helper to promote fenced ```svg ...``` into placeholders, restored post-render
+    _SVG_FENCE = re.compile(r"```(?:svg|SVG)\s+([\s\S]*?)\s*```")
+    def _promote_svg_fences(text: str):
+        svgs = []
+        def _repl(m):
+            key = f"__SVG_{len(svgs)}__"
+            svgs.append(m.group(1).strip())
+            return key
+        return _SVG_FENCE.sub(_repl, text), svgs
+
     for r in rows:
         cid = r.get("id")
         ts = r.get("ts"); ts_iso = r.get("ts_iso") or _human_dt(ts)
@@ -759,9 +816,19 @@ def _build_export_html(project_name: str, rows: List[Dict[str, Any]], *, include
         streaming = "on" if r.get("streaming") else "off"
         prompt_md = (r.get("prompt") or "").rstrip()
         answer_md = (r.get("answer") or "").rstrip()
+        # Promote fenced SVG to placeholders before Markdown conversion
+        prompt_promoted, p_svgs = _promote_svg_fences(prompt_md)
+        answer_promoted, a_svgs = _promote_svg_fences(answer_md)
         # Convert markdown → HTML
-        prompt_html = _md_to_html(prompt_md)
-        answer_html = _md_to_html(answer_md)
+        # For wkhtml: include_katex=True ⇒ keep $…$ (no MathML). For server-side PDF: use MathML.
+        _use_mathml = not include_katex
+        prompt_html = _md_to_html(prompt_promoted, use_mathml=_use_mathml)
+        answer_html = _md_to_html(answer_promoted, use_mathml=_use_mathml)
+        # Restore SVG placeholders to raw <svg> so they render as graphics
+        for i, s in enumerate(p_svgs):
+            prompt_html = prompt_html.replace(f"__SVG_{i}__", s)
+        for i, s in enumerate(a_svgs):
+            answer_html = answer_html.replace(f"__SVG_{i}__", s)
         parts.append("<div class='chat'>")
         parts.append(f"<h2>Chat #{cid} — {html.escape(ts_iso)}</h2>")
         parts.append(f"<div class='meta'>{html.escape(mode)} · model={html.escape(model)} · emb={html.escape(embedder)} · RAG={rag_on} · stream={streaming}</div>")
@@ -1012,18 +1079,32 @@ def _export_chats_to_pdf_wkhtml(project_name: str, rows: List[Dict[str, Any]], *
     if not _have_wkhtmltopdf():
         return None
     try:
+        # Auto-enable KaTeX if math markup is present anywhere in the selection.
+        if not inject_katex:
+            try:
+                all_md = "\n\n".join([(r.get("prompt") or "") + "\n" + (r.get("answer") or "") for r in rows])
+            except Exception:
+                all_md = ""
+            if _md_has_math(all_md):
+                inject_katex = True
+        html_doc = _build_export_html(project_name, rows, include_katex=inject_katex)
         with tempfile.TemporaryDirectory() as td:
-            html_doc = _build_export_html(project_name, rows, include_katex=inject_katex)
             html_path = Path(td) / "export.html"
             pdf_path  = Path(td) / "export.pdf"
             html_path.write_text(html_doc, encoding="utf-8")
             cmd = [
                 shutil.which("wkhtmltopdf"),
                 "--enable-local-file-access",
+                "--print-media-type",
+                "--dpi", os.environ.get("TARKASH_WKHTML_DPI", "144"),
+                "--encoding", "utf-8",
                 "-q",
-                str(html_path),
-                str(pdf_path),
             ]
+            # When KaTeX is injected, enable JS and wait for window.status='katex-done'
+            if inject_katex:
+                js_delay = os.environ.get("TARKASH_WKHTML_JS_DELAY", "1600")
+                cmd += ["--enable-javascript", "--javascript-delay", js_delay, "--window-status", "katex-done"]
+            cmd += [str(html_path), str(pdf_path)]
             subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             return pdf_path.read_bytes()
     except Exception as e:
@@ -1324,7 +1405,6 @@ def _inject_css():
           width:100%;
           border-radius:8px;
         }
-        }
         /* Tarkash glyphs (corners + sidebar) */
         .tarkash-logo{
           position: fixed; top: 6px; left: 14px; z-index: 1000;
@@ -1345,19 +1425,6 @@ def _inject_css():
           background: transparent !important;
           margin-bottom: .35rem !important; /* tighter gap to the next heading */
         }
-
-
-        /* Tarkash glyph (top-left) */
-        .tarkash-logo{
-          position: fixed;
-          top: 6px;
-          left: 14px;
-          z-index: 1000;
-          display:flex; align-items:center; gap:.35rem;
-          font-weight:600; color:var(--ink); opacity:.95;
-          pointer-events:none;
-        }
-        .tarkash-logo svg{ width:28px; height:28px; }
         </style>
         """,
         unsafe_allow_html=True,
