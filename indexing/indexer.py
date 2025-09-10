@@ -1,4 +1,3 @@
-# indexing/indexer.py
 from __future__ import annotations
 
 import re, os, json, time, hashlib, traceback
@@ -9,7 +8,7 @@ from loguru import logger
 import chromadb
 import concurrent.futures as cf
 
-from config_home import project_rag_dir  # ~/.gencli/<project>/RAG
+from config_home import project_rag_dir, set_project_embedder  # ~/.tarkash/projects/<name>/RAG
 from .settings import load as load_settings
 from .filters import iter_files
 from .embedder import resolve_embedder
@@ -94,6 +93,36 @@ def _load_env_for_project(project_root: str) -> None:
                 logger.debug("_load_env_for_project: loaded {}", str(p))
         except Exception as e:
             logger.debug("_load_env_for_project: failed to load {} → {}", str(p), e)
+
+def _resolve_rag_json_path(project_root: str, rag_path: str | None) -> str | None:
+    """
+    Prefer the project's rag.json. Rules:
+      1) If rag_path is an explicit .json → use it.
+      2) If rag_path is a directory and has rag.json → use it.
+      3) <project_root>/rag.json if present.
+      4) Parent of project RAG dir (…/<project>/rag.json) if present.
+      5) Else None (caller may decide a fallback).
+    """
+    try:
+        if rag_path and rag_path.lower().endswith(".json") and os.path.isfile(rag_path):
+            return rag_path
+        if rag_path and os.path.isdir(rag_path):
+            cand = os.path.join(rag_path, "rag.json")
+            if os.path.isfile(cand):
+                return cand
+        cand = os.path.join(project_root, "rag.json")
+        if os.path.isfile(cand):
+            return cand
+        # ~/.tarkash/projects/<name>/rag.json (sibling of RAG dir)
+        try:
+            cand = str(Path(project_rag_dir(project_root)).parent / "rag.json")
+            if os.path.isfile(cand):
+                return cand
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
 
 
 # ------------------------------ small utilities ------------------------------
@@ -281,12 +310,13 @@ def _as_doc_text(chunk: dict) -> str:
 
 # ----------------------------- chroma collection ------------------------------
 
-def _chroma(project_root: str, cfg: dict):
+def _chroma(project_root: str, cfg: dict, embedder_name: str | None = None):
     """
     Create/get a Chroma collection for this project.
     IMPORTANT: Do NOT pass an embedding_function here.
                We embed client-side and pass vectors explicitly.
     The RAG store path is anchored to the *project root* for consistency with the app.
+    Also stamps/refreshes collection metadata with the embedder name for mismatch checks.
     """
     # Ensure we always operate on a real Path object (mkdir used below)
     rag_dir = Path(project_rag_dir(project_root))
@@ -294,7 +324,19 @@ def _chroma(project_root: str, cfg: dict):
     client = chromadb.PersistentClient(path=str(rag_dir))
     coll_name = _collection_name_for(cfg)
     logger.info("Chroma store: dir='{}' collection='{}'", str(rag_dir), coll_name)
-    return client.get_or_create_collection(name=coll_name)
+    coll = client.get_or_create_collection(name=coll_name)
+    # Best-effort metadata stamp (newer Chroma supports modify)
+    try:
+        meta = dict(getattr(coll, "metadata", {}) or {})
+        if project_root:
+            meta["project_root"] = project_root
+        if embedder_name:
+            meta["embedder_name"] = embedder_name
+        if hasattr(coll, "modify"):
+            coll.modify(metadata=meta)  # type: ignore[attr-defined]
+    except Exception as _e:
+        logger.debug("_chroma: could not set collection metadata: {}", _e)
+    return coll
 
 
 # --------------------------------- chunking -----------------------------------
@@ -448,18 +490,31 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
       - Embed client-side + upsert in batches
     Returns: {"ok": True, "added": <int>, "files": {...}}
     """
-    logger.info("full_reindex: begin project_root='{}' rag='{}'", project_root, rag_path)
+    # Add contextual logging: component, project key, and root
+    log = logger.bind(component="indexer",
+                      project=_project_key(project_root),
+                      project_root=project_root)
+    log.info("full_reindex: begin project_root='{}' rag='{}'", project_root, rag_path)
     _load_env_for_project(project_root)  # make sure keys from .env are visible
 
-    cfg = load_settings(rag_path)
+    # Always prefer the project's rag.json (explicit .json overrides)
+    cfg = load_settings(_resolve_rag_json_path(project_root, rag_path))
     root = os.path.join(project_root, cfg["index_root"])
-    logger.info("Index root: '{}'", root)
+    log.info("Index root: '{}'", root)
 
-    coll = _chroma(project_root, cfg)
     models_path = _resolve_models_json_path(project_root)
-    logger.info("models.json resolved: '{}'", models_path)
+    log.info("models.json resolved: '{}'", models_path)
     embed_fn = resolve_embedder(models_path, cfg)
-    logger.info("Embedder resolved for selected='{}'", (cfg.get("embedder") or {}).get("selected_name") or (cfg.get("embedder") or {}).get("model_key"))
+    emb_name = getattr(embed_fn, "name", None) or (cfg.get("embedder") or {}).get("selected_name") or (cfg.get("embedder") or {}).get("model_key") or "unknown"
+    # Enrich context with embedder
+    log = log.bind(embedder=emb_name)
+    log.info("Embedder resolved: '{}'", emb_name)
+    # Persist the resolved embedder into the per-project rag.json (authoritative source of truth)
+    try:
+        set_project_embedder(project_root, emb_name)
+    except Exception as e:
+        log.debug("full_reindex: set_project_embedder failed: {}", e)
+    coll = _chroma(project_root, cfg, embedder_name=emb_name)
 
     # Clear any stale STOP and set status → running
     try:
@@ -478,7 +533,7 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     workers = _auto_workers(cfg)
     upsert_batch = int(cfg.get("upsert_batch_size") or 64)
     max_pending = int(cfg.get("max_pending_chunks") or 2000)
-    logger.info("Parallel chunking: files={} workers={} upsert_batch={} max_pending={}",
+    log.info("Parallel chunking: files={} workers={} upsert_batch={} max_pending={}",
                 len(files), workers, upsert_batch, max_pending)
 
     # status seed
@@ -517,7 +572,7 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
         except Exception:
             pass
         if err:
-            logger.error("chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
+            log.error("chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
             # still update progress and continue
             status["processed_files"] += 1
             try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
@@ -531,7 +586,7 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
             if not _is_meaningful(doc):
                 continue
             sanitized.append({"document": doc, "metadata": c.get("metadata", {})})
-        logger.info("chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), len(sanitized), elapsed)
+        log.info("chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), len(sanitized), elapsed)
         per_file_stats[rel] = len(sanitized)
         status["processed_files"] += 1
         try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
@@ -561,7 +616,7 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
                             stamp_ts=(max_seen_mtime or time.time()),
                             dirty=bool(dirty))
     except Exception as e:
-        logger.warning("Failed to save manifest/stamp: {}", e)
+        log.warning("Failed to save manifest/stamp: {}", e)
 
     # update status file (final)
     status.update({"state": "stopped" if dirty else "complete", "dirty": bool(dirty), "ended": time.time()})
@@ -570,9 +625,20 @@ def full_reindex(project_root: str, rag_path: str | None) -> Dict:
     except Exception:
         pass
 
-    logger.info("full_reindex: done added={} files={} dirty={}", added, len(per_file_stats), bool(dirty))
-    return {"ok": True, "added": added, "files": per_file_stats, "dirty": bool(dirty),
-            "processed_files": status["processed_files"], "total_files": status["total_files"]}
+    log.info("full_reindex: done added={} files={} dirty={}", added, len(per_file_stats), bool(dirty))
+    # Normalize keys to align with delta_index summary
+    return {
+        "ok": True,
+        "added": added,
+        "updated": 0,
+        "deleted": 0,
+        "files_changed": len(per_file_stats),
+        "files": per_file_stats,
+        "dirty": bool(dirty),
+        "processed_files": status["processed_files"],
+        "total_files": status["total_files"],
+        "embedder": emb_name,
+    }
 
 
 def delta_index(project_root: str, rag_path: str | None) -> Dict:
@@ -583,18 +649,31 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
       - deleted: purge by relpath
       - added/changed: purge old by relpath, re-chunk, embed, upsert
     """
-    logger.info("delta_index(manifest): begin project_root='{}' rag='{}'", project_root, rag_path)
+    # Add contextual logging: component, project key, and root
+    log = logger.bind(component="indexer",
+                      project=_project_key(project_root),
+                      project_root=project_root)
+    log.info("delta_index(manifest): begin project_root='{}' rag='{}'", project_root, rag_path)
     _load_env_for_project(project_root)
 
-    cfg = load_settings(rag_path)
+    # Always prefer the project's rag.json (explicit .json overrides)
+    cfg = load_settings(_resolve_rag_json_path(project_root, rag_path))
     root = os.path.join(project_root, cfg["index_root"])
-    logger.info("Index root: '{}'", root)
+    log.info("Index root: '{}'", root)
 
-    coll = _chroma(project_root, cfg)
     models_path = _resolve_models_json_path(project_root)
-    logger.info("models.json resolved: '{}'", models_path)
+    log.info("models.json resolved: '{}'", models_path)
     embed_fn = resolve_embedder(models_path, cfg)
-    logger.info("Embedder resolved for selected='{}'", (cfg.get("embedder") or {}).get("selected_name"))
+    emb_name = getattr(embed_fn, "name", None) or (cfg.get("embedder") or {}).get("selected_name") or (cfg.get("embedder") or {}).get("model_key") or "unknown"
+    # Enrich context with embedder
+    log = log.bind(embedder=emb_name)
+    log.info("Embedder resolved: '{}'", emb_name)
+    # Keep per-project rag.json in sync with the embedder actually used for delta indexing
+    try:
+        set_project_embedder(project_root, emb_name)
+    except Exception as e:
+        log.debug("delta_index: set_project_embedder failed: {}", e)
+    coll = _chroma(project_root, cfg, embedder_name=emb_name)
 
     prev = _load_manifest_file(project_root)
     cur  = _scan_current_manifest(root, cfg)
@@ -627,7 +706,7 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
     workers = _auto_workers(cfg)
     upsert_batch = int(cfg.get("upsert_batch_size") or 64)
     max_pending = int(cfg.get("max_pending_chunks") or 2000)
-    logger.info("Parallel chunking delta: files={} workers={} upsert_batch={}", len(candidates), workers, upsert_batch)
+    log.info("Parallel chunking delta: files={} workers={} upsert_batch={}", len(candidates), workers, upsert_batch)
 
     dirty = False
     per_file_stats = {}
@@ -646,7 +725,7 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
     for fp, chunks, elapsed, err in _parallel_chunk_stream(candidates, cfg, workers, project_root):
         rel = _relpath(root, fp)
         if err:
-            logger.error("delta chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
+            log.error("delta chunk FAIL '{}' in {:.1f}s: {}", rel, elapsed, err)
             status["processed_files"] += 1
             try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
             except Exception: pass
@@ -659,7 +738,7 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
             if not _is_meaningful(doc):
                 continue
             sanitized.append({"document": doc, "metadata": c.get("metadata", {})})
-        logger.info("delta chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), len(sanitized), elapsed)
+        log.info("delta chunk OK   '{}' chunks={} kept={} time={:.1f}s", rel, len(chunks), len(sanitized), elapsed)
         per_file_stats[rel] = len(sanitized)
         status["processed_files"] += 1
         try: _status_path(project_root).write_text(json.dumps(status), encoding="utf-8")
@@ -669,7 +748,7 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
         try:
             coll.delete(where={"relpath": rel})
         except Exception as e:
-            logger.debug("delete before upsert skipped/failed for rel='{}': {}", rel, e)
+            log.debug("delete before upsert skipped/failed for rel='{}': {}", rel, e)
 
         for c in _rekey(sanitized, project_root, root, fp):
             buf_ids.append(c["id"])
@@ -701,5 +780,5 @@ def delta_index(project_root: str, rag_path: str | None) -> Dict:
         "deleted_files": deleted,
         "files": per_file_stats,
     }
-    logger.info("delta_index(manifest): done {}", summary)
+    log.info("delta_index(manifest): done {}", summary)
     return summary

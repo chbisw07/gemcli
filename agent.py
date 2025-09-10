@@ -25,6 +25,8 @@ class Agent:
         self.model = model
         self.tools = tools
         self.enable_tools = enable_tools
+        # Optional override that callers (UI/Agent mode) can set to specialize the system message
+        self.system_override: Optional[str] = None
 
         if model.is_openai_compat():
             self.adapter = OpenAICompatAdapter(model, tools)
@@ -42,6 +44,13 @@ class Agent:
         )
 
     # --------------------------- Prompt ---------------------------
+    def set_system_override(self, text: Optional[str]) -> None:
+        """Let callers (e.g., Agent Plan & Run) provide a specialized system prompt to append."""
+        val = (text or "").strip()
+        self.system_override = val if val else None
+        if self.system_override:
+            logger.debug("system_override set ({} chars)", len(self.system_override))
+
 
     def system_prompt(self) -> str:
         """
@@ -70,6 +79,9 @@ class Agent:
                     "NEVER dump large file blobs; summarize and use the tools."
                 )
         logger.debug("system_prompt built (len={})", len(prompt))
+        # Append caller-provided system specialization last (if any)
+        if self.system_override:
+            prompt = prompt + "\n\n" + self.system_override
         return prompt
 
     # --------------------------- Public API ---------------------------

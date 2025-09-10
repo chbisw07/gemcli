@@ -7,12 +7,64 @@ from loguru import logger
 
 from .settings import load as load_settings
 from .retriever import retrieve as rag_retrieve
-from config_home import project_rag_dir
+from config_home import project_rag_dir, project_paths
 
 CODE_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".cpp", ".c"}
 DOC_EXTS  = {".pdf", ".md", ".txt", ".docx", ".rst"}
 TAB_EXTS  = {".csv", ".xlsx", ".tsv"}
 
+
+AGENT_RAG_SYS_PROMPT = """You are an Educational Agent. Your job is to (1) understand the user’s task,
+(2) fetch supporting material with RAG, (3) produce a clean, study-ready output.
+
+Rules:
+- Prefer RAG. If RAG returns fewer than {COV_MIN} passages or low scores, expand queries; if still weak, use web tools.
+- Math: use \( inline \) and \[ display \]. Do not use $...$.
+- Cite sources inline as [S1], [S2] and include a “Sources” section mapping these tags.
+- When user asks for questions: include “Problems” then “Solutions” (if requested). Respect requested counts, difficulty, subject/chapter filters.
+- Never invent facts; if not found, say “Not found” and still produce practice items (clearly marked).
+"""
+
+COV_MIN = 4  # used by planner/retriever heuristics
+
+def compose_agent_system_prompt(system_override: str | None = None, cov_min: int | None = None) -> str:
+    """
+    Build the final system prompt for Agent Plan & Run (Agent + RAG).
+    - Starts with our internal educational guardrails.
+    - Optionally appends a user/system override (from UI).
+    - Injects the current COV_MIN into the template.
+    """
+    value = int(COV_MIN if cov_min is None else cov_min)
+    base = AGENT_RAG_SYS_PROMPT.format(COV_MIN=value)
+    extra = (system_override or "").strip()
+    return base + ("\n\n" + extra if extra else "")
+
+AGENT_RAG_SYS_PROMPT = """You are an Educational Agent. Your job is to (1) understand the user’s task,
+(2) fetch supporting material with RAG, (3) produce a clean, study-ready output.
+
+Rules:
+- Prefer RAG. If RAG returns fewer than COV_MIN passages or low scores, expand queries; if still weak, use web tools.
+- Math: use \( inline \) and \[ display \]. Do not use $…$.
+- Cite sources inline as [S1], [S2] and include a “Sources” section mapping these tags.
+- When user asks for questions: include “Problems” then “Solutions” (if requested). Respect requested counts, difficulty, subject/chapter filters.
+- Never invent facts; if not found, say “Not found” and still produce practice items (clearly marked).
+"""
+COV_MIN = 4  # used by planner/retriever heuristics
+
+# def compose_agent_system_prompt(system_override: Optional[str] = None, cov_min: Optional[int] = None) -> str:
+#     """
+#     Build the final system prompt for Agent Plan & Run (Agent + RAG).
+#     - Starts with our internal educational guardrails.
+#     - Optionally appends a user/system override (from UI).
+#     - Injects the current COV_MIN into the template.
+#     """
+#     value = int(COV_MIN if cov_min is None else cov_min)
+#     base = AGENT_RAG_SYS_PROMPT.format(COV_MIN=value)
+#     if system_override:
+#         extra = str(system_override).strip()
+#         if extra:
+#             return base + "\n\n" + extra
+#     return base
 
 def _norm_lower(x) -> str:
     """Robust lowercase for strings/Paths/objects."""
@@ -112,7 +164,14 @@ def route_query(
         "filename_boosted": [...]
       }
     """
-    cfg = load_settings(None)
+    # Prefer project rag.json when available (keeps router thresholds aligned per project)
+    try:
+        _rag_path = rag_path
+        if not _rag_path and project_root:
+            _rag_path = str(project_paths(Path(project_root).name)["rag"])
+        cfg = load_settings(_rag_path)
+    except Exception:
+        cfg = load_settings(None)
     if k is None:
         k = int((cfg.get("retrieval") or {}).get("top_k", 8))
 
@@ -124,6 +183,7 @@ def route_query(
     rag_dir = rag_path or cfg.get("chroma_dir") or project_rag_dir(project_root)
 
     logger.info("router.route_query: top_k={} min_score={} rag_dir='{}'", k, min_score, rag_dir)
+    # First pass
     rag = rag_retrieve(
         project_root=project_root,
         rag_path=rag_dir,
@@ -137,6 +197,29 @@ def route_query(
     scores = score_buckets(chunks)
     route = decide_route(scores)
 
+    # Auto-relax if hits are too low
+    min_hits = (cfg.get("router") or {}).get("min_hits", 10)
+    auto_relax = bool((cfg.get("router") or {}).get("auto_relax", True))
+    retry_info = None
+    if auto_relax and len(rag.get("chunks") or []) < int(min_hits):
+        relaxed_k = max(int(k or 8) * 2, 16)
+        base_thr = min_score if isinstance(min_score, (int, float)) else 0.25
+        relaxed_thr = max(0.0, float(base_thr) * 0.7)  # soften by 30%
+        rag_relaxed = rag_retrieve(
+            project_root=project_root,
+            rag_path=rag_dir,
+            query=query,
+            k=relaxed_k,
+            where=where,
+            min_score=relaxed_thr,
+        )
+        # Prefer relaxed hits if they add value
+        if len(rag_relaxed.get("chunks") or []) > len(rag.get("chunks") or []):
+            retry_info = {"reason": "low_hits", "prev_hits": len(rag.get("chunks") or []),
+                          "new_hits": len(rag_relaxed.get("chunks") or []),
+                          "relaxed_k": relaxed_k, "relaxed_threshold": relaxed_thr}
+            rag = rag_relaxed
+
     out = {
         "route": route,
         "scores": scores,
@@ -145,6 +228,12 @@ def route_query(
         "used_where": rag.get("used_where"),
         "filename_boosted": rag.get("filename_boosted"),
     }
+    if retry_info:
+        out["auto_relaxed"] = retry_info
+    # Bubble up embedder mismatch so callers/UX can warn prominently
+    if rag.get("embedder_mismatch"):
+        logger.warning("router: embedder mismatch — {}", rag["embedder_mismatch"])
+        out["embedder_mismatch"] = rag["embedder_mismatch"]
     logger.info("router.route_query: route={} scores={}", route, {k: round(v, 3) for k, v in scores.items()})
     return out
 

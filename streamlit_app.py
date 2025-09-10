@@ -1889,6 +1889,16 @@ with st.sidebar:
         )
         st.session_state["tools"] = tools
         st.session_state["agent"] = agent
+        # Pass the UI system prompt (if ON) to Agent+RAG (ReasoningAgent) so final synthesis uses it.
+        try:
+            if hasattr(agent, "set_system_override"):
+                _ui = _read_json(per_ui_path)
+                _on = bool(_ui.get("sys_prompt_on", False))
+                _txt = (_ui.get("sys_prompt_text") or "").strip() if _on else ""
+                agent.set_system_override(_txt)
+        except Exception as _e:
+            logger.debug("ignored: could not set system_override on agent: {}", _e)
+
         st.session_state["rt_key"] = rt_key
         st.session_state["last_results"] = None
 
@@ -2157,6 +2167,17 @@ def _rag_summary_from_steps(steps: List[dict]) -> Optional[str]:
     except Exception:
         return None
 
+def _rag_mismatch_from_steps(steps: List[dict]) -> Optional[dict]:
+    try:
+        for s in steps:
+            if s.get("tool") == "rag_retrieve":
+                mm = (s.get("result") or {}).get("embedder_mismatch")
+                if mm:
+                    return mm
+    except Exception:
+        pass
+    return None
+
 def _keywordize(text: str, max_terms: int = 8) -> list[str]:
     if not text:
         return []
@@ -2390,18 +2411,23 @@ if submit:
             # PLAN
             try:
                 if hasattr(agent, "analyze_and_plan"):
-                    plan = agent.analyze_and_plan(prompt)  # type: ignore[attr-defined]
+                    plan = agent.analyze_and_plan(  # type: ignore[attr-defined]
+                        prompt,
+                        rag_on=bool(st.session_state.get("rag_on", False)),
+                    )
                 else:
                     plan = []
-                    for sub in _keywordize(prompt, max_terms=8):
-                        plan.append(
-                            {
-                                "tool": "rag_retrieve",
-                                "args": {"query": sub, "top_k": 8},
-                                "description": "Focused retrieval from sub-query",
-                                "critical": False,
-                            }
-                        )
+                    # Only add retrieval steps if RAG is enabled
+                    if bool(st.session_state.get("rag_on", False)):
+                        for sub in _keywordize(prompt, max_terms=8):
+                            plan.append(
+                                {
+                                    "tool": "rag_retrieve",
+                                    "args": {"query": sub, "top_k": 8},
+                                    "description": "Focused retrieval from sub-query",
+                                    "critical": False,
+                                }
+                            )
                     plan.append(
                         {
                             "tool": "rag_retrieve",
@@ -2430,9 +2456,10 @@ if submit:
                 if hasattr(agent, "execute_plan"):
                     exec_json = agent.execute_plan(  # type: ignore[attr-defined]
                         plan,
-                        max_iters=int(st.session_state.get("max_iters", 5)),
+                        max_iters=max_iters,
                         analysis_only=bool(st.session_state.get("analysis_only", True)),
                         progress_cb=_progress_cb,
+                        rag_on=bool(st.session_state.get("rag_on", False)),
                     )
                 else:
                     # Minimal local executor
@@ -2504,6 +2531,10 @@ if submit:
                 _rs = _rag_summary_from_steps(steps)
                 if _rs:
                     st.caption(_rs)
+                _mm = _rag_mismatch_from_steps(steps)
+                if _mm:
+                    st.warning(f"Embedder mismatch: index was built with `{_mm['indexed']}`, "
+                               f"but retrieval requested `{_mm['requested']}`. {_mm.get('advice','')}")
 
                 for rec in steps:
                     res = rec.get("result")

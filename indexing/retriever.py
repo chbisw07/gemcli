@@ -3,14 +3,15 @@
 # =========================
 from __future__ import annotations
 
-import os
+import os, hashlib
 import re
 from typing import Dict, Any, List, Optional
+from pathlib import Path
 from loguru import logger
 import chromadb
 
-from config_home import project_rag_dir
-from .settings import load as load_settings
+from .settings import load as load_settings, save as save_settings
+from config_home import project_paths, project_rag_dir
 from .embedder import resolve_embedder
 from .utils import collection_name_for as _collection_name_for
 from .utils import resolve_models_json_path as _resolve_models_json_path
@@ -130,6 +131,22 @@ def _query_collection(
     return out
 
 
+def _infer_project_rag_json(project_root: Optional[str]) -> Optional[str]:
+    try:
+        if not project_root:
+            return None
+        name = Path(project_root).name
+        return str(project_paths(name)["rag"])
+    except Exception:
+        return None
+
+def _project_key(project_root: str) -> str:
+    """Stable, human-friendly project key for logs."""
+    p = Path(project_root)
+    name = p.name or "project"
+    h = hashlib.sha1(os.path.abspath(project_root).encode("utf-8")).hexdigest()[:8]
+    return f"{name}-{h}"
+
 def retrieve(
     project_root: str,
     rag_path: str,
@@ -150,11 +167,18 @@ def retrieve(
         "filename_boosted": [filenames...]
       }
     """
+    # Add contextual logging: component, project key, and root
+    log = logger.bind(component="retriever",
+                      project=_project_key(project_root),
+                      project_root=project_root)
     q_preview = (query or "").strip().replace("\n", " ")[:160]
-    logger.info("retriever.retrieve: q='{}…' root='{}' ragdir='{}'", q_preview, project_root, rag_path)
+    log.info("retriever.retrieve: q='{}…' root='{}' rag_path_in='{}'", q_preview, project_root, rag_path)
 
-    # --- Load settings (prefer an explicit rag.json path if given) ---
-    cfg = load_settings(rag_path) if (rag_path and rag_path.lower().endswith(".json")) else load_settings(None)
+    # --- Load settings (prefer the project's rag.json; explicit rag.json overrides) ---
+    if rag_path and rag_path.lower().endswith(".json"):
+        cfg = load_settings(rag_path)
+    else:
+        cfg = load_settings(_infer_project_rag_json(project_root))
 
     # knobs
     topk = int(k or (cfg.get("retrieval") or {}).get("top_k", 8))
@@ -165,6 +189,8 @@ def retrieve(
         min_score = float(thr) if isinstance(thr, (int, float)) else None
     if enable_filename_boost is None:
         enable_filename_boost = bool(router_cfg.get("enable_filename_boost", True))
+    log.info("retriever: k={} min_score={} filename_boost={} where_keys={}",
+                topk, min_score, enable_filename_boost, list((where or {}).keys()))
 
     # --- Resolve rag directory and collection ---
     # If rag_path is a rag.json file → use its chroma_dir; if it's a directory → use it;
@@ -179,15 +205,45 @@ def retrieve(
     client = chromadb.PersistentClient(path=rag_dir)
     coll_name = _collection_name_for(cfg)
     coll = client.get_or_create_collection(name=coll_name, metadata={"hnsw:space": "cosine"})
-    logger.info("retriever: collection='{}' rag_dir='{}'", coll_name, rag_dir)
+    log.info("retriever: collection='{}' rag_dir='{}'", coll_name, rag_dir)
 
     # --- Build embedder ---
     models_path = _resolve_models_json_path(project_root)
     embed = resolve_embedder(models_path, cfg)
+    selected_name = getattr(embed, "name", None) or ((cfg.get("embedder") or {}).get("selected_name"))
+    # Enrich context with embedder
+    log = log.bind(embedder=selected_name)
+    log.info("retriever: selected_embedder='{}'", selected_name)
+    # --- Embedder mismatch detection (index-time vs now) ---
+    embedder_mismatch = None
+    try:
+        meta = getattr(coll, "metadata", {}) or {}
+        indexed_name = meta.get("embedder_name") or meta.get("embedding_model")
+        if indexed_name and selected_name and str(indexed_name) != str(selected_name):
+            embedder_mismatch = {
+                "indexed": indexed_name,
+                "requested": selected_name,
+                "advice": "Reindex with the requested embedder or switch back to the embedder used for indexing.",
+            }
+            log.warning(
+                "retriever: embedder mismatch (indexed='{}', requested='{}')",
+                indexed_name, selected_name
+            )
+    except Exception as _e:
+        log.debug("retriever: could not read collection metadata for mismatch detection: {}", _e)
+
     qvecs = embed([query]) if query else []
     if not qvecs:
-        logger.warning("retriever: No query embeddings returned — possible model misconfiguration or endpoint issue")
-        return {"chunks": [], "top_k": topk, "used_where": where or {}, "filename_boosted": []}
+        log.warning("retriever: No query embeddings returned — possible model misconfiguration or endpoint issue")
+        return {
+            "chunks": [],
+            "top_k": topk,
+            "used_where": where or {},
+            "filename_boosted": [],
+            "symbol_boosted": [],
+            "embedder": selected_name,
+            **({"embedder_mismatch": embedder_mismatch} if embedder_mismatch else {}),
+        }
 
     qvec = qvecs[0]
 
@@ -199,8 +255,9 @@ def retrieve(
         var = sum((x - mean) ** 2 for x in qvec) / len(qvec)
         if var < 1e-12:
             raise ValueError("near-constant embedding")
+        log.debug("retriever: qvec stats mean={:.4f} var={:.4e}", mean, var)
     except Exception as e:
-        logger.error("retriever: invalid query embedding ({}). Aborting retrieval.", e)
+        log.error("retriever: invalid query embedding ({}). Aborting retrieval.", e)
         return {"chunks": [], "top_k": topk, "used_where": where or {}, "filename_boosted": []}
 
 
@@ -246,11 +303,11 @@ def retrieve(
     if isinstance(min_score, (int, float)):
         before = len(merged)
         merged = [c for c in merged if (c.get("score") or 0.0) >= float(min_score)]
-        logger.info("retriever: min_score={} filtered {}→{}", min_score, before, len(merged))
+        log.info("retriever: min_score={} filtered {}→{}", min_score, before, len(merged))
 
     merged = merged[:topk]
 
-    logger.info(
+    log.info(
         "retriever: results={} first_id='{}' boosted_files={} boosted_symbols={} where_keys={}",
         len(merged),
         merged[0]["id"] if merged else None,
@@ -265,4 +322,6 @@ def retrieve(
         "used_where": where or {},
         "filename_boosted": filename_hits,
         "symbol_boosted": symbol_hits,
+        "embedder": selected_name,
+        **({"embedder_mismatch": embedder_mismatch} if embedder_mismatch else {}),
     }

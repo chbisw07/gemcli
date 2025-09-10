@@ -34,7 +34,7 @@ for _p in (PROJECTS_DIR, CHAT_HISTORY_DIR):
 # Single-file, app-scoped artifacts
 ENV_PATH: Path = APP_DIR / ".env"
 MODELS_JSON_PATH: Path = APP_DIR / "models.json"
-GLOBAL_RAG_PATH: Path = APP_DIR / "rag.json"                  # template / fallback
+GLOBAL_RAG_PATH: Path = APP_DIR / "rag.json"                  # TEMPLATE ONLY (seed new projects; not read at runtime)
 GLOBAL_UI_SETTINGS_PATH: Path = APP_DIR / "ui_settings.json"  # remembers last project, etc.
 
 # ---------- helpers ----------
@@ -51,6 +51,23 @@ def _write_json(p: Path, d: dict) -> None:
         p.write_text(json.dumps(d, indent=2), encoding="utf-8")
     except Exception as e:
         logger.warning("Failed to save json '{}': {}", str(p), e)
+
+def _ensure_global_templates() -> None:
+    """
+    Make sure the app-level template rag.json exists.
+    This file is used only to seed new projects (copied into ~/.tarkash/projects/<name>/rag.json).
+    Runtime always reads the per-project rag.json.
+    """
+    try:
+        if not GLOBAL_RAG_PATH.exists():
+            # Keep this minimal; per-project rag.json will inject a project-local chroma_dir.
+            _write_json(GLOBAL_RAG_PATH, {
+                "index_root": ".",
+                "collection": "tarkash"
+            })
+            logger.info("Initialized template rag.json at {}", str(GLOBAL_RAG_PATH))
+    except Exception as e:
+        logger.warning("Could not initialize template rag.json: {}", e)
 
 _name_safe_rx = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -93,6 +110,14 @@ def project_paths(project_name: str) -> Dict[str, Path]:
     p["rag_index_dir"].mkdir(parents=True, exist_ok=True)
     return p
 
+def project_rag_json(project_root: Optional[str] = None, project_name: Optional[str] = None) -> Path:
+    """
+    Resolve the authoritative per-project rag.json path.
+    Prefer explicit project_name; else derive from project_root or UI state.
+    """
+    name = project_name or current_project_name(project_root)
+    return project_paths(name)["rag"]
+
 def ensure_project_scaffold(
     project_name: str,
     *,
@@ -106,7 +131,7 @@ def ensure_project_scaffold(
     """
     paths = project_paths(project_name)
 
-    # rag.json
+    # rag.json (copy from template once; thereafter per-project rag.json is the source of truth)
     if not paths["rag"].exists():
         src = template_rag if (template_rag and template_rag.exists()) else GLOBAL_RAG_PATH
         if src.exists():
@@ -144,6 +169,21 @@ def ensure_project_scaffold(
 
     return paths
 
+def set_project_embedder(project_root: str, embedder_name: str) -> None:
+    """
+    Persist the embedder used for (re)indexing into the per-project rag.json.
+    Called by indexer after it resolves the actual embedder.
+    """
+    try:
+        p = project_rag_json(project_root)
+        cfg = _read_json(p)
+        cfg.setdefault("embedder", {})
+        cfg["embedder"]["selected_name"] = embedder_name
+        _write_json(p, cfg)
+        logger.info("Updated project embedder in {}", str(p))
+    except Exception as e:
+        logger.warning("Failed to update project embedder: {}", e)
+
 # ---------- Compatibility shim for older imports ----------
 
 def project_rag_dir(project_root: str) -> str:
@@ -155,6 +195,8 @@ def project_rag_dir(project_root: str) -> str:
     name = current_project_name(project_root)
     paths = ensure_project_scaffold(name)
     return str(paths["rag_index_dir"])
+
+_ensure_global_templates()
 
 __all__ = [
     "APP_DIR",

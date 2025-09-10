@@ -169,19 +169,43 @@ class ToolRegistry:
             Retrieve top chunks from the project's Chroma index, with optional metadata filters.
             Defaults:
               - project_root: this registry's root
-              - rag_path: config_home.GLOBAL_RAG_PATH
+              - rag_path: the project's rag.json (resolved via config_home.project_rag_json)
             Returns: {"chunks":[{id, document, metadata, score, distance}], "top_k":int, ...}
             """
             try:
                 from indexing.retriever import retrieve as _retrieve
-                from config_home import GLOBAL_RAG_PATH
+                from config_home import project_rag_json
             except Exception as e:  # pragma: no cover
                 logger.error("rag_retrieve import failed: {}", e)
                 raise
             pr = project_root or str(self.root)
-            rp = rag_path or str(GLOBAL_RAG_PATH)
-            res = _retrieve(project_root=pr, rag_path=rp, query=query, k=top_k, where=where, min_score=min_score, enable_filename_boost=enable_filename_boost)
-            logger.info("rag_retrieve: query='{}...' hits={} where_keys={} threshold={}", (query or "")[:80], len(res.get("chunks") or []), list((where or {}).keys()), min_score)
+            # Prefer per-project rag.json; allow explicit rag_path override
+            if not rag_path or rag_path in ("", "default"):
+                try:
+                    rp = str(project_rag_json(project_root=pr))
+                except Exception:
+                    rp = None  # let retriever infer from project_root
+            else:
+                rp = rag_path
+            res = _retrieve(
+                project_root=pr,
+                rag_path=rp,
+                query=query,
+                k=top_k,
+                where=where,
+                min_score=min_score,
+                enable_filename_boost=enable_filename_boost,
+            )
+            mm = res.get("embedder_mismatch")
+            logger.info(
+                "rag_retrieve: query='{}...' hits={} where_keys={} threshold={} rag_path='{}'{}",
+                (query or "")[:80],
+                len(res.get("chunks") or []),
+                list((where or {}).keys()),
+                min_score,
+                rp,
+                f" mismatch(indexed={mm.get('indexed')},requested={mm.get('requested')})" if mm else ""
+            )
             return res
 
         # ---------- read_file ----------

@@ -139,7 +139,10 @@ def _endpoint_reachable(url: str, timeout: float = 2.0) -> bool:
 
 def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
     """
-    Returns a callable: embed(texts) -> List[List[float]]
+    Returns a callable with attributes:
+      - __call__(texts) -> List[List[float]]
+      - name: str  (the selected embedder's logical name, used for stamping/mismatch checks)
+      - dim: Optional[int] (embedding dimension when known; None if unknown)
 
     Behavior:
       - Loads .env so env[api_key_env] is available.
@@ -202,6 +205,9 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
                     raise RuntimeError("Embedding endpoint returned an unexpected response schema.")
             return out
 
+        # Expose logical name + optional dim for downstream stamping/mismatch checks
+        embed.name = entry.get("name") or model_name  # type: ignore[attr-defined]
+        embed.dim = None                               # type: ignore[attr-defined]
         return embed
 
     # Fallback: local sentence-transformers
@@ -217,6 +223,10 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
     local_name = entry.get("model") or entry.get("name") or "all-MiniLM-L6-v2"
     logger.info("embedder: local SentenceTransformer='{}'", local_name)
     st_model = SentenceTransformer(local_name)
+    try:
+        local_dim = int(getattr(st_model, "get_sentence_embedding_dimension", lambda: None)() or 0) or None
+    except Exception:
+        local_dim = None
 
     def _local_embed(texts: List[str]) -> List[List[float]]:
         if not texts:
@@ -224,4 +234,7 @@ def resolve_embedder(models_json_path: str, rag_cfg: Dict[str, Any]):
         # normalize_embeddings=True gives unit-length vectors (nice for cosine)
         return st_model.encode(texts, normalize_embeddings=True).tolist()
 
+    # Expose logical name + optional dim for downstream stamping/mismatch checks
+    _local_embed.name = entry.get("name") or local_name  # type: ignore[attr-defined]
+    _local_embed.dim = local_dim                         # type: ignore[attr-defined]
     return _local_embed

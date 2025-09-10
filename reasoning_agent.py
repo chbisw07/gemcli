@@ -11,9 +11,26 @@ from loguru import logger
 from agent import Agent
 from models import LLMModel
 from tools.registry import ToolRegistry
+from config_home import project_rag_json
 
 # NEW: central router + canonical tool specs/helpers
-from indexing.router import route_query
+from indexing.router import route_query, compose_agent_system_prompt
+# Try to import the Agent+RAG system prompt composer; fall back to a local template if not present
+try:
+    from indexing.router import compose_agent_system_prompt, COV_MIN  # project-level router.py
+except Exception:  # pragma: no cover
+    compose_agent_system_prompt = None  # type: ignore
+    COV_MIN = 4
+    _AGENT_RAG_SYS_PROMPT = """You are an Educational Agent. Your job is to (1) understand the user’s task,
+(2) fetch supporting material with RAG, (3) produce a clean, study-ready output.
+
+Rules:
+- Prefer RAG. If RAG returns fewer than {COV_MIN} passages or low scores, expand queries; if still weak, use web tools.
+- Math: use \\( inline \\) and \\[ display \\]. Do not use $…$.
+- Cite sources inline as [S1], [S2] and include a “Sources” section mapping these tags.
+- When user asks for questions: include “Problems” then “Solutions” (if requested). Respect requested counts, difficulty, subject/chapter filters.
+- Never invent facts; if not found, say “Not found” and still produce practice items (clearly marked).
+"""
 from tools.tool_schema import (
     TOOL_SPECS,
     normalize_args,
@@ -44,10 +61,19 @@ class ReasoningAgent(Agent):
         super().__init__(model, tools, enable_tools)
         logger.info("ReasoningAgent (router-first) initialized: tools_enabled={}", enable_tools)
         self._last_router: Dict[str, Any] = {}
+        self.system_override: str = ""
 
     # ---------------- public: router info for UI ----------------
     def router_info(self) -> Dict[str, Any]:
         return dict(self._last_router or {})
+
+
+    def set_system_override(self, text: str) -> None:
+        """Set a user-provided system prompt addendum (from UI)."""
+        try:
+            self.system_override = (text or "").strip()
+        except Exception:
+            self.system_override = ""
 
     # ---------------- routing + planning ----------------
 
@@ -104,35 +130,40 @@ class ReasoningAgent(Agent):
             if w not in queries: queries.append(w)
         return queries[:max_terms]
 
-    def _route_and_seed(self, prompt: str) -> Tuple[str, Dict[str, Any], Dict[str, float]]:
+    def _route_and_seed(self, prompt: str, rag_on: bool = True) -> Tuple[str, Dict[str, Any], Dict[str, float]]:
         """
         Use the centralized router to decide a route and fetch initial chunks.
         Returns (route, rag_result, scores).
         """
-        try:
-            info = route_query(project_root=str(self.tools.root), query=prompt)
-        except Exception as e:
-            logger.warning("router route_query failed: {}", e)
-            # Prefer hybrid so code tools are available even if routing hiccups
-            info = {"route": "hybrid", "scores": {"code": 0, "document": 0, "tabular": 0}, "top_k": 0, "chunks": []}
+        # When RAG is OFF, skip router+retriever entirely.
+        if not rag_on:
+            info = {"route": "direct", "scores": {"code": 0, "document": 0, "tabular": 0}, "top_k": 0, "chunks": []}
+        else:
+            try:
+                info = route_query(project_root=str(self.tools.root), query=prompt)
+            except Exception as e:
+                logger.warning("router route_query failed: {}", e)
+                # Prefer hybrid so code tools are available even if routing hiccups
+                info = {"route": "hybrid", "scores": {"code": 0, "document": 0, "tabular": 0}, "top_k": 0, "chunks": []}
 
         self._last_router = {
             "route": info.get("route"),
             "scores": info.get("scores"),
             "top_k": info.get("top_k"),
             "prompt": prompt,  # keep to mine filenames later
+            "auto_relaxed": info.get("auto_relaxed"),
         }
         rag = {"chunks": info.get("chunks") or [], "top_k": info.get("top_k")}
         logger.info("router: route={} scores={} top_k={}", self._last_router["route"], self._last_router["scores"], rag["top_k"])
         return self._last_router["route"], rag, self._last_router["scores"]
 
-    def analyze_and_plan(self, query: str) -> List[Dict[str, Any]]:
+    def analyze_and_plan(self, query: str, *, rag_on: bool = True) -> List[Dict[str, Any]]:
         """
         Build a *small*, deterministic plan (no LLM planning).
         Steps are later filtered by a per-route allowlist.
         Now: early broad-but-scoped RAG, then focused RAG sub-queries, then (for code/hybrid) call-graph → _answer.
         """
-        route, _rag, _scores = self._route_and_seed(query)
+        route, _rag, _scores = self._route_and_seed(query, rag_on=rag_on)
 
         # ---- CHART SHORT-CIRCUIT: route chart prompts straight to chart tools ----
         low = (query or "").lower()
@@ -201,22 +232,23 @@ class ReasoningAgent(Agent):
         
         plan: List[Dict[str, Any]] = []
 
-        # Early broad-but-scoped retrieval to prime good hits/caching
-        plan.append({
-            "tool": "rag_retrieve",
-            "args": {"query": query, "top_k": 12, "enable_filename_boost": True},
-            "description": "Broad retrieval for residual gaps (scoped)",
-            "critical": False,
-        })
-
-        # Focused RAG sub-queries (function/file oriented)
-        for sub in self._keywordize(query, max_terms=8):
+        if rag_on:
+            # Early broad-but-scoped retrieval to prime good hits/caching
             plan.append({
                 "tool": "rag_retrieve",
-                "args": {"query": sub, "top_k": 8, "enable_filename_boost": True},
-                "description": "Focused retrieval from sub-query",
+                "args": {"query": query, "top_k": 12, "enable_filename_boost": True},
+                "description": "Broad retrieval for residual gaps (scoped)",
                 "critical": False,
             })
+
+            # Focused RAG sub-queries (function/file oriented)
+            for sub in self._keywordize(query, max_terms=8):
+                plan.append({
+                    "tool": "rag_retrieve",
+                    "args": {"query": sub, "top_k": 8, "enable_filename_boost": True},
+                    "description": "Focused retrieval from sub-query",
+                    "critical": False,
+                })
 
         # Extract function-like targets for call-graph & code search signals
         func_targets: List[str] = []
@@ -357,7 +389,7 @@ class ReasoningAgent(Agent):
     def _looks_like_placeholder(self, val: Any) -> bool:
         return looks_like_placeholder(val)
 
-    def _synthesize_answer(self, prompt: str, last_by_tool: Dict[str, Any]) -> str:
+    def _synthesize_answer(self, prompt: str, last_by_tool: Dict[str, Any], system_override: Optional[str] = None, rag_on: bool = True) -> str:
         """
         Final model call using whatever context we have gathered.
         Builds a compact, auditable context block:
@@ -396,7 +428,8 @@ class ReasoningAgent(Agent):
 
         # -------- Collect RAG evidence (across multiple rag steps; dedupe by id) --------
         rag = last_by_tool.get("rag_retrieve") or {}
-        chunks = list(rag.get("chunks") or [])
+        chunks = [] if not rag_on else list(rag.get("chunks") or [])
+        total_chunks = len(chunks)
         # some executors keep only last step; in ours we already merge — keep defensive anyway
         seen_ids, evidence_blocks = set(), []
         for c in chunks[:128]:  # hard cap to avoid giant prompts
@@ -464,7 +497,7 @@ class ReasoningAgent(Agent):
         context_sections = []
         if artifacts_section:
             context_sections.append(artifacts_section)
-        if rag_context:
+        if rag_on and rag_context:
             context_sections.append("### RAG evidence\n" + rag_context)
         if code_hits_section:
             context_sections.append("### Code search hits\n" + code_hits_section)
@@ -472,20 +505,56 @@ class ReasoningAgent(Agent):
             context_sections.append("### Call graph\n" + callgraph_section)
 
         context = ("\n\n".join(context_sections)).strip()
-        system_msg = (
-            "You are a precise code/doc assistant.\n"
-            "Use the provided EVIDENCE only; when citing, rely on the bracket headers already shown "
-            "([file Ls–Le score=…] or '## path:line'). Keep changes minimal and concrete."
-        )
-        user_msg = (
-            f"QUESTION:\n{prompt}\n\n"
-            f"EVIDENCE:\n{context if context else '(no retrieved context)'}\n\n"
-            "INSTRUCTIONS:\n"
-            "- Be concise and specific.\n"
-            "- Prefer exact code citations from the headers above over paraphrase.\n"
-            "- When proposing code changes, include filenames and unified diff hunks.\n"
-            "- If the evidence is insufficient for a claim, say so and list what extra you would need."
-        )
+        # -------- Educational Agent+RAG system prompt (with graceful fallback) --------
+        # If a composer is available (router.compose_agent_system_prompt), use it.
+        # Otherwise, use a local educational template + the previous safety rails.
+        override = (system_override or self._system_override or self.system_override)
+        if compose_agent_system_prompt:
+            system_msg = compose_agent_system_prompt(system_override=override, cov_min=COV_MIN)
+        else:
+            system_msg = _AGENT_RAG_SYS_PROMPT.format(COV_MIN=COV_MIN).strip()
+            if override and override.strip():
+                system_msg += "\n\n" + override.strip()
+            # keep the existing evidence-usage guardrails as a suffix (only if RAG is ON)
+            if rag_on:
+                system_msg += (
+                    "\n\nUse the provided EVIDENCE only; when citing, rely on the bracket headers already shown "
+                    "([file Ls–Le score=…] or '## path:line'). Keep changes minimal and concrete."
+                )
+        # If RAG is sparse, transparently allow generative fill to meet the user's request.
+        if rag_on and total_chunks < 10:
+            system_msg += (
+                "\n\n[Note] Retrieved evidence is sparse; if citations are insufficient, "
+                "proceed to generate the requested output using domain knowledge and clear assumptions. "
+                "Be transparent about any gaps and prefer grounding in the snippets that were found."
+            )
+        # Surface router auto-relax info (if any) to the model as context
+        if rag_on:
+            try:
+                ar = self._last_router.get("auto_relaxed")
+                if ar:
+                    system_msg += "\n(Info: retrieval threshold was auto-relaxed to increase coverage.)"
+            except Exception:
+                pass
+        if rag_on:
+            user_msg = (
+                f"QUESTION:\n{prompt}\n\n"
+                f"EVIDENCE:\n{context if context else '(no retrieved context)'}\n\n"
+                "INSTRUCTIONS:\n"
+                "- Be concise and specific.\n"
+                "- Prefer exact code citations from the headers above over paraphrase.\n"
+                "- When proposing code changes, include filenames and unified diff hunks.\n"
+                "- If the evidence is insufficient for a claim, say so and list what extra you would need."
+            )
+        else:
+            # RAG off: no evidence block; ask for a direct, well-structured answer.
+            user_msg = (
+                f"QUESTION:\n{prompt}\n\n"
+                "INSTRUCTIONS:\n"
+                "- Produce a complete, well-structured answer.\n"
+                "- Do not include a Supporting Evidence section.\n"
+                "- If assumptions are required, state them briefly."
+            )
         try:
             resp = self.adapter.chat([
                 {"role": "system", "content": system_msg},
@@ -544,7 +613,7 @@ class ReasoningAgent(Agent):
                 out[dst] = out.pop(src)
         return out
 
-    def execute_plan(self, plan: List[Dict[str, Any]], max_iters: int = 10, analysis_only: bool = False, progress_cb=None) -> str:
+    def execute_plan(self, plan: List[Dict[str, Any]], max_iters: int = 10, analysis_only: bool = False, progress_cb=None, rag_on: bool = True) -> str:
         results: List[Dict[str, Any]] = []
         last_by_tool: Dict[str, Any] = {}
         logger.info("execute_plan: steps={} analysis_only={}", len(plan or []), analysis_only)
@@ -574,6 +643,12 @@ class ReasoningAgent(Agent):
             args = dict(step.get("args") or {})
             desc = step.get("description") or ""
             critical = bool(step.get("critical", True))
+
+            # Hard guard: with RAG OFF, never execute rag tools even if a plan slipped one in.
+            if not rag_on and tool in ("rag_retrieve", "route_query"):
+                results.append({"step": idx, "tool": tool, "description": desc, "error": "RAG is disabled; skipping retrieval step.", "success": False})
+                _emit("step_done", step=idx, tool=tool, ok=False, error="RAG disabled")
+                continue
 
             # Enforce tool allowlist (virtual tool _answer is always allowed).
             # Keep call-graph in code/hybrid even if not listed in allowlist.
@@ -616,7 +691,9 @@ class ReasoningAgent(Agent):
             # Virtual tool: _answer
             if tool == "_answer":
                 _emit("synthesis_start")
-                out_text = self._synthesize_answer(fixed_args.get("prompt", ""), last_by_tool)
+                out_text = self._synthesize_answer(
+                    fixed_args.get("prompt", ""), last_by_tool, system_override=self._system_override, rag_on=rag_on
+                )
                 rec = {"step": idx, "tool": tool, "description": desc, "args": fixed_args, "result": out_text, "success": True}
                 results.append(rec)
                 last_by_tool[tool] = rec
@@ -630,8 +707,12 @@ class ReasoningAgent(Agent):
                     if fixed_args.get("project_root") in (None,"",".","default"):
                         fixed_args["project_root"] = str(getattr(self.tools, "root", ""))
                     if fixed_args.get("rag_path") in (None,"",".","default"):
-                        from config_home import GLOBAL_RAG_PATH
-                        fixed_args["rag_path"] = str(GLOBAL_RAG_PATH)
+                        # Use the authoritative per-project rag.json (not the app template)
+                        try:
+                            fixed_args["rag_path"] = str(project_rag_json(project_root=str(getattr(self.tools, "root", ""))))
+                        except Exception:
+                            # leave unset: retriever will infer from project_root
+                            pass
                     # Gentler retrieval threshold; the index + query models mismatch slightly
                     if tool == "rag_retrieve" and fixed_args.get("min_score") in (None, "", 0):
                         fixed_args["min_score"] = 0.35
@@ -725,6 +806,12 @@ class ReasoningAgent(Agent):
 
     # ---------------- entrypoint ----------------
 
-    def ask_with_planning(self, query: str, max_iters: int = 10, analysis_only: bool = False) -> str:
-        plan = self.analyze_and_plan(query)
-        return self.execute_plan(plan, max_iters=max_iters, analysis_only=analysis_only)
+    def ask_with_planning(self, query: str, max_iters: int = 10, analysis_only: bool = False,
+                          system_override: Optional[str] = None, rag_on: bool = True) -> str:
+        """
+        Entry point for Agent Plan & Run.
+        `system_override` lets the UI pass a user/system specialization for the educational agent.
+        """
+        self._system_override = (system_override or "").strip() or None
+        plan = self.analyze_and_plan(query, rag_on=rag_on)
+        return self.execute_plan(plan, max_iters=max_iters, analysis_only=analysis_only, rag_on=rag_on)
