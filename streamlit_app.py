@@ -1133,8 +1133,6 @@ def _export_chats_to_pdf_wkhtml(project_name: str, rows: List[Dict[str, Any]], *
 
 def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = True) -> None:
     chats = list_chats(project_name, **flt)
-    if not chats:
-        return
     # Wrap history area so we can scope CSS reliably
     st.markdown('<div class="hist-root">', unsafe_allow_html=True)
 
@@ -1149,39 +1147,32 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     # Always show these extra columns
     visible_extra_cols = ["mode", "model", "embedder"]
 
-    # ---------- Build DF first so we know which IDs are visible ----------
-    df = _history_dataframe(project_name, flt=flt, show_cols=visible_extra_cols)
-    displayed_ids = df["id"].tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
-
-    # ---------- Header row: title (left) + checkboxes (right, horizontal) ----------
+    # We will build DF **after** the toolbar (but before exports), to avoid scoping issues
+    # ---------- Header: title + compact toolbar ----------
+    st.markdown("### History")
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
-    # Add Copy + Delete beside Select All / Clear
-    h1, h2, h3, h4, h5, h6, h7 = st.columns([5, 2, 2, 1, 1, 1, 1], gap="small")
-    with h1:
-        st.markdown("### History")
-    with h2:
-        st.checkbox(
-            "Save to project (exports/)",
-            value=st.session_state.get("save_exports_to_project", True),
-            key="save_exports_to_project",
-        )
-    with h3:
-        st.checkbox(
-            "Inject KaTeX (wkhtmltopdf)",
-            value=st.session_state.get("inject_katex", False),
-            key="inject_katex",
-        )
-    # Small, right-aligned selection controls (top row)
-    st.session_state.setdefault("hist_view_ids", set())    
-    with h4:
-        if st.button("Select All", use_container_width=True, key="hist_select_all_top"):
-            st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
-            _rerun()
-    with h5:
-        if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
-            st.session_state["hist_view_ids"] = set()
-            _rerun()
-    # ---- Bulk Copy (selected rows → clipboard) ----
+    # Left group: two checkboxes. Right group: 4 aligned buttons.
+    # NOTE: we define the copy-payload helper *before* any buttons that use it,
+    # so Streamlit's single-pass execution never hits an undefined name.
+    #
+    left_grp, right_grp = st.columns([7, 5], gap="small")
+    with left_grp:
+        cb1, cb2 = st.columns([1, 1], gap="small")
+        with cb1:
+            st.checkbox(
+                "Save to project (exports/)",
+                value=st.session_state.get("save_exports_to_project", True),
+                key="save_exports_to_project",
+            )
+        with cb2:
+            st.checkbox(
+                "Inject KaTeX (wkhtmltopdf)",
+                value=st.session_state.get("inject_katex", False),
+                key="inject_katex",
+            )
+    st.session_state.setdefault("hist_view_ids", set())
+    # ---- Helper for bulk copy payload (now defined before button usage) ----
+
     def _compose_copy_payload(rows: list[dict]) -> str:
         parts: list[str] = []
         for r in rows:
@@ -1193,40 +1184,73 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             parts.append("Assistant:\n" + (r.get("answer") or "").rstrip())
             parts.append("\n---\n")
         return "\n".join(parts).strip()
-    with h6:
-        if st.button("Copy", use_container_width=True, key="hist_copy_bulk"):
-            sel_ids = list(st.session_state.get("hist_view_ids", set()))
-            sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
-            if not sel_rows:
-                st.toast("Select at least one row to copy.", icon="⚠️")
-            else:
-                payload = _compose_copy_payload(sel_rows)
-                b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-                # Immediate copy via tiny HTML/JS snippet
-                components.html(
-                    f"<script>navigator.clipboard.writeText(atob('{b64}'));</script>",
-                    height=0,
-                )
-                st.toast(f"Copied {len(sel_rows)} chat(s) to clipboard.", icon="✅")
-    # ---- Bulk Delete (selected rows) ----
-    with h7:
-        if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
-            sel_ids = list(st.session_state.get("hist_view_ids", set()))
-            if not sel_ids:
-                st.toast("Select at least one row to delete.", icon="⚠️")
-            else:
-                try:
-                    for _cid in sel_ids:
-                        delete_chat(project_name, int(_cid))
-                    st.session_state["hist_view_ids"] = set()
-                    st.toast(f"Deleted {len(sel_ids)} chat(s).", icon="🗑️")
-                    _rerun()
-                except Exception as e:
-                    st.error(f"Delete failed: {e}")
-    st.markdown('</div>', unsafe_allow_html=True)
+    with right_grp:
+        bsel, bclr, bcpy, bdel = st.columns([1.25, 1, 1, 1], gap="small")
+        # NOTE: displayed_ids will be set immediately after we render the table;
+        # until then, keep a fallback empty list to avoid NameError on first paint.
+        with bsel:
+            if st.button("Select all", use_container_width=True, key="hist_select_all_top"):
+                ids = st.session_state.get("_hist_last_displayed_ids", [])
+                st.session_state["hist_view_ids"] = set(map(int, ids))
+                _rerun()
+        with bclr:
+            if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
+                st.session_state["hist_view_ids"] = set()
+                _rerun()
+        # ---- Bulk Copy (selected rows → clipboard) ----
+        with bcpy:
+            if st.button("Copy", use_container_width=True, key="hist_copy_bulk"):
+                sel_ids = list(st.session_state.get("hist_view_ids", set()))
+                sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
+                if not sel_rows:
+                    st.toast("Select at least one row to copy.", icon="⚠️")
+                else:
+                    payload = _compose_copy_payload(sel_rows)
+                    b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+                    components.html(
+                        f"<script>navigator.clipboard.writeText(atob('{b64}'));</script>",
+                        height=0,
+                    )
+                    st.toast(f"Copied {len(sel_rows)} chat(s) to clipboard.", icon="✅")
+        # ---- Bulk Delete (selected rows) ----
+        with bdel:
+            if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
+                sel_ids = list(st.session_state.get("hist_view_ids", set()))
+                if not sel_ids:
+                    st.toast("Select at least one row to delete.", icon="⚠️")
+                else:
+                    try:
+                        for _cid in sel_ids:
+                            delete_chat(project_name, int(_cid))
+                        st.session_state["hist_view_ids"] = set()
+                        st.toast(f"Deleted {len(sel_ids)} chat(s).", icon="🗑️")
+                        _rerun()
+                    except Exception as e:
+                        st.error(f"Delete failed: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)  # end .toolbar
 
-    # ---------- Data table ----------
-    # Lock all non-boolean columns; only 'view' remains editable
+    # ---------- Build DF (ALWAYS render table right after toolbar) ----------
+    df = _history_dataframe(project_name, flt=flt, show_cols=visible_extra_cols)
+    # Ensure the editor renders even with no rows by keeping the schema stable
+    if df.empty:
+        # keep only the known, desired columns (in the same order)
+        expected_cols = (
+            ["id"]
+            + [c for c in visible_extra_cols if c in ["mode", "model", "embedder"]]
+            + ["prompt", "answer", "view"]
+        )
+        # create any missing columns with appropriate dtypes
+        for col in expected_cols:
+            if col not in df.columns:
+                # bool dtype for 'view', object for others keeps st.data_editor happy
+                df[col] = pd.Series(dtype=("bool" if col == "view" else "object"))
+        # keep column order tidy
+        df = df[expected_cols]
+    displayed_ids = df["id"].tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
+    # cache for the "Select all" button on first paint
+    st.session_state["_hist_last_displayed_ids"] = displayed_ids
+
+    # Lock non-boolean columns; only 'view' is editable
     disabled_cols = ["id","prompt","answer"] + [c for c in ["mode","model","embedder"] if c in df.columns]
     colcfg: Dict[str, Any] = {
         "id": st.column_config.NumberColumn("id", help="Chat ID", width="small", format="%d"),
@@ -1240,8 +1264,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         colcfg["model"] = st.column_config.TextColumn("model", width="small", help="LLM model")
     if "embedder" in df.columns:
         colcfg["embedder"] = st.column_config.TextColumn("embedder", width="small", help="Embedding model")
-
-    # enforce column order to match the screenshot (id, mode, model, embedder, prompt, answer, view)
+    # desired order
     order_cols = [c for c in ["id","mode","model","embedder","prompt","answer","view"] if c in df.columns]
 
     df_ret = st.data_editor(
@@ -1249,12 +1272,13 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         hide_index=True,
         num_rows="fixed",
         use_container_width=True,
-        disabled=disabled_cols,  # only 'view' is editable
+        disabled=disabled_cols,
         column_config=colcfg,
         column_order=order_cols,
         key="history_table",
     )
     _update_history_selection_from_editor(df_ret)
+
 
     # ---------- Exports + downloads ----------
     if manager_ui:
@@ -1518,6 +1542,8 @@ def _inject_css():
           padding:.25rem .6rem;
           font-size:.85rem;
           border-radius:8px;
+          white-space: nowrap;          /* avoid two-line button labels */
+          min-width: 96px;              /* gives 'Select all' a bit more room */
         }
         /* Smaller export buttons row */
         .hist-root .exports .stButton>button{
