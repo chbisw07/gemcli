@@ -1425,6 +1425,17 @@ def _inject_css():
           background: transparent !important;
           margin-bottom: .35rem !important; /* tighter gap to the next heading */
         }
+        /* -------- History view polish -------- */
+        .hist-root [data-testid="stDataFrame"] *{
+          font-size: 15px;               /* larger grid text */
+        }
+        .hist-root [data-testid="stDataFrame"] th,
+        .hist-root [data-testid="stDataFrame"] td{
+          padding: 10px 12px !important; /* comfy row height */
+        }
+        .hist-root .card{
+          margin-top:.75rem;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1926,6 +1937,10 @@ for key, default in [
     if key not in st.session_state:
         st.session_state[key] = default
 
+# Defaults so History tab can render without Chat widgets
+prompt: str = ""
+submit: bool = False
+
 st.write("")
 top = st.container()
 with top:
@@ -1965,69 +1980,6 @@ with top:
                 "Complex planning", value=False, disabled=(mode != "Agent Plan & Run")
             )
 
-# Prompt + single primary action
-st.markdown('<div class="card prompt-card">', unsafe_allow_html=True)
-prompt = st.text_area("input_prompt", height=140, placeholder="Type your instruction…")
-b1, b2, _ = st.columns([1, 1, 6])
-with b1:
-    main_label = "Stop" if st.session_state.get("running") else "Submit"
-    action_clicked = st.button(main_label, type="primary", use_container_width=True, key="submit_stop_btn")
-with b2:
-    clear = st.button("Clear", use_container_width=True, key="btn_clear_prompt")
-st.markdown("</div>", unsafe_allow_html=True)
-
-if clear:
-    st.session_state["progress_rows"] = []
-    st.session_state["last_tools_used"] = set()
-    st.session_state["show_chart_gallery"] = False
-    _rerun()
-
-# Interpret action button
-if action_clicked and st.session_state.get("running"):
-    st.session_state["cancel"] = True
-    st.toast("Stopping…", icon="🛑")
-    submit = False
-else:
-    submit = bool(action_clicked and not st.session_state.get("running"))
-
-# ---------------------- System prompt controls (below user prompt) ----------------------
-# Per-project persistence: read the current project's ui_settings.json
-def _current_project_name_and_paths():
-    _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
-    name = _g.get("project_name") or Path.cwd().name
-    return name, project_paths(name)
-
-proj_name_for_ui, _paths_for_ui = _current_project_name_and_paths()
-_ui_for_ui = _read_json(_paths_for_ui["ui_settings"])
-
-# simple separator (no boxed card)
-st.divider()
-
-# Initialize session_state once from disk, then drive the widgets from it.
-if "sys_prompt_on" not in st.session_state:
-    st.session_state["sys_prompt_on"] = bool(_ui_for_ui.get("sys_prompt_on", False))
-if "sys_prompt_text" not in st.session_state:
-    st.session_state["sys_prompt_text"] = _ui_for_ui.get("sys_prompt_text", "")
-
-# Bind widgets directly to session_state (no `value=` to avoid double-click/flicker)
-st.toggle(
-    "System prompt",
-    key="sys_prompt_on",
-    help="When ON, the text below is sent as a system message (merged with internal system instructions).",
-)
-if st.session_state["sys_prompt_on"]:
-    st.text_area(
-        "system_prompt",
-        key="sys_prompt_text",
-        height=72,  # ~3 lines
-        placeholder="e.g., Be concise; answer strictly with steps; prefer KaTeX for math…",
-    )
-
-# Persist per-project immediately from session_state
-_ui_for_ui["sys_prompt_on"] = bool(st.session_state["sys_prompt_on"])
-_ui_for_ui["sys_prompt_text"] = st.session_state.get("sys_prompt_text", "")
-_write_json(_paths_for_ui["ui_settings"], _ui_for_ui)
-
 # Compose the effective system prompt each run
 def _compose_system_prompt(ui_dict: dict, mode_label: str) -> str:
     # Internal baseline (dynamic bits kept minimal & safe)
@@ -2050,11 +2002,67 @@ def _prefix_with_system(user_prompt: str, system_text: str) -> str:
     return f"[SYSTEM]\n{system_text.strip()}\n\n[USER]\n{user_prompt}"
 
 
-# Tabs: keep chat UI as-is in “Chat”, move history into its own tab
+# Tabs: move all Chat widgets into Chat tab so History is clutter-free
 chat_tab, history_tab = st.tabs(["Chat", "History"])
 
-# --- Chat tab: current response UI as before ---
 with chat_tab:
+    # Prompt + single primary action (Chat-only)
+    st.markdown('<div class="card prompt-card">', unsafe_allow_html=True)
+    prompt = st.text_area("input_prompt", height=140, placeholder="Type your instruction…")
+    b1, b2, _ = st.columns([1, 1, 6])
+    with b1:
+        main_label = "Stop" if st.session_state.get("running") else "Submit"
+        action_clicked = st.button(main_label, type="primary", use_container_width=True, key="submit_stop_btn")
+    with b2:
+        clear = st.button("Clear", use_container_width=True, key="btn_clear_prompt")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if clear:
+        st.session_state["progress_rows"] = []
+        st.session_state["last_tools_used"] = set()
+        st.session_state["show_chart_gallery"] = False
+        _rerun()
+
+    # Interpret action button
+    if action_clicked and st.session_state.get("running"):
+        st.session_state["cancel"] = True
+        st.toast("Stopping…", icon="🛑")
+        submit = False
+    else:
+        submit = bool(action_clicked and not st.session_state.get("running"))
+
+    # ---- System prompt (Chat-only) ----
+    # Per-project persistence: read the current project's ui_settings.json
+    def _current_project_name_and_paths():
+        _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
+        name = _g.get("project_name") or Path.cwd().name
+        return name, project_paths(name)
+    proj_name_for_ui, _paths_for_ui = _current_project_name_and_paths()
+    _ui_for_ui = _read_json(_paths_for_ui["ui_settings"])
+
+    st.divider()
+    if "sys_prompt_on" not in st.session_state:
+        st.session_state["sys_prompt_on"] = bool(_ui_for_ui.get("sys_prompt_on", False))
+    if "sys_prompt_text" not in st.session_state:
+        st.session_state["sys_prompt_text"] = _ui_for_ui.get("sys_prompt_text", "")
+    st.toggle(
+        "System prompt",
+        key="sys_prompt_on",
+        help="When ON, the text below is sent as a system message (merged with internal system instructions).",
+    )
+    if st.session_state["sys_prompt_on"]:
+        st.text_area(
+            "system_prompt",
+            key="sys_prompt_text",
+            height=72,
+            placeholder="e.g., Be concise; answer strictly with steps; prefer KaTeX for math…",
+        )
+    # Persist per-project immediately from session_state
+    _ui_for_ui["sys_prompt_on"] = bool(st.session_state["sys_prompt_on"])
+    _ui_for_ui["sys_prompt_text"] = st.session_state.get("sys_prompt_text", "")
+    _write_json(_paths_for_ui["ui_settings"], _ui_for_ui)
+
+    # Response area (Chat-only)
     st.markdown("### Assistant Response")
     response_area = st.empty()
 

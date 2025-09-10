@@ -98,6 +98,54 @@
       "api_key_reqd": false,
       "tags": ["general", "large", "tools"],
       "group": ["free"]
+    },
+    {
+      "name": "gpt-4.1-mini",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1",
+      "temperature": 0.4,
+      "system_prompt": "You are a state-of-the-art code and reasoning assistant. Use all provided code, docs, and chat context to resolve ambiguity and explain concepts precisely. Clarify all references in your answers and use markdown for code or technical content.",
+      "max_context_tokens": 16384,
+      "api_key_reqd": true,
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["code", "chat", "tools", "fast", "long-context"],
+      "group": ["paid"]
+    },
+    {
+      "name": "gpt-4o-mini",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1",
+      "temperature": 0.4,
+      "system_prompt": "You are a state-of-the-art code and reasoning assistant. Use all provided code, docs, and chat context to resolve ambiguity and explain concepts precisely. Clarify all references in your answers and use markdown for code or technical content.",
+      "max_context_tokens": 16384,
+      "api_key_reqd": true,
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["code", "chat", "tools", "fast", "long-context"],
+      "group": ["paid"]
+    },
+    {
+      "name": "gpt-5-mini",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1",
+      "temperature": 0.4,
+      "system_prompt": "You are a state-of-the-art code and reasoning assistant. Use all provided code, docs, and chat context to resolve ambiguity and explain concepts precisely. Clarify all references in your answers and use markdown for code or technical content.",
+      "max_context_tokens": 16384,
+      "api_key_reqd": true,
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["code", "chat", "tools", "long-context"],
+      "group": ["paid"]
+    },
+    {
+      "name": "gpt-5",
+      "provider": "openai",
+      "endpoint": "https://api.openai.com/v1",
+      "temperature": 0.4,
+      "system_prompt": "You are a state-of-the-art code and reasoning assistant. Use all provided code, docs, and chat context to resolve ambiguity and explain concepts precisely. Clarify all references in your answers and use markdown for code or technical content.",
+      "max_context_tokens": 16384,
+      "api_key_reqd": true,
+      "api_key_env": "OPENAI_API_KEY",
+      "tags": ["code", "chat", "tools", "long-context"],
+      "group": ["paid"]
     }
   ],
   "embedding_models": [
