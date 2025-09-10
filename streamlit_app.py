@@ -1126,7 +1126,8 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     displayed_ids = df["id"].tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
 
     # ---------- Header row: title (left) + checkboxes (right, horizontal) ----------
-    h1, h2, h3 = st.columns([5, 2, 2], gap="small")
+    st.markdown('<div class="toolbar">', unsafe_allow_html=True)
+    h1, h2, h3, h4, h5 = st.columns([5, 2, 2, 1, 1], gap="small")
     with h1:
         st.markdown("### History")
     with h2:
@@ -1141,6 +1142,16 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             value=st.session_state.get("inject_katex", False),
             key="inject_katex",
         )
+    # Small, right-aligned selection controls (top row)
+    with h4:
+        if st.button("Select All", use_container_width=True, key="hist_select_all_top"):
+            st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
+            _rerun()
+    with h5:
+        if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
+            st.session_state["hist_view_ids"] = set()
+            _rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------- Data table ----------
     df_ret = st.data_editor(
@@ -1165,24 +1176,14 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     )
     _update_history_selection_from_editor(df_ret)
 
-    # ---------- Selection row (AFTER table): only Select All / Clear ----------
+    # ---------- Exports + downloads ----------
     if manager_ui:
         st.session_state.setdefault("hist_view_ids", set())
-        r1c1, r1c2 = st.columns(2, gap="small")
-        with r1c1:
-            if st.button("Select All", use_container_width=True, key="hist_select_all"):
-                st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
-                _rerun()
-        with r1c2:
-            if st.button("Clear", use_container_width=True, key="hist_clear_selection"):
-                st.session_state["hist_view_ids"] = set()
-                _rerun()
-
-        # --- Exports + downloads ---
         sel_ids = list(st.session_state.get("hist_view_ids", set()))
         sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
         disabled = (len(sel_rows) == 0)
         # Columns: MD | PDF (Pandoc) | PDF (wkhtml) | ⬇ .md | ⬇ PDF
+        st.markdown('<div class="exports">', unsafe_allow_html=True)
         bcol = st.columns(5, gap="small")
         with bcol[0]:
             if st.button("Export .md", disabled=disabled, use_container_width=True, key="btn_export_md"):
@@ -1192,7 +1193,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
                     st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
                     st.success("Markdown prepared")
-                    if save_to_project:
+                    if bool(st.session_state.get("save_exports_to_project", True)):
                         export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
                         export_dir.mkdir(parents=True, exist_ok=True)
                         (export_dir/st.session_state["last_export_md_name"]).write_bytes(md_bytes)
@@ -1208,7 +1209,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
                     st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
                     st.success("PDF prepared")
-                    if save_to_project:
+                    if bool(st.session_state.get("save_exports_to_project", True)):
                         export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
                         export_dir.mkdir(parents=True, exist_ok=True)
                         (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
@@ -1227,7 +1228,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
                     st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
                     st.success("PDF prepared (wkhtmltopdf)")
-                    if save_to_project:
+                    if bool(st.session_state.get("save_exports_to_project", True)):
                         export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
                         export_dir.mkdir(parents=True, exist_ok=True)
                         (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
@@ -1251,6 +1252,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                                    mime="application/pdf",
                                    use_container_width=True,
                                    key="dl_hist_pdf")
+        st.markdown('</div>', unsafe_allow_html=True)  # close .exports
 
     # ---------- Rows as expanders ----------
     for row in chats:
@@ -1437,6 +1439,20 @@ def _inject_css():
         }
         .hist-root .card{
           margin-top:.75rem;
+        }
+        /* History header toolbar + smaller buttons */
+        .hist-root .toolbar .stButton>button{
+          height:32px;
+          padding:.25rem .6rem;
+          font-size:.85rem;
+          border-radius:8px;
+        }
+        /* Smaller export buttons row */
+        .hist-root .exports .stButton>button{
+          height:32px;
+          padding:.25rem .6rem;
+          font-size:.85rem;
+          border-radius:8px;
         }
         </style>
         """,
