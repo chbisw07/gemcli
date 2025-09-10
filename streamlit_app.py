@@ -1174,6 +1174,10 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     # ---- Helper for bulk copy payload (now defined before button usage) ----
 
     def _compose_copy_payload(rows: list[dict]) -> str:
+        """
+        Build the concatenated text that goes to the clipboard for the selected
+        chats. Keeps formatting readable and UTF-8 clean.
+        """
         parts: list[str] = []
         for r in rows:
             cid = r.get("id")
@@ -1184,6 +1188,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             parts.append("Assistant:\n" + (r.get("answer") or "").rstrip())
             parts.append("\n---\n")
         return "\n".join(parts).strip()
+
     with right_grp:
         bsel, bclr, bcpy, bdel = st.columns([1.25, 1, 1, 1], gap="small")
         # NOTE: displayed_ids will be set immediately after we render the table;
@@ -1199,19 +1204,87 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                 _rerun()
         # ---- Bulk Copy (selected rows → clipboard) ----
         with bcpy:
-            if st.button("Copy", use_container_width=True, key="hist_copy_bulk"):
-                sel_ids = list(st.session_state.get("hist_view_ids", set()))
-                sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
-                if not sel_rows:
-                    st.toast("Select at least one row to copy.", icon="⚠️")
-                else:
-                    payload = _compose_copy_payload(sel_rows)
-                    b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
-                    components.html(
-                        f"<script>navigator.clipboard.writeText(atob('{b64}'));</script>",
-                        height=0,
-                    )
-                    st.toast(f"Copied {len(sel_rows)} chat(s) to clipboard.", icon="✅")
+            # Build current selection and render a real button *inside* the iframe.
+            _sel_ids  = {str(i) for i in st.session_state.get("hist_view_ids", set())}
+            _sel_rows = [r for r in chats if str(r.get("id")) in _sel_ids]
+            _payload  = _compose_copy_payload(_sel_rows) if _sel_rows else ""
+            _b64      = base64.b64encode(_payload.encode("utf-8")).decode("ascii")
+            _disabled = "disabled" if not _sel_rows else ""
+            _tooltip  = f"Copy {len(_sel_rows)} selected chat(s)" if _sel_rows else "Copy selected chat(s)"
+            components.html(
+                f"""
+                <div style="width:100%">
+                  <button class="hist-copy-btn" title="{_tooltip}" {_disabled}
+                    onclick="(function(btn){{
+                      if (btn.hasAttribute('disabled')) return;
+                      const b64 = '{_b64}';
+                      function b64ToUtf8(s){{
+                        try {{
+                          const bin = atob(s);
+                          const bytes = new Uint8Array(bin.length);
+                          for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+                          return new TextDecoder('utf-8').decode(bytes);
+                        }} catch(e) {{
+                          try {{ return decodeURIComponent(escape(atob(s))); }}
+                          catch(_e) {{ return atob(s); }}
+                        }}
+                      }}
+                      const txt = b64ToUtf8(b64);
+                      function legacyCopy(t){{
+                        const ta=document.createElement('textarea');
+                        ta.value=t; ta.setAttribute('readonly','');
+                        ta.style.position='fixed'; ta.style.top='-1000px';
+                        document.body.appendChild(ta); ta.select();
+                        try{{ document.execCommand('copy'); }}catch(_){{
+                        }} document.body.removeChild(ta);
+                      }}
+                      const done = () => {{ btn.innerText='Copied!'; setTimeout(()=>{{btn.innerText='Copy';}}, 1200); }};
+                      if (navigator.clipboard && window.isSecureContext) {{
+                        navigator.clipboard.writeText(txt).then(done).catch(function(){{ legacyCopy(txt); done(); }});
+                      }} else {{
+                        legacyCopy(txt); done();
+                      }}
+                    }})(this)">
+                    Copy
+                  </button>
+                  <style>
+                    /* Make the iframe button visually match Streamlit toolbar buttons */
+                    :root {{
+                      --btn-border: #e2e8f0;
+                      --btn-bg: #ffffff;
+                      --btn-bg-hover: #f3f4f6;
+                    }}
+                    html, body {{
+                      margin:0; padding:0;
+                      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+                                   Arial, "Noto Sans", "Liberation Sans", "Apple Color Emoji",
+                                   "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
+                      font-size: 14px;
+                      line-height: 1.2;
+                    }}
+                    .hist-copy-btn {{
+                      display:inline-flex; align-items:center; justify-content:center;
+                      width:100%;
+                      height:36px;                 /* toolbar height */
+                      padding:.25rem .8rem;        /* toolbar padding */
+                      font-size:.85rem;
+                      border-radius:8px;
+                      border:1px solid var(--btn-border);
+                      background:var(--btn-bg);
+                      white-space:nowrap;
+                      box-sizing:border-box;
+                      cursor:pointer;
+                      transition: background .15s ease, transform .02s ease, opacity .15s ease;
+                    }}
+                    .hist-copy-btn:hover {{ background:var(--btn-bg-hover); }}
+                    .hist-copy-btn:active {{ transform: translateY(1px); }}
+                    .hist-copy-btn[disabled] {{ opacity:.5; cursor:not-allowed; }}
+                    .hist-copy-btn:focus {{ outline:none; box-shadow:none; }}
+                  </style>
+                </div>
+                """,
+                height=40,
+            )
         # ---- Bulk Delete (selected rows) ----
         with bdel:
             if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
