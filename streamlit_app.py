@@ -1941,45 +1941,6 @@ for key, default in [
 prompt: str = ""
 submit: bool = False
 
-st.write("")
-top = st.container()
-with top:
-    left, right = st.columns([3, 2], gap="large")
-    with left:
-        MODE_LABELS = ["Direct Chat", "LLM Tools", "Agent Plan & Run"]
-        mode = st.radio("Mode", MODE_LABELS, horizontal=True, index=0, key="mode_radio")
-    with right:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            _adapter = getattr(st.session_state.get("agent"), "adapter", None)
-            _has_stream = bool(getattr(_adapter, "chat_stream", None))
-            can_stream = (mode == "Direct Chat") and _has_stream
-            streaming = st.toggle(
-                "Streaming",
-                value=can_stream,
-                disabled=not can_stream,
-                help=(
-                    "Streaming is only available in Direct Chat"
-                    if mode != "Direct Chat"
-                    else ("Adapter does not support streaming" if not _has_stream else None)
-                ),
-            )
-            st.session_state["streaming_enabled"] = bool(streaming)
-        with col2:
-            # Default OFF; preserve prior choice if already set
-            # Label shortened to "RAG" with a minimal help tooltip explaining usage.
-            rag_on = st.toggle(
-                "RAG",
-                value=bool(st.session_state.get("rag_on", False)),
-                help="Use this project's indexed documents in answers. "
-                     "Set the Project name & root in the sidebar; indexing controls live there and enable when RAG is on."
-            )
-            st.session_state["rag_on"] = rag_on
-        with col3:
-            complex_planning = st.toggle(
-                "Complex planning", value=False, disabled=(mode != "Agent Plan & Run")
-            )
-
 # Compose the effective system prompt each run
 def _compose_system_prompt(ui_dict: dict, mode_label: str) -> str:
     # Internal baseline (dynamic bits kept minimal & safe)
@@ -2002,10 +1963,46 @@ def _prefix_with_system(user_prompt: str, system_text: str) -> str:
     return f"[SYSTEM]\n{system_text.strip()}\n\n[USER]\n{user_prompt}"
 
 
-# Tabs: move all Chat widgets into Chat tab so History is clutter-free
+# Tabs at the top; Chat holds all runtime controls, History stays clean
 chat_tab, history_tab = st.tabs(["Chat", "History"])
 
 with chat_tab:
+    # ----- Mode & run toggles (Chat-only) -----
+    mt_left, mt_right = st.columns([3, 2], gap="large")
+    with mt_left:
+        MODE_LABELS = ["Direct Chat", "LLM Tools", "Agent Plan & Run"]
+        st.radio("Mode", MODE_LABELS, horizontal=True, index=0, key="mode_radio")
+    with mt_right:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            _adapter = getattr(st.session_state.get("agent"), "adapter", None)
+            _has_stream = bool(getattr(_adapter, "chat_stream", None))
+            _mode_now = st.session_state.get("mode_radio", "Direct Chat")
+            can_stream = (_mode_now == "Direct Chat") and _has_stream
+            streaming = st.toggle(
+                "Streaming",
+                value=can_stream,
+                disabled=not can_stream,
+                help=("Streaming is only available in Direct Chat"
+                      if _mode_now != "Direct Chat"
+                      else ("Adapter does not support streaming" if not _has_stream else None)),
+            )
+            st.session_state["streaming_enabled"] = bool(streaming)
+        with col2:
+            rag_on = st.toggle(
+                "RAG",
+                value=bool(st.session_state.get("rag_on", False)),
+                help="Use this project's indexed documents in answers. Set project root & index in the sidebar."
+            )
+            st.session_state["rag_on"] = rag_on
+        with col3:
+            st.toggle(
+                "Complex planning",
+                value=bool(st.session_state.get("complex_planning", False)),
+                key="complex_planning",
+                disabled=(st.session_state.get("mode_radio", "Direct Chat") != "Agent Plan & Run"),
+            )
+
     # Prompt + single primary action (Chat-only)
     st.markdown('<div class="card prompt-card">', unsafe_allow_html=True)
     prompt = st.text_area("input_prompt", height=140, placeholder="Type your instruction…")
@@ -2065,6 +2062,9 @@ with chat_tab:
     # Response area (Chat-only)
     st.markdown("### Assistant Response")
     response_area = st.empty()
+
+# Resolve current mode for downstream logic (visible even outside Chat tab)
+mode = st.session_state.get("mode_radio", "Direct Chat")
 
 # --- transient conversation buffer (used when history is OFF) ---
 if "transient_turns" not in st.session_state:
@@ -2436,14 +2436,15 @@ if submit:
                                     "critical": False,
                                 }
                             )
-                    plan.append(
-                        {
-                            "tool": "rag_retrieve",
-                            "args": {"query": prompt, "top_k": 12},
-                            "description": "Broad retrieval for residual gaps",
-                            "critical": False,
-                        }
-                    )
+                        # Broad retrieval only when RAG is ON
+                        plan.append(
+                            {
+                                "tool": "rag_retrieve",
+                                "args": {"query": prompt, "top_k": 12},
+                                "description": "Broad retrieval for residual gaps",
+                                "critical": False,
+                            }
+                        )
                     plan.append(
                         {
                             "tool": "_answer",
