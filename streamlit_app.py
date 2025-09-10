@@ -1118,12 +1118,31 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     chats = list_chats(project_name, **flt)
     if not chats:
         return
-    st.markdown("#### History")
     # Wrap history area so we can scope CSS reliably
     st.markdown('<div class="hist-root">', unsafe_allow_html=True)
 
-    # ---------- Data table (run FIRST so selection state is fresh) ----------
+    # ---------- Build DF first so we know which IDs are visible ----------
     df = _history_dataframe(project_name, flt=flt)
+    displayed_ids = df["id"].tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
+
+    # ---------- Header row: title (left) + checkboxes (right, horizontal) ----------
+    h1, h2, h3 = st.columns([5, 2, 2], gap="small")
+    with h1:
+        st.markdown("### History")
+    with h2:
+        st.checkbox(
+            "Save to project (exports/)",
+            value=st.session_state.get("save_exports_to_project", True),
+            key="save_exports_to_project",
+        )
+    with h3:
+        st.checkbox(
+            "Inject KaTeX (wkhtmltopdf)",
+            value=st.session_state.get("inject_katex", False),
+            key="inject_katex",
+        )
+
+    # ---------- Data table ----------
     df_ret = st.data_editor(
         df,
         hide_index=True,
@@ -1145,36 +1164,21 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         key="history_table",
     )
     _update_history_selection_from_editor(df_ret)
-    displayed_ids = df_ret["id"].tolist() if "id" in df_ret.columns else [int(r["id"]) for r in chats]
 
-    # ---------- Manager toolbar (now AFTER table, uses fresh selection) ----------
+    # ---------- Selection row (AFTER table): only Select All / Clear ----------
     if manager_ui:
         st.session_state.setdefault("hist_view_ids", set())
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-
-        # --- Row 1: selection + toggles ---
-        top_row = st.columns([1, 2])
-        with top_row[0]:
-            c1, c2 = st.columns(2, gap="small")
-            if c1.button("Select All", use_container_width=True, key="hist_select_all"):
+        r1c1, r1c2 = st.columns(2, gap="small")
+        with r1c1:
+            if st.button("Select All", use_container_width=True, key="hist_select_all"):
                 st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
                 _rerun()
-            if c2.button("Clear", use_container_width=True, key="hist_clear_selection"):
+        with r1c2:
+            if st.button("Clear", use_container_width=True, key="hist_clear_selection"):
                 st.session_state["hist_view_ids"] = set()
                 _rerun()
-        with top_row[1]:
-            save_to_project = st.checkbox(
-                "Save to project (exports/)",
-                value=st.session_state.get("save_exports_to_project", True),
-                key="save_exports_to_project",
-            )
-            inject_katex = st.checkbox(
-                "Inject KaTeX (wkhtmltopdf)",
-                value=st.session_state.get("inject_katex", False),
-                key="inject_katex",
-            )
 
-        # --- Row 2: exports + downloads ---
+        # --- Exports + downloads ---
         sel_ids = list(st.session_state.get("hist_view_ids", set()))
         sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
         disabled = (len(sel_rows) == 0)
@@ -1247,8 +1251,6 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                                    mime="application/pdf",
                                    use_container_width=True,
                                    key="dl_hist_pdf")
-
-        st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------- Rows as expanders ----------
     for row in chats:
