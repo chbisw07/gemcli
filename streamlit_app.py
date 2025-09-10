@@ -575,17 +575,34 @@ def _build_context_messages(project_name: str, ui: Dict[str, Any], prompt: str) 
 
 
 # ---------- History table helpers ----------
-def _history_dataframe(project_name: str, *, flt: dict) -> pd.DataFrame:
+# ---------- History table helpers ----------
+def _history_dataframe(
+    project_name: str,
+    *,
+    flt: dict,
+    show_cols: list[str] | None = None,   # any of: ["mode","model","embedder"]
+) -> pd.DataFrame:
     rows = list_chats(project_name, **flt)
+    show_cols = (show_cols or [])
     # compact snippets for the grid
     recs = []
     for r in rows:
-        recs.append({
+        row = {
             "id": int(r["id"]),
-            "prompt": _shorten_one_line(r.get("prompt",""), 110),
-            "answer": _shorten_one_line(r.get("answer",""), 110),
-        })
-    df = pd.DataFrame(recs, columns=["id","prompt","answer"])
+            # slightly shorter previews so extra cols fit comfortably
+            "prompt": _shorten_one_line(r.get("prompt",""), 90),
+            "answer": _shorten_one_line(r.get("answer",""), 90),
+        }
+        if "mode" in show_cols:     row["mode"] = r.get("mode","")
+        if "model" in show_cols:    row["model"] = r.get("model") or ""
+        if "embedder" in show_cols: row["embedder"] = r.get("embedder") or ""
+        recs.append(row)
+    # order: id, mode, model, embedder, prompt, answer
+    base = ["id"]
+    for k in ["mode","model","embedder"]:
+        if k in show_cols: base.append(k)
+    base += ["prompt","answer"]
+    df = pd.DataFrame(recs, columns=base)
     # attach a 'view' flag bound to session selection
     sel = set(st.session_state.get("hist_view_ids", set()))
     df["view"] = df["id"].apply(lambda i: (i in sel))
@@ -1121,13 +1138,25 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     # Wrap history area so we can scope CSS reliably
     st.markdown('<div class="hist-root">', unsafe_allow_html=True)
 
+    # ----------Load per-project UI (no column picker UI anymore) ----------
+    try:
+        _ui_path = project_paths(project_name)["ui_settings"]
+        _ui_local = _read_json(_ui_path)
+    except Exception:
+        _ui_local = {}
+        _ui_path = None
+
+    # Always show these extra columns
+    visible_extra_cols = ["mode", "model", "embedder"]
+
     # ---------- Build DF first so we know which IDs are visible ----------
-    df = _history_dataframe(project_name, flt=flt)
+    df = _history_dataframe(project_name, flt=flt, show_cols=visible_extra_cols)
     displayed_ids = df["id"].tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
 
     # ---------- Header row: title (left) + checkboxes (right, horizontal) ----------
     st.markdown('<div class="toolbar">', unsafe_allow_html=True)
-    h1, h2, h3, h4, h5 = st.columns([5, 2, 2, 1, 1], gap="small")
+    # Add Copy + Delete beside Select All / Clear
+    h1, h2, h3, h4, h5, h6, h7 = st.columns([5, 2, 2, 1, 1, 1, 1], gap="small")
     with h1:
         st.markdown("### History")
     with h2:
@@ -1143,6 +1172,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             key="inject_katex",
         )
     # Small, right-aligned selection controls (top row)
+    st.session_state.setdefault("hist_view_ids", set())    
     with h4:
         if st.button("Select All", use_container_width=True, key="hist_select_all_top"):
             st.session_state["hist_view_ids"] = set(map(int, displayed_ids))
@@ -1151,27 +1181,77 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
             st.session_state["hist_view_ids"] = set()
             _rerun()
+    # ---- Bulk Copy (selected rows → clipboard) ----
+    def _compose_copy_payload(rows: list[dict]) -> str:
+        parts: list[str] = []
+        for r in rows:
+            cid = r.get("id")
+            ts  = r.get("ts_iso") or _human_dt(r.get("ts"))
+            mode = r.get("mode",""); model = r.get("model") or ""; emb = r.get("embedder") or ""
+            parts.append(f"# Chat #{cid} — {ts}\n[{mode}] model={model} · emb={emb}\n")
+            parts.append("You:\n" + (r.get("prompt") or "").rstrip() + "\n")
+            parts.append("Assistant:\n" + (r.get("answer") or "").rstrip())
+            parts.append("\n---\n")
+        return "\n".join(parts).strip()
+    with h6:
+        if st.button("Copy", use_container_width=True, key="hist_copy_bulk"):
+            sel_ids = list(st.session_state.get("hist_view_ids", set()))
+            sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
+            if not sel_rows:
+                st.toast("Select at least one row to copy.", icon="⚠️")
+            else:
+                payload = _compose_copy_payload(sel_rows)
+                b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+                # Immediate copy via tiny HTML/JS snippet
+                components.html(
+                    f"<script>navigator.clipboard.writeText(atob('{b64}'));</script>",
+                    height=0,
+                )
+                st.toast(f"Copied {len(sel_rows)} chat(s) to clipboard.", icon="✅")
+    # ---- Bulk Delete (selected rows) ----
+    with h7:
+        if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
+            sel_ids = list(st.session_state.get("hist_view_ids", set()))
+            if not sel_ids:
+                st.toast("Select at least one row to delete.", icon="⚠️")
+            else:
+                try:
+                    for _cid in sel_ids:
+                        delete_chat(project_name, int(_cid))
+                    st.session_state["hist_view_ids"] = set()
+                    st.toast(f"Deleted {len(sel_ids)} chat(s).", icon="🗑️")
+                    _rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
     st.markdown('</div>', unsafe_allow_html=True)
 
     # ---------- Data table ----------
+    # Lock all non-boolean columns; only 'view' remains editable
+    disabled_cols = ["id","prompt","answer"] + [c for c in ["mode","model","embedder"] if c in df.columns]
+    colcfg: Dict[str, Any] = {
+        "id": st.column_config.NumberColumn("id", help="Chat ID", width="small", format="%d"),
+        "prompt": st.column_config.TextColumn("prompt", width="large", help="User prompt (truncated)"),
+        "answer": st.column_config.TextColumn("answer", width="large", help="Assistant answer (truncated)"),
+        "view": st.column_config.CheckboxColumn("view", width="small", help="Show details below"),
+    }
+    if "mode" in df.columns:
+        colcfg["mode"] = st.column_config.TextColumn("mode", width="small", help="Run mode")
+    if "model" in df.columns:
+        colcfg["model"] = st.column_config.TextColumn("model", width="small", help="LLM model")
+    if "embedder" in df.columns:
+        colcfg["embedder"] = st.column_config.TextColumn("embedder", width="small", help="Embedding model")
+
+    # enforce column order to match the screenshot (id, mode, model, embedder, prompt, answer, view)
+    order_cols = [c for c in ["id","mode","model","embedder","prompt","answer","view"] if c in df.columns]
+
     df_ret = st.data_editor(
         df,
         hide_index=True,
         num_rows="fixed",
         use_container_width=True,
-        disabled=["id","prompt","answer"],  # only 'view' is editable
-        column_config={
-            "id": st.column_config.NumberColumn(
-                "id", help="Chat ID", width="small", format="%d"
-            ),
-            "prompt": st.column_config.TextColumn(
-                "prompt", width="medium", help="User prompt (truncated)"
-            ),
-            "answer": st.column_config.TextColumn(
-                "answer", width="large", help="Assistant answer (truncated)"
-            ),
-            "view": st.column_config.CheckboxColumn("view", width="small", help="Show details below"),
-        },
+        disabled=disabled_cols,  # only 'view' is editable
+        column_config=colcfg,
+        column_order=order_cols,
         key="history_table",
     )
     _update_history_selection_from_editor(df_ret)
@@ -1277,14 +1357,6 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             st.caption(f"{ts_iso} · {mode} · model={model} · emb={embedder} · RAG={rag_on} · stream={streaming}")
             if proj_path:
                 st.caption(f"root: {proj_path}")
-            # Actions
-            ac1, ac2 = st.columns([1, 1], gap="small")
-            with ac1:
-                _copy_button(answer, f"copy_{cid}")
-            with ac2:
-                if st.button("Delete", key=f"del_{cid}", help="Delete this chat"):
-                    delete_chat(project_name, cid)
-                    _rerun()
             # Content
             st.markdown("**You:**")
             st.markdown(prompt)
