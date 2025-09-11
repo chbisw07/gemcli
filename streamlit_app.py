@@ -1280,9 +1280,56 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                 parts.append("\n---\n")
             return "\n".join(parts).strip()
 
+        # ---------- Markdown → "friendlier KaTeX" preprocessing ----------
+        def _normalize_latexish(md_text: str) -> str:
+            """
+            Make common “almost-LaTeX” patterns KaTeX-friendly.
+            - Any [ ... ] segment containing a TeX command → \[ ... \]  (display)
+            - Any ( ... ) segment containing a TeX command → \( ... \)  (inline)
+            - Collapse doubled backslashes (\\alpha → \alpha) inside math only.
+            Conservative: only transforms when a backslash-command exists.
+            """
+            def _clean_math(s: str) -> str:
+                # turn \\alpha → \alpha, \\sin → \sin (only before a letter)
+                return re.sub(r"\\\\([A-Za-z])", r"\\\1", s)
+
+            text = md_text
+
+            # 1) Bracketed display math anywhere in a line (not just whole line)
+            #    Example: "... [ \\cos^2 A + \\sin^2 A = 1 ]."
+            def _bracket_any_repl(m: re.Match) -> str:
+                inner = m.group(1)
+                if re.search(r"\\[A-Za-z]+", inner):
+                    # → \[ … \]  (single backslashes)
+                    return "\\[" + _clean_math(inner).strip() + "\\]"
+                return m.group(0)
+            text = re.sub(r"\[\s*([^\[\]\n]*\\[A-Za-z][^\[\]\n]*)\s*\]", _bracket_any_repl, text)
+
+            # 2) Parenthetical inline math anywhere in a line
+            #    Example: "Solve for (\\sin A) when ..."
+            def _paren_any_repl(m: re.Match) -> str:
+                inner = m.group(1)
+                if re.search(r"\\[A-Za-z]+", inner):
+                    # → \( … \)  (single backslashes)
+                    return "\\(" + _clean_math(inner).strip() + "\\)"
+                return m.group(0)
+            text = re.sub(r"\(\s*([^()\n]*\\[A-Za-z][^()\n]*)\s*\)", _paren_any_repl, text)
+
+            # 3) As a final pass, convert lines that are *only* bracket-math into $$ blocks
+            #    (helps spacing/centering when the equation sits alone on a line)
+            def _block_repl(m: re.Match) -> str:
+                inner = m.group(1)
+                if re.search(r"\\[A-Za-z]+", inner):
+                    return "$$\n" + _clean_math(inner).strip() + "\n$$"
+                return m.group(0)
+            text = re.sub(r"^[ \t]*\[\s*(.+?)\s*\][ \t]*$", _block_repl, text, flags=re.MULTILINE)
+
+            return text
+
         # ---------- HTML builder for PDF (Chromium/wkhtml) ----------
         def _compose_html_doc(project_name: str, rows: List[Dict[str, Any]], inject_katex: bool = True) -> str:
             md = _compose_copy_payload(rows)
+            md = _normalize_latexish(md)
             # Convert Markdown → HTML (with tables & fenced code)
             html_body = markdown.markdown(
                 md,
@@ -1296,11 +1343,12 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
             # Minimal print CSS for nice PDF
             css = """
                 @page { size: A4; margin: 18mm 16mm 18mm 16mm; }
-                body { font: 12pt -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji", sans-serif; color:#111; }
-                h1,h2,h3{ margin: 1.2em 0 .4em; }
+                body { font: 12pt -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji", sans-serif; color:#111; line-height:1.35; }
+                h1,h2,h3{ margin: 1.2em 0 .4em; page-break-after: avoid; }
+                p, li { orphans: 3; widows: 3; }
                 pre code, code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; font-size: 10pt; }
-                pre { background: #f6f8fa; padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
-                table { width: 100%; border-collapse: collapse; margin: .8em 0; }
+                pre { background: #f6f8fa; padding: 10px 12px; border-radius: 8px; overflow-x: auto; page-break-inside: avoid; }
+                table { width: 100%; border-collapse: collapse; margin: .8em 0; page-break-inside: avoid; }
                 th,td { border: 1px solid #e5e7eb; padding: 6px 8px; vertical-align: top; }
                 hr { border: 0; border-top: 1px solid #e5e7eb; margin: 18px 0; }
                 .header { font-size: 13pt; font-weight: 600; margin-bottom: 12px; }
@@ -1312,6 +1360,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                 katex = """
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/mhchem.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
 <script>
 document.addEventListener("DOMContentLoaded", function() {
@@ -1321,7 +1370,9 @@ document.addEventListener("DOMContentLoaded", function() {
       {left: "$", right: "$", display: false},
       {left: "\\\\(", right: "\\\\)", display: false},
       {left: "\\\\[", right: "\\\\]", display: true}
-    ]
+    ],
+    throwOnError: false,
+    strict: "ignore"
   });
 });
 </script>
@@ -1353,17 +1404,56 @@ document.addEventListener("DOMContentLoaded", function() {
                 with sync_playwright() as p:
                     browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
                     page = browser.new_page()
-                    page.set_content(html, wait_until="networkidle")
+                    # Load HTML and give KaTeX/fonts a brief moment to settle.
+                    page.set_content(html, wait_until="domcontentloaded")
+                    try:
+                        page.wait_for_function(
+                            "document.fonts ? document.fonts.status === 'loaded' : true",
+                            timeout=5000,
+                        )
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(400)
+                    # Footer with page numbers; no header (to avoid duplicate title)
+                    footer = """
+                    <style>
+                      .f { font-size:8px; color:#666; width:100%; padding:0 12mm; }
+                    </style>
+                    <div class="f" style="text-align:center;">
+                      Page <span class="pageNumber"></span> / <span class="totalPages"></span>
+                    </div>
+                    """
                     pdf_bytes = page.pdf(
                         format="A4",
                         print_background=True,
                         margin={"top": "18mm", "bottom": "18mm", "left": "16mm", "right": "16mm"},
+                        display_header_footer=True,
+                        header_template="<div></div>",
+                        footer_template=footer,
                     )
                     browser.close()
                     return pdf_bytes
             except Exception as e:
                 logger.warning(f"Chromium PDF export failed: {e}")
                 return None
+            
+        def _available_pdf_paths() -> list[tuple[str, str]]:
+            """Return a list of (key, label) for available PDF export engines."""
+            opts: list[tuple[str, str]] = []
+            if _pandoc_available():       opts.append(("pandoc",   "Pandoc (LaTeX)"))
+            if sync_playwright is not None: opts.append(("chromium", "Chromium (Playwright)"))
+            if _have_wkhtmltopdf():       opts.append(("wkhtml",   "wkhtmltopdf"))
+            if _have_weasyprint():        opts.append(("weasy",    "WeasyPrint"))
+            return opts
+
+        def _export_chats_to_pdf_weasy(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
+            """Render PDF via WeasyPrint explicitly (HTML -> PDF)."""
+            if not _have_weasyprint():
+                return None
+            from weasyprint import HTML  # type: ignore
+            html_doc = _build_export_html(project_name, rows, include_katex=False)
+            return HTML(string=html_doc).write_pdf()
+
 
         def _export_chats_to_pdf_auto(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
             """
@@ -1388,6 +1478,21 @@ document.addEventListener("DOMContentLoaded", function() {
                 return pdf
             # 4) pure-Python fallback
             return _export_chats_to_pdf_rich(project_name, rows)
+
+        def _export_pdf_by_path(path_key: str, project_name: str, rows: List[Dict[str, Any]], *, inject_katex: bool = False) -> Optional[bytes]:
+            """Switchboard for specific engines: pandoc|chromium|wkhtml|weasy|auto"""
+            if not rows:
+                return None
+            key = (path_key or "").strip().lower()
+            if key == "pandoc":
+                return _export_chats_to_pdf_pandoc(project_name, rows)
+            if key == "chromium":
+                return _export_chats_to_pdf_chromium(project_name, rows, inject_katex=inject_katex)
+            if key == "wkhtml":
+                return _export_chats_to_pdf_wkhtml(project_name, rows, inject_katex=inject_katex)
+            if key == "weasy":
+                return _export_chats_to_pdf_weasy(project_name, rows)
+            return _export_chats_to_pdf_auto(project_name, rows)
 
         def _send_telegram_channel(text: str, *, caption: str = "Tarkash share") -> tuple[bool, str]:
             """Send text to a Telegram channel using Bot API.
@@ -1568,8 +1673,12 @@ document.addEventListener("DOMContentLoaded", function() {
                 sel_ids_send  = {int(i) for i in st.session_state.get("hist_view_ids", set())}
                 sel_rows_send = [r for r in chats if int(r.get("id")) in sel_ids_send]
                 if st.button("Telegram", use_container_width=True, key="hist_send_tg", disabled=(not sel_rows_send)):
-                    # Prefer PDF upload; fall back to sending text if PDF generation fails.
-                    pdf_bytes = _export_chats_to_pdf_auto(project_name, sel_rows_send) if sel_rows_send else None
+                    # Use the selected (or explicitly set) PDF engine for Telegram
+                    path = st.session_state.get('telegram_pdf_path') or st.session_state.get('export_pdf_path') or 'pandoc'
+                    pdf_bytes = _export_pdf_by_path(
+                        path, project_name, sel_rows_send,
+                        inject_katex=bool(st.session_state.get('inject_katex', False))
+                    )
                     if pdf_bytes:
                         tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
                         fname = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
@@ -1587,62 +1696,75 @@ document.addEventListener("DOMContentLoaded", function() {
     if manager_ui:
         st.session_state.setdefault("hist_view_ids", set())
         sel_ids = list(st.session_state.get("hist_view_ids", set()))
-        sel_rows = [r for r in chats if int(r["id"]) in sel_ids]
+        sel_rows = [r for r in chats if int(r.get("id")) in set(map(int, sel_ids))]
         disabled = (len(sel_rows) == 0)
-        # Columns: MD | PDF (Pandoc) | PDF (wkhtml) | ⬇ .md | ⬇ PDF
+
+        # ---- Unified Export Toolbar ----
         st.markdown('<div class="exports">', unsafe_allow_html=True)
-        bcol = st.columns(5, gap="small")
+        bcol = st.columns([1.2, 1.8, 0.9, 0.9, 1.1], gap="small")
+
+        # (1) File type selector
         with bcol[0]:
-            if st.button("Export .md", disabled=disabled, use_container_width=True, key="btn_export_md"):
-                try:
-                    md_bytes = _export_chats_to_markdown(project_name, sel_rows)
-                    st.session_state["last_export_md"] = md_bytes
-                    tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                    st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
-                    st.success("Markdown prepared")
-                    if bool(st.session_state.get("save_exports_to_project", True)):
-                        export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
-                        export_dir.mkdir(parents=True, exist_ok=True)
-                        (export_dir/st.session_state["last_export_md_name"]).write_bytes(md_bytes)
-                        st.caption(f"Saved: `{export_dir/st.session_state['last_export_md_name']}`")
-                except Exception as e:
-                    st.error(f"MD export failed: {e}")
+            st.session_state.setdefault("export_file_type", "PDF")
+            st.selectbox("Export file type", options=["PDF", "Markdown"], key="export_file_type")
+
+        # (2) PDF engine selector (shown only when File type == PDF)
         with bcol[1]:
-            have_pandoc = _pandoc_available()
-            if st.button("Export PDF", disabled=(disabled or not have_pandoc), use_container_width=True, key="btn_export_pdf_pandoc"):
-                pdf_bytes = _export_chats_to_pdf_pandoc(project_name, sel_rows)
-                if pdf_bytes:
-                    st.session_state["last_export_pdf"] = pdf_bytes
-                    tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                    st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
-                    st.success("PDF prepared")
-                    if bool(st.session_state.get("save_exports_to_project", True)):
-                        export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
-                        export_dir.mkdir(parents=True, exist_ok=True)
-                        (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
-                        st.caption(f"Saved: `{export_dir/st.session_state['last_export_pdf_name']}`")
-                else:
-                    err = st.session_state.get("pandoc_error") or "Pandoc/LaTeX failed. Ensure pandoc + (xelatex or tectonic) are installed and in PATH."
-                    st.error(f"Pandoc PDF export failed.\n\n```\n{err}\n```")
+            avail = _available_pdf_paths()
+            opts   = [k for k,_ in avail]
+            labels = {k: lbl for k,lbl in avail}
+            default_key = st.session_state.get("export_pdf_path")
+            if not default_key or default_key not in labels:
+                default_key = (opts[0] if opts else "pandoc")
+                st.session_state["export_pdf_path"] = default_key
+            st.selectbox(
+                "Export path",
+                options=opts if opts else ["pandoc"],
+                index=(opts.index(st.session_state["export_pdf_path"]) if opts and st.session_state["export_pdf_path"] in opts else 0),
+                key="export_pdf_path",
+                format_func=lambda k: labels.get(k, k),
+                disabled=(st.session_state.get("export_file_type") != "PDF") or (not opts),
+                help="Choose the engine for PDF export."
+            )
+
+        # (3) Export
         with bcol[2]:
-            have_wk = _have_wkhtmltopdf()
-            help_txt = ("HTML→PDF via wkhtmltopdf. Turn on 'Inject KaTeX' if your content has math."
-                        if have_wk else "wkhtmltopdf not found in PATH.")
-            if st.button("Export (wkhtml)", disabled=(disabled or not have_wk), use_container_width=True, key="btn_export_pdf_wkhtml"):
-                pdf_bytes = _export_chats_to_pdf_wkhtml(project_name, sel_rows, inject_katex=bool(st.session_state.get("inject_katex", False)))
-                if pdf_bytes:
-                    st.session_state["last_export_pdf"] = pdf_bytes
-                    tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                    st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
-                    st.success("PDF prepared (wkhtmltopdf)")
-                    if bool(st.session_state.get("save_exports_to_project", True)):
-                        export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
-                        export_dir.mkdir(parents=True, exist_ok=True)
-                        (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
-                        st.caption(f"Saved: `{export_dir/st.session_state['last_export_pdf_name']}`")
-                else:
-                    st.error("wkhtmltopdf export failed. Check that wkhtmltopdf is installed and accessible.")
-            st.caption(help_txt)
+            if st.button("Export", disabled=disabled, use_container_width=True, key="btn_export_unified"):
+                try:
+                    if st.session_state.get("export_file_type") == "Markdown":
+                        md_bytes = _export_chats_to_markdown(project_name, sel_rows, for_pdf=False)
+                        if md_bytes:
+                            st.session_state["last_export_md"] = md_bytes
+                            tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                            st.session_state["last_export_md_name"] = f"{_safe_name(project_name)}_chats_{tsf}.md"
+                            st.success("Markdown prepared")
+                            if bool(st.session_state.get("save_exports_to_project", True)):
+                                export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
+                                export_dir.mkdir(parents=True, exist_ok=True)
+                                (export_dir/st.session_state["last_export_md_name"]).write_bytes(md_bytes)
+                                st.caption(f"Saved: `{export_dir/st.session_state['last_export_md_name']}`")
+                    else:
+                        path_key = st.session_state.get("export_pdf_path") or "pandoc"
+                        pdf_bytes = _export_pdf_by_path(
+                            path_key, project_name, sel_rows,
+                            inject_katex=bool(st.session_state.get("inject_katex", False))
+                        )
+                        if pdf_bytes:
+                            st.session_state["last_export_pdf"] = pdf_bytes
+                            tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                            st.session_state["last_export_pdf_name"] = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                            st.success("PDF prepared")
+                            if bool(st.session_state.get("save_exports_to_project", True)):
+                                export_dir = Path.home()/".tarkash"/"projects"/_safe_name(project_name)/"exports"
+                                export_dir.mkdir(parents=True, exist_ok=True)
+                                (export_dir/st.session_state["last_export_pdf_name"]).write_bytes(pdf_bytes)
+                                st.caption(f"Saved: `{export_dir/st.session_state['last_export_pdf_name']}`")
+                        else:
+                            st.error("PDF export failed. Check engine availability (Pandoc/LaTeX, Playwright Chromium, wkhtmltopdf, or WeasyPrint).")
+                except Exception as e:
+                    st.error(f"Export failed: {e}")
+
+        # (4) Downloads
         with bcol[3]:
             if st.session_state.get("last_export_md"):
                 st.download_button("⬇ .md",
