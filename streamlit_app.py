@@ -1875,7 +1875,12 @@ with st.sidebar:
         project_root = project_root_resolved
         ui["project_root"] = project_root_resolved
 
-        # auto-index controls
+        # --- Indexation (moved out of Project) ---
+        # nothing rendered here; see dedicated "Indexation" expander below
+
+    # --- Indexation ---
+    with st.expander("Indexation", expanded=False):
+        # Auto indexing toggle
         auto_index_flag = st.checkbox(
             "Auto indexing",
             value=bool(ui.get("rag_auto_index", True)),
@@ -1883,35 +1888,31 @@ with st.sidebar:
         )
         ui["rag_auto_index"] = auto_index_flag
 
-        # determine current indexing status ONCE for both buttons & status text
-        # Always fetch status (allow manual indexing regardless of chat mode / RAG toggle)
+        # determine current indexing status ONCE (always fetch; independent of chat mode)
         try:
             _st = index_status(project_root) or {}
             is_running = (str(_st.get("state", "")).lower() == "running")
         except Exception:
             _st, is_running = {}, False
 
-        # actions (Delta, Full, Stop) — only disable while a run is active
-        disabled_manual = bool(is_running)
-
-        # Place the buttons inside a borderless container and distribute evenly
+        # ── Actions (Delta, Full, Stop). Only disable while a run is active.
         st.markdown('<div class="index-actions">', unsafe_allow_html=True)
         btn_cols = 3 if is_running else 2
         cols = st.columns(btn_cols, gap="small")
 
-        # --- Delta index ---
+        # Delta
         with cols[0]:
-            if st.button("Delta index", use_container_width=True, disabled=disabled_manual, key="btn_delta_index"):
+            if st.button("Delta index", use_container_width=True, disabled=is_running, key="btn_delta_index"):
                 with st.spinner("Delta indexing…"):
                     try:
-                        cfg = load_rag(per_rag_path)                     # Path ok
+                        cfg = load_rag(per_rag_path)
                         emb_name = ui.get("embedding_model")
                         cfg.setdefault("embedder", {})
                         if emb_name:
                             cfg["embedder"]["selected_name"] = emb_name
-                        cfg["chroma_dir"] = str(rag_index_dir)            # ensure per-project index dir
-                        save_rag(per_rag_path, cfg)                        # Path ok
-                        res = delta_index(project_root, per_rag_path)      # Path ok
+                        cfg["chroma_dir"] = str(rag_index_dir)
+                        save_rag(per_rag_path, cfg)
+                        res = delta_index(project_root, per_rag_path)
                         # Robust summary across possible keys that the indexer may return
                         files_changed = int(res.get("files_changed") or res.get("changed_files") or 0)
                         added         = int(res.get("added") or res.get("chunks_added") or 0)
@@ -1920,24 +1921,26 @@ with st.sidebar:
                         st.success(
                             f"Delta index complete · added={added}, updated={updated}, deleted={deleted}, changed(existing)={files_changed}"
                         )
-                        # Optional: quick details panel
-                        with st.expander("Delta details"):
-                            st.write({
-                                "added_files":   res.get("added_files")   or [],
-                                "changed_files": res.get("changed_files") or [],
-                                "deleted_files": res.get("deleted_files") or [],
-                            })
-                            per_file = res.get("files") or {}
+                        with st.expander("Delta details", expanded=False):
+                            added_files   = res.get("added_files") or res.get("files_added") or []
+                            changed_files = res.get("changed_files") or []
+                            deleted_files = res.get("deleted_files") or res.get("files_removed") or []
+                            per_file      = res.get("per_file") or res.get("file_stats")
+                            if added_files:
+                                st.write("Added files:", added_files)
+                            if changed_files:
+                                st.write("Changed files:", changed_files)
+                            if deleted_files:
+                                st.write("Deleted files:", deleted_files)
                             if per_file:
                                 st.write("Per-file chunk counts:", per_file)
-                        # Keep the full raw dict for debugging
-                        st.caption(res)
+                            st.caption(res)
                     except Exception as e:
                         st.error(f"Delta index failed: {e}")
 
-        # --- Full reindex ---
+        # Full
         with cols[1]:
-            if st.button("Full reindex", use_container_width=True, disabled=disabled_manual, key="btn_full_reindex"):
+            if st.button("Full reindex", use_container_width=True, disabled=is_running, key="btn_full_reindex"):
                 with st.spinner("Reindexing…"):
                     try:
                         cfg = load_rag(per_rag_path)
@@ -1955,7 +1958,7 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"Reindex failed: {e}")
 
-        # --- Stop (only while running) ---
+        # Stop (only while running)
         if is_running:
             with cols[2]:
                 if st.button("Stop indexing", use_container_width=True, key="btn_stop_index"):
@@ -1967,7 +1970,7 @@ with st.sidebar:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # status — concise, professional summary (clean/dirty, last time, counts)
+        # ── Status: concise, professional summary (clean/dirty, last time, counts)
         def _fmt_idx_summary(_st: dict) -> str:
             def _ival(*keys, default=0):
                 for k in keys:
@@ -1976,31 +1979,31 @@ with st.sidebar:
                         try: return int(v)
                         except Exception: pass
                 return default
-            def _bval(*keys, default=False):
+            def _b(*keys, default=False):
                 for k in keys:
                     v = _st.get(k)
                     if isinstance(v, bool): return v
-                    if str(v).lower() in ("1","true","yes","dirty"): return True
-                    if str(v).lower() in ("0","false","no","clean"): return False
+                    s = str(v).lower()
+                    if s in ("1","true","yes","dirty"):  return True
+                    if s in ("0","false","no","clean"):  return False
                 return default
-            def _tsval(*keys):
+            def _ts(*keys):
                 for k in keys:
                     v = _st.get(k)
-                    if isinstance(v, (int, float)) and v > 0:
+                    if isinstance(v, (int,float)) and v>0:
                         try: return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(v)))
                         except Exception: pass
-                    if isinstance(v, str) and v:
-                        # If iso-like already, return as-is
-                        return v
+                    if isinstance(v, str) and v: return v
                 return "—"
-            running = str(_st.get("state","")).lower() == "running"
-            dirty   = _bval("dirty")
-            pf, tf  = _ival("processed_files","files_processed"), _ival("total_files","files_total", default=0)
-            added   = _ival("added","files_added","chunks_added")
-            changed = _ival("files_changed","changed_files","chunks_updated","updated","modified")
-            deleted = _ival("deleted","removed","chunks_removed")
-            last_ts = _tsval("last_index_ts","last_run_ts","last_ts","last_run")
+            running  = str(_st.get("state","")).lower() == "running"
+            dirty    = _b("dirty")
+            pf, tf   = _ival("processed_files","files_processed"), _ival("total_files","files_total", default=0)
+            added    = _ival("added","files_added","chunks_added")
+            changed  = _ival("files_changed","changed_files","chunks_updated","updated","modified")
+            deleted  = _ival("deleted","removed","chunks_removed")
+            last_ts  = _ts("last_index_ts","last_run_ts","last_ts","last_run")
             if running:
+                tf = tf or 1
                 return f"Indexing… {pf}/{tf} files"
             state_txt = "DIRTY" if dirty else "clean"
             parts = [f"Indexer: {state_txt}", f"last: {last_ts}"]
