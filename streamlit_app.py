@@ -1329,10 +1329,10 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                         .hist-copy-btn {{
                           display:inline-flex; align-items:center; justify-content:center;
                           width:100%;
-                          height:40px;                 /* match Clear/Delete pill height */
+                          height:46px;                 /* match Clear/Delete pill height */
                           padding:0 .75rem;            /* no vertical padding to avoid overflow */
                           font-size:.85rem;
-                          border-radius:8px; border:1px solid var(--btn-border); background:var(--btn-bg);
+                          border-radius:14px; border:1px solid var(--btn-border); background:var(--btn-bg);
                           white-space:nowrap; box-sizing:border-box; cursor:pointer;
                           transition: background .15s ease, transform .02s ease, opacity .15s ease;
                           -webkit-font-smoothing: antialiased;
@@ -1344,7 +1344,7 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                       </style>
                     </div>
                     """,
-                    height=40,
+                    height=46,
                 )
             with bdel:
                 if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
