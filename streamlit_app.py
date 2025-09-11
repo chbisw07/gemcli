@@ -1325,16 +1325,20 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                       </button>
                       <style>
                         :root {{ --btn-border:#e2e8f0; --btn-bg:#ffffff; --btn-bg-hover:#f3f4f6; }}
-                        html, body {{ margin:0; padding:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; font-size:14px; line-height:1.2; }}
+                        html, body {{ margin:0; padding:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; font-size:16px; line-height:1.2; }}
                         .hist-copy-btn {{
                           display:inline-flex; align-items:center; justify-content:center;
-                          width:100%; height:36px; padding:.25rem .8rem; font-size:.85rem;
+                          width:100%;
+                          height:40px;                 /* match Clear/Delete pill height */
+                          padding:0 .75rem;            /* no vertical padding to avoid overflow */
+                          font-size:.85rem;
                           border-radius:8px; border:1px solid var(--btn-border); background:var(--btn-bg);
                           white-space:nowrap; box-sizing:border-box; cursor:pointer;
                           transition: background .15s ease, transform .02s ease, opacity .15s ease;
+                          -webkit-font-smoothing: antialiased;
                         }}
                         .hist-copy-btn:hover {{ background:var(--btn-bg-hover); }}
-                        .hist-copy-btn:active {{ transform: translateY(1px); }}
+                        .hist-copy-btn:active {{ transform: translateY(2px); }}
                         .hist-copy-btn[disabled] {{ opacity:.5; cursor:not-allowed; }}
                         .hist-copy-btn:focus {{ outline:none; box-shadow:none; }}
                       </style>
