@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import html
 from functools import lru_cache
+import base64
 
 import sqlite3
 import base64
@@ -110,6 +111,71 @@ EDIT_TOOLS = {
 load_dotenv(dotenv_path=ENV_PATH)
 logger.info("Environment loaded from {}", str(ENV_PATH.resolve()))
 
+# =========================
+# Branding (logo + title)
+# =========================
+# Search for a logo path in a few sensible places; allow override via env.
+def _load_logo_bytes() -> bytes | None:
+    candidates = [
+        os.environ.get("TARKASH_LOGO") or "",
+        str(Path.home() / ".tarkash" / "TARKASH.png"),
+        str(Path.home() / ".tarkash" / "tarkash.png"),
+        str(Path.home() / ".tarkash" / "logo.png"),
+        "assets/tarkash.png",
+        "assets/TARKASH.png",
+        "assets/logo.png",
+    ]
+    for p in candidates:
+        if not p:
+            continue
+        try:
+            return Path(p).read_bytes()
+        except Exception:
+            try:
+                with open(p, "rb") as f:
+                    return f.read()
+            except Exception:
+                continue
+    return None
+
+def _brand_css():
+    st.markdown(
+        """
+        <style>
+          .tarkash-brand{display:flex;align-items:center;gap:.6rem;line-height:1}
+          .tarkash-brand .name{font-weight:700;letter-spacing:.02em}
+          .tarkash-brand.sidebar .name{font-size:1.05rem}
+          .tarkash-brand.header .name{font-size:1.15rem}
+          .tarkash-brand img{display:block;height:28px;width:auto;border-radius:6px}
+          .tarkash-brand.header img{height:36px}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def _render_brand_rows():
+    _brand_css()
+    logo = _load_logo_bytes()
+    if not logo:
+        return
+    b64 = base64.b64encode(logo).decode("ascii")
+    # Sidebar brand (top)
+    with st.sidebar:
+        st.markdown(
+            f"<div class='tarkash-brand sidebar'>"
+            f"<img src='data:image/png;base64,{b64}' alt='Tarkash'/>"
+            f"<span class='name'>Tarkash</span></div>",
+            unsafe_allow_html=True,
+        )
+    # Header brand (main area)
+    st.markdown(
+        f"<div class='tarkash-brand header'>"
+        f"<img src='data:image/png;base64,{b64}' alt='Tarkash'/>"
+        f"<span class='name'>Tarkash</span></div>",
+        unsafe_allow_html=True,
+    )
+
+   
 # -------------------------- Markdown / LaTeX helpers --------------------------
 
 _SVG_FENCE_RE = re.compile(r"```(?:svg|SVG)\s+([\s\S]*?)\s*```", re.MULTILINE)
@@ -1838,6 +1904,7 @@ document.addEventListener("DOMContentLoaded", function() {
 st.set_page_config(page_title=APP_TITLE, page_icon="💎", layout="wide")
 
 _log_env_status()
+_render_brand_rows()  # <-- ensure PNG logo renders (sidebar + header)
 
 def _env_pills():
     # Compute environment once per render
@@ -1869,18 +1936,12 @@ def _inject_css():
           --accent:#6366f1;       /* indigo-500 */
           --radius:14px;
         }
-        .main > div { padding-top: .6rem; }
+        /* bring content closer to the top now that the title card is gone */
+        .main > div { padding-top: .2rem; }
         h1,h2,h3{ letter-spacing:-.02em; }
-        .title-card{
-          background:var(--card);
-          border:1px solid var(--ring);
-          border-radius:var(--radius);
-          padding:.9rem 1.2rem;
-          box-shadow:0 1px 2px rgba(2,6,23,.05);
-          display:flex; align-items:center; justify-content:space-between;
-          margin-bottom:.6rem;
-        }
-        .brand{ display:flex; gap:.6rem; align-items:center; }
+        /* small breathing room under the header logo row */
+        .tarkash-brand.header{ margin: .15rem 0 .4rem 0; }
+        /* (removed .title-card styles; no longer used) */
         .pills{ display:flex; gap:.4rem; flex-wrap: wrap; }
         .pill{
           border:1px solid var(--ring);
@@ -2001,69 +2062,14 @@ def _inject_css():
 
 _inject_css()
 
-# Title bar (env pills removed; status is logged instead)
-with st.container():
-    st.markdown(
-        "<div class='title-card'><div class='brand'><span style='font-weight:700'>Tarkash</span></div></div>",
-        unsafe_allow_html=True
-    )
-
-
-# Logo
-st.markdown(
-    """
-    <div class="tarkash-logo" title="Tarkash">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="3" y="3" width="10" height="18" rx="2"></rect>
-        <path d="M7.5 6 L6 7.5 L9 7.5 Z"></path>
-        <path d="M11.5 5 L10 6.5 L13 6.5 Z"></path>
-        <path d="M8 8 V18"></path>
-        <path d="M12 7 V18"></path>
-      </svg>
-      <span>Tarkash</span>
-    </div>
-    """,
-    unsafe_allow_html=True)
-
-# Logo (top-right)
-st.markdown(
-    """
-    <div class="tarkash-logo-right" title="Tarkash">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <rect x="3" y="3" width="10" height="18" rx="2"></rect>
-        <path d="M7.5 6 L6 7.5 L9 7.5 Z"></path>
-        <path d="M11.5 5 L10 6.5 L13 6.5 Z"></path>
-        <path d="M8 8 V18"></path>
-        <path d="M12 7 V18"></path>
-      </svg>
-    </div>
-    """,
-    unsafe_allow_html=True)
+# (removed the extra top title card to eliminate redundant space)
 
 # =============================================================================
 # Sidebar — grouped, minimal-scrolling
 # =============================================================================
 
 with st.sidebar:
-    # Sidebar logo
-    st.markdown(
-        """
-        <div class="sidebar-logo" title="Tarkash">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="3" y="3" width="10" height="18" rx="2"></rect>
-            <path d="M7.5 6 L6 7.5 L9 7.5 Z"></path>
-            <path d="M11.5 5 L10 6.5 L13 6.5 Z"></path>
-            <path d="M8 8 V18"></path>
-            <path d="M12 7 V18"></path>
-          </svg>
-          <span>Tarkash</span>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    # PNG logo already injected by _render_brand_rows(); keep sidebar header below.
     st.header("Configuration", anchor=False)
 
     # read cross-panel state early
@@ -2790,9 +2796,39 @@ with chat_tab:
                 disabled=(st.session_state.get("mode_radio", "Direct Chat") != "Agent Plan & Run"),
             )
 
-    # Prompt + single primary action (Chat-only)
+    # Prompt + System prompt (moved above buttons) + primary actions
     st.markdown('<div class="card prompt-card">', unsafe_allow_html=True)
     prompt = st.text_area("input_prompt", height=140, placeholder="Type your instruction…")
+
+    # ---- System prompt (moved here: below input, above Submit) ----
+    def _current_project_name_and_paths():
+        _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
+        name = _g.get("project_name") or Path.cwd().name
+        return name, project_paths(name)
+    proj_name_for_ui, _paths_for_ui = _current_project_name_and_paths()
+    _ui_for_ui = _read_json(_paths_for_ui["ui_settings"])
+    if "sys_prompt_on" not in st.session_state:
+        st.session_state["sys_prompt_on"] = bool(_ui_for_ui.get("sys_prompt_on", False))
+    if "sys_prompt_text" not in st.session_state:
+        st.session_state["sys_prompt_text"] = _ui_for_ui.get("sys_prompt_text", "")
+    st.toggle(
+        "System prompt",
+        key="sys_prompt_on",
+        help="When ON, the text below is sent as a system message (merged with internal system instructions).",
+    )
+    if st.session_state["sys_prompt_on"]:
+        st.text_area(
+            "system_prompt",
+            key="sys_prompt_text",
+            height=72,
+            placeholder="e.g., Be concise; answer strictly with steps; prefer KaTeX for math…",
+        )
+    # Persist per-project immediately from session_state
+    _ui_for_ui["sys_prompt_on"] = bool(st.session_state["sys_prompt_on"])
+    _ui_for_ui["sys_prompt_text"] = st.session_state.get("sys_prompt_text", "")
+    _write_json(_paths_for_ui["ui_settings"], _ui_for_ui)
+
+    # Action row
     b1, b2, _ = st.columns([1, 1, 6])
     with b1:
         main_label = "Stop" if st.session_state.get("running") else "Submit"
@@ -2815,36 +2851,8 @@ with chat_tab:
     else:
         submit = bool(action_clicked and not st.session_state.get("running"))
 
-    # ---- System prompt (Chat-only) ----
-    # Per-project persistence: read the current project's ui_settings.json
-    def _current_project_name_and_paths():
-        _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
-        name = _g.get("project_name") or Path.cwd().name
-        return name, project_paths(name)
-    proj_name_for_ui, _paths_for_ui = _current_project_name_and_paths()
-    _ui_for_ui = _read_json(_paths_for_ui["ui_settings"])
-
+    # (removed old System prompt block and divider; now rendered above the buttons)
     st.divider()
-    if "sys_prompt_on" not in st.session_state:
-        st.session_state["sys_prompt_on"] = bool(_ui_for_ui.get("sys_prompt_on", False))
-    if "sys_prompt_text" not in st.session_state:
-        st.session_state["sys_prompt_text"] = _ui_for_ui.get("sys_prompt_text", "")
-    st.toggle(
-        "System prompt",
-        key="sys_prompt_on",
-        help="When ON, the text below is sent as a system message (merged with internal system instructions).",
-    )
-    if st.session_state["sys_prompt_on"]:
-        st.text_area(
-            "system_prompt",
-            key="sys_prompt_text",
-            height=72,
-            placeholder="e.g., Be concise; answer strictly with steps; prefer KaTeX for math…",
-        )
-    # Persist per-project immediately from session_state
-    _ui_for_ui["sys_prompt_on"] = bool(st.session_state["sys_prompt_on"])
-    _ui_for_ui["sys_prompt_text"] = st.session_state.get("sys_prompt_text", "")
-    _write_json(_paths_for_ui["ui_settings"], _ui_for_ui)
 
     # Response area (Chat-only)
     st.markdown("### Assistant Response")
