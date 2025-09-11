@@ -16,10 +16,10 @@ import shutil
 import tempfile
 import html
 from functools import lru_cache
-import base64
 
 import sqlite3
 import base64
+import mimetypes
 import pandas as pd
 import requests
 from io import BytesIO
@@ -596,6 +596,46 @@ def _shorten_one_line(text: str, max_chars: int = 90) -> str:
         return ""
     s = " ".join(str(text).split())  # collapse whitespace/newlines
     return s if len(s) <= max_chars else (s[: max_chars - 1] + "…")
+
+# ---------- Attachment helpers (drag & drop under prompt) ----------
+_TEXT_EXTS = {".txt",".md",".py",".json",".csv",".yaml",".yml",".toml",".ini",".cfg",".log",".tex"}
+
+def _readable_bytes(n: int) -> str:
+    try:
+        if n >= 1024*1024: return f"{n/1024/1024:.2f} MB"
+        if n >= 1024:      return f"{n/1024:.2f} KB"
+        return f"{n} B"
+    except Exception:
+        return str(n)
+
+def _is_textlike(name: str, mime: str | None) -> bool:
+    ext = (Path(name).suffix or "").lower()
+    if ext in _TEXT_EXTS:
+        return True
+    if not mime:
+        return False
+    m = mime.lower()
+    return m.startswith("text/") or "json" in m or "xml" in m
+
+def _attachments_to_prompt_block(atts: list[dict]) -> str:
+    """Render a compact, model-friendly block for attachments."""
+    if not atts: 
+        return ""
+    lines = ["\n[ATTACHMENTS]\n"]
+    for a in atts:
+        name = a.get("name","file")
+        mime = a.get("mime","application/octet-stream")
+        text = a.get("text","")
+        data = a.get("bytes", b"")
+        if text:
+            lang = (Path(name).suffix or "").lstrip(".")
+            # cap each text block just in case
+            snippet = text[:20000]
+            lines.append(f"--- {name} ({mime}) ---\n```{lang}\n{snippet}\n```\n")
+        else:
+            lines.append(f"- {name} ({mime}, {_readable_bytes(len(data))}) [binary not inlined]")
+    return "\n".join(lines)
+
 
 # ---------- Time helpers ----------
 def _epoch_from_date_str(s: Optional[str]) -> Optional[float]:
@@ -2800,6 +2840,53 @@ with chat_tab:
     st.markdown('<div class="card prompt-card">', unsafe_allow_html=True)
     prompt = st.text_area("input_prompt", height=140, placeholder="Type your instruction…")
 
+    # ---- Drag & drop attachments (≤ 1 MB total) ----
+    MAX_TOTAL = 1_000_000  # 1 MB
+    uploaded = st.file_uploader(
+        "Drag & drop attachments (≤ 1 MB total)",
+        type=["txt","md","py","json","csv","yaml","yml","toml","ini","cfg","log","tex",
+              "png","jpg","jpeg","gif","webp","pdf","xml"],
+        accept_multiple_files=True,
+        key="chat_uploader",
+    )
+    # Normalize and validate
+    attachments: list[dict] = []
+    total_size = 0
+    if uploaded:
+        for uf in uploaded:
+            try:
+                raw = uf.getvalue()
+            except Exception:
+                raw = uf.read()  # fallback
+            size = len(raw)
+            total_size += size
+            attachments.append({
+                "name": uf.name,
+                "mime": uf.type or (mimetypes.guess_type(uf.name)[0] or "application/octet-stream"),
+                "bytes": raw,
+                "text": ""
+            })
+        if total_size > MAX_TOTAL:
+            st.error(f"Attachments exceed the 1 MB total limit (got {_readable_bytes(total_size)}). Please remove some files.")
+            attachments = []
+            total_size = 0
+    # Decode text-like attachments to inline text
+    for a in attachments:
+        if _is_textlike(a["name"], a.get("mime")):
+            try:
+                a["text"] = a["bytes"].decode("utf-8", errors="replace")
+            except Exception:
+                a["text"] = ""
+    # Show a tiny summary row
+    if attachments:
+        names = ", ".join(f"{Path(a['name']).name} ({_readable_bytes(len(a['bytes']))})" for a in attachments)
+        st.caption(f"Attached: {names}  ·  total {_readable_bytes(total_size)}")
+    # Persist for this run
+    st.session_state["chat_attachments"] = attachments
+    # Build effective prompt
+    prompt_effective = prompt + _attachments_to_prompt_block(attachments)
+
+
     # ---- System prompt (moved here: below input, above Submit) ----
     def _current_project_name_and_paths():
         _g = _read_json(GLOBAL_UI_SETTINGS_PATH)
@@ -2841,6 +2928,7 @@ with chat_tab:
         st.session_state["progress_rows"] = []
         st.session_state["last_tools_used"] = set()
         st.session_state["show_chart_gallery"] = False
+        st.session_state["chat_attachments"] = []
         _rerun()
 
     # Interpret action button
@@ -3095,7 +3183,7 @@ if submit:
                     msgs.append({"role": "system", "content": eff_system})
                 # Build conversation-aware messages (uses SQLite if history is ON,
                 # otherwise falls back to a transient session buffer).
-                msgs += _build_context_messages(current_project_name_for_history or current_project, ui, prompt)
+                msgs += _build_context_messages(current_project_name_for_history or current_project, ui, prompt_effective)
                 try:
                     _adapter = getattr(agent, "adapter", None)
                     if _adapter and hasattr(_adapter, "chat_stream"):
@@ -3113,7 +3201,7 @@ if submit:
                             response_area.empty()
                             _md = _render_images_and_svg_from_text(buf)
                             render_response_with_latex(_md)
-                            _push_transient_turn(prompt, buf)
+                            _push_transient_turn(prompt_effective, buf)
                         except Exception as _e:
                             st.error(f"[stream error] {_e}")
                     else:
@@ -3124,7 +3212,7 @@ if submit:
                             # render final text into Chat tab area (with images/SVG)
                             _md = _render_images_and_svg_from_text(answer)
                             render_response_with_latex(_md)
-                        _push_transient_turn(prompt, answer)
+                        _push_transient_turn(prompt_effective, answer)
                 except Exception as e:
                     st.error(f"[error] {e}")
 
@@ -3163,7 +3251,7 @@ if submit:
             try:
                 # Prefix user prompt so adapters that only accept a single string still get system guidance.
                 eff_system = _compose_system_prompt(ui, mode)
-                prompt_for_llm = _prefix_with_system(prompt, eff_system)
+                prompt_for_llm = _prefix_with_system(prompt_effective, eff_system)
                 answer = agent.ask_once(
                     prompt_for_llm, max_iters=int(st.session_state.get("max_iters", 5)), progress_cb=_progress_cb
                 )
