@@ -1701,12 +1701,23 @@ document.addEventListener("DOMContentLoaded", function() {
 
         # ---- Unified Export Toolbar ----
         st.markdown('<div class="exports">', unsafe_allow_html=True)
-        bcol = st.columns([1.2, 1.8, 0.9, 0.9, 1.1], gap="small")
+        # Layout: [file type] [engine] [spacer] [Export] [↓.md] [↓PDF]
+        try:
+            # Move Export (col[2]) closer to the selectors by shrinking the spacer.
+            bcol = st.columns([1.2, 2.0, 1.1, 6, 0.9, 0.9], gap="small", vertical_alignment="center")
+        except TypeError:
+            # Streamlit < 1.31 doesn't support vertical_alignment
+            bcol = st.columns([1.2, 2.0, 1.1, 6, 0.9, 0.9], gap="small")
 
         # (1) File type selector
         with bcol[0]:
             st.session_state.setdefault("export_file_type", "PDF")
-            st.selectbox("Export file type", options=["PDF", "Markdown"], key="export_file_type")
+            st.selectbox(
+                "Export file type",
+                options=["PDF", "Markdown"],
+                key="export_file_type",
+                help="Choose whether to export a PDF or a Markdown file.",
+            )
 
         # (2) PDF engine selector (shown only when File type == PDF)
         with bcol[1]:
@@ -1724,11 +1735,13 @@ document.addEventListener("DOMContentLoaded", function() {
                 key="export_pdf_path",
                 format_func=lambda k: labels.get(k, k),
                 disabled=(st.session_state.get("export_file_type") != "PDF") or (not opts),
-                help="Choose the engine for PDF export."
+                help="Choose the engine for PDF export.",
             )
 
-        # (3) Export
+        # (3) Export — align with the two selects by padding for label height
         with bcol[2]:
+            # Add a small spacer so the button lines up with the selectboxes (which have labels).
+            st.markdown("<div style='height:30px'></div>", unsafe_allow_html=True)
             if st.button("Export", disabled=disabled, use_container_width=True, key="btn_export_unified"):
                 try:
                     if st.session_state.get("export_file_type") == "Markdown":
@@ -1764,8 +1777,12 @@ document.addEventListener("DOMContentLoaded", function() {
                 except Exception as e:
                     st.error(f"Export failed: {e}")
 
-        # (4) Downloads
+        # Spacer to push the download buttons to the far right
         with bcol[3]:
+            st.write("")
+
+        # (4) Downloads
+        with bcol[4]:
             if st.session_state.get("last_export_md"):
                 st.download_button("⬇ .md",
                                    data=st.session_state["last_export_md"],
@@ -1773,7 +1790,7 @@ document.addEventListener("DOMContentLoaded", function() {
                                    mime="text/markdown",
                                    use_container_width=True,
                                    key="dl_hist_md")
-        with bcol[4]:
+        with bcol[5]:
             if st.session_state.get("last_export_pdf"):
                 st.download_button("⬇ PDF",
                                    data=st.session_state["last_export_pdf"],
