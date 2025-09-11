@@ -1884,18 +1884,15 @@ with st.sidebar:
         ui["rag_auto_index"] = auto_index_flag
 
         # determine current indexing status ONCE for both buttons & status text
-        if _rag_enabled:
-            try:
-                _st = index_status(project_root) or {}
-                is_running = (_st.get("state") == "running")
-            except Exception:
-                _st, is_running = {}, False
-        else:
+        # Always fetch status (allow manual indexing regardless of chat mode / RAG toggle)
+        try:
+            _st = index_status(project_root) or {}
+            is_running = (str(_st.get("state", "")).lower() == "running")
+        except Exception:
             _st, is_running = {}, False
 
-        # actions (Delta, Full, Stop) — honor Auto indexing and running state
-        # Also disable when RAG is OFF
-        disabled_manual = (not _rag_enabled) or bool(auto_index_flag or is_running)
+        # actions (Delta, Full, Stop) — only disable while a run is active
+        disabled_manual = bool(is_running)
 
         # Place the buttons inside a borderless container and distribute evenly
         st.markdown('<div class="index-actions">', unsafe_allow_html=True)
@@ -1970,20 +1967,50 @@ with st.sidebar:
 
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # status
+        # status — concise, professional summary (clean/dirty, last time, counts)
+        def _fmt_idx_summary(_st: dict) -> str:
+            def _ival(*keys, default=0):
+                for k in keys:
+                    v = _st.get(k)
+                    if v is not None:
+                        try: return int(v)
+                        except Exception: pass
+                return default
+            def _bval(*keys, default=False):
+                for k in keys:
+                    v = _st.get(k)
+                    if isinstance(v, bool): return v
+                    if str(v).lower() in ("1","true","yes","dirty"): return True
+                    if str(v).lower() in ("0","false","no","clean"): return False
+                return default
+            def _tsval(*keys):
+                for k in keys:
+                    v = _st.get(k)
+                    if isinstance(v, (int, float)) and v > 0:
+                        try: return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(v)))
+                        except Exception: pass
+                    if isinstance(v, str) and v:
+                        # If iso-like already, return as-is
+                        return v
+                return "—"
+            running = str(_st.get("state","")).lower() == "running"
+            dirty   = _bval("dirty")
+            pf, tf  = _ival("processed_files","files_processed"), _ival("total_files","files_total", default=0)
+            added   = _ival("added","files_added","chunks_added")
+            changed = _ival("files_changed","changed_files","chunks_updated","updated","modified")
+            deleted = _ival("deleted","removed","chunks_removed")
+            last_ts = _tsval("last_index_ts","last_run_ts","last_ts","last_run")
+            if running:
+                return f"Indexing… {pf}/{tf} files"
+            state_txt = "DIRTY" if dirty else "clean"
+            parts = [f"Indexer: {state_txt}", f"last: {last_ts}"]
+            if any([added, changed, deleted]):
+                parts.append(f"Δ added={added}, changed={changed}, deleted={deleted}")
+            return " · ".join(parts)
         try:
-            if _st.get("dirty"):
-                st.markdown(
-                    "<span style='color:#c00;font-size:0.85em'>Indexing status: DIRTY</span>",
-                    unsafe_allow_html=True,
-                )
-            if _st.get("state") == "running":
-                pf, tf = int(_st.get("processed_files", 0)), int(_st.get("total_files", 0) or 1)
-                st.caption(f"Indexing… {pf}/{tf} files")
-            elif not disabled_manual:
-                st.caption("Indexer is idle.")
+            st.caption(_fmt_idx_summary(_st))
         except Exception:
-            pass
+            st.caption("Indexer: status unavailable")
 
     # --- RAG settings (per project) ---
     with st.expander("RAG settings (project)", expanded=False):
