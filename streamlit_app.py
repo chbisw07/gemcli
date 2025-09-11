@@ -20,6 +20,7 @@ from functools import lru_cache
 import sqlite3
 import base64
 import pandas as pd
+import requests
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -1269,8 +1270,88 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                 parts.append("\n---\n")
             return "\n".join(parts).strip()
 
+        def _export_chats_to_pdf_auto(project_name: str, rows: List[Dict[str, Any]]) -> Optional[bytes]:
+            """
+            Build a PDF using the best available engine in this order:
+            1) Pandoc + (xelatex|tectonic)
+            2) wkhtmltopdf (with optional KaTeX based on the UI toggle)
+            3) Pure-Python rich fallback (WeasyPrint → xhtml2pdf → PyMuPDF)
+            """
+            # 1) Pandoc if present
+            pdf = _export_chats_to_pdf_pandoc(project_name, rows)
+            if pdf:
+                return pdf
+            # 2) wkhtmltopdf (respect "Inject KaTeX" toggle)
+            inject_katex = bool(st.session_state.get("inject_katex", False))
+            pdf = _export_chats_to_pdf_wkhtml(project_name, rows, inject_katex=inject_katex)
+            if pdf:
+                return pdf
+            # 3) pure-Python fallback
+            return _export_chats_to_pdf_rich(project_name, rows)
+
+        def _send_telegram_channel(text: str, *, caption: str = "Tarkash share") -> tuple[bool, str]:
+            """Send text to a Telegram channel using Bot API.
+            Uses env TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID.
+            For long texts, uploads as a .txt document (no length cap).
+            Returns (ok, info)."""
+            token = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+            chat_id = os.environ.get("TELEGRAM_CHAT_ID") or ""
+            if not token or not chat_id:
+                return False, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+            api = f"https://api.telegram.org/bot{token}"
+            try:
+                if len(text) <= 3500:
+                    r = requests.post(f"{api}/sendMessage", data={"chat_id": chat_id, "text": text})
+                else:
+                    bio = BytesIO(text.encode("utf-8"))
+                    bio.name = "tarkash_share.txt"
+                    r = requests.post(
+                        f"{api}/sendDocument",
+                        data={"chat_id": chat_id, "caption": caption},
+                        files={"document": ("tarkash_share.txt", bio, "text/plain")},
+                    )
+                ok = False
+                info = ""
+                try:
+                    j = r.json()
+                    ok = bool(j.get("ok"))
+                    info = j.get("description", "") or ""
+                except Exception:
+                    info = r.text
+                return (True, "ok") if ok else (False, info or "Telegram API error")
+            except Exception as e:
+                return False, str(e)
+
+        def _send_telegram_document(data: bytes, *, filename: str = "tarkash_share.pdf", caption: str = "Tarkash share (PDF)") -> tuple[bool, str]:
+            """Upload a document (PDF) to the Telegram channel via Bot API."""
+            token = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+            chat_id = os.environ.get("TELEGRAM_CHAT_ID") or ""
+            if not token or not chat_id:
+                return False, "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+            api = f"https://api.telegram.org/bot{token}"
+            try:
+                bio = BytesIO(data)
+                bio.name = filename
+                r = requests.post(
+                    f"{api}/sendDocument",
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"document": (filename, bio, "application/pdf")},
+                )
+                ok = False
+                info = ""
+                try:
+                    j = r.json()
+                    ok = bool(j.get("ok"))
+                    info = j.get("description", "") or ""
+                except Exception:
+                    info = r.text
+                return (True, "ok") if ok else (False, info or "Telegram API error")
+            except Exception as e:
+                return False, str(e)
+
         with right_grp:
-            bsel, bclr, bcpy, bdel = st.columns([1.25, 1, 1, 1], gap="small")
+            # Trimmed toolbar: keep Select/Clear, Copy, Send Telegram, Delete
+            bsel, bclr, bcpy, btgsend, bdel = st.columns([1.25, 1, 1, 1, 1], gap="small")
             with bsel:
                 if st.button("Select all", use_container_width=True, key="hist_select_all_top"):
                     ids = st.session_state.get("_hist_last_displayed_ids", [])
@@ -1344,8 +1425,25 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                       </style>
                     </div>
                     """,
-                    height=46,
+                    height=50,
                 )
+            with btgsend:
+                sel_ids_send  = {int(i) for i in st.session_state.get("hist_view_ids", set())}
+                sel_rows_send = [r for r in chats if int(r.get("id")) in sel_ids_send]
+                if st.button("Send Telegram", use_container_width=True, key="hist_send_tg", disabled=(not sel_rows_send)):
+                    # Prefer PDF upload; fall back to sending text if PDF generation fails.
+                    pdf_bytes = _export_chats_to_pdf_auto(project_name, sel_rows_send) if sel_rows_send else None
+                    if pdf_bytes:
+                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                        fname = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                        ok, info = _send_telegram_document(pdf_bytes, filename=fname, caption=f"Tarkash share ({len(sel_rows_send)} chat(s))")
+                    else:
+                        payload_send  = _compose_copy_payload(sel_rows_send) if sel_rows_send else ""
+                        ok, info = _send_telegram_channel(payload_send, caption=f"Tarkash share ({len(sel_rows_send)} chat(s))")
+                    if ok:
+                        st.toast(f"Sent {len(sel_rows_send)} chat(s) to Telegram", icon="📤")
+                    else:
+                        st.error(f"Telegram send failed: {info}")
             with bdel:
                 if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
                     sel_ids_list = list(st.session_state.get("hist_view_ids", set()))
