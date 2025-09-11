@@ -612,6 +612,36 @@ def _update_history_selection_from_editor(df_ret: pd.DataFrame):
     ids = set(df_ret.loc[df_ret["view"] == True, "id"].tolist())
     st.session_state["hist_view_ids"] = ids
 
+def _apply_pending_view_edits_from_editor(df: pd.DataFrame, key: str = "history_table") -> pd.DataFrame:
+    """
+    If the user just clicked a checkbox, Streamlit stores that edit under
+    st.session_state[key].edited_rows before our next st.data_editor runs.
+    We merge those pending edits into the 'view' column so the UI never
+    appears to "undo" the click on the immediate rerun.
+    """
+    try:
+        state = st.session_state.get(key)
+        # Try both dict-like and attribute access forms.
+        edits = None
+        if isinstance(state, dict):
+            edits = state.get("edited_rows")
+        else:
+            edits = getattr(state, "edited_rows", None)
+        if not edits:
+            return df
+        # edited_rows is typically a dict: { row_index: {"view": <bool>, ...}, ... }
+        for idx_raw, changes in dict(edits).items():
+            try:
+                idx = int(idx_raw)
+            except Exception:
+                continue
+            if isinstance(changes, dict) and "view" in changes and 0 <= idx < len(df):
+                df.at[idx, "view"] = bool(changes["view"])
+        return df
+    except Exception:
+        # Fail-quietly: if Streamlit changes the internal shape, we just skip.
+        return df
+
 # ---------- Small text cleanups for PDF ----------
 def _fix_common_encoding_glitches(s: str) -> str:
     if not s: return s
@@ -1147,163 +1177,16 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     # Always show these extra columns
     visible_extra_cols = ["mode", "model", "embedder"]
 
-    # We will build DF **after** the toolbar (but before exports), to avoid scoping issues
-    # ---------- Header: title + compact toolbar ----------
+    # ---------- Header ----------
     st.markdown("### History")
-    st.markdown('<div class="toolbar">', unsafe_allow_html=True)
-    # Left group: two checkboxes. Right group: 4 aligned buttons.
-    # NOTE: we define the copy-payload helper *before* any buttons that use it,
-    # so Streamlit's single-pass execution never hits an undefined name.
-    #
-    left_grp, right_grp = st.columns([7, 5], gap="small")
-    with left_grp:
-        cb1, cb2 = st.columns([1, 1], gap="small")
-        with cb1:
-            st.checkbox(
-                "Save to project (exports/)",
-                value=st.session_state.get("save_exports_to_project", True),
-                key="save_exports_to_project",
-            )
-        with cb2:
-            st.checkbox(
-                "Inject KaTeX (wkhtmltopdf)",
-                value=st.session_state.get("inject_katex", False),
-                key="inject_katex",
-            )
+    # Toolbar placeholder so it renders *after* the table (ensures single-click enable for Copy)
     st.session_state.setdefault("hist_view_ids", set())
-    # ---- Helper for bulk copy payload (now defined before button usage) ----
-
-    def _compose_copy_payload(rows: list[dict]) -> str:
-        """
-        Build the concatenated text that goes to the clipboard for the selected
-        chats. Keeps formatting readable and UTF-8 clean.
-        """
-        parts: list[str] = []
-        for r in rows:
-            cid = r.get("id")
-            ts  = r.get("ts_iso") or _human_dt(r.get("ts"))
-            mode = r.get("mode",""); model = r.get("model") or ""; emb = r.get("embedder") or ""
-            parts.append(f"# Chat #{cid} — {ts}\n[{mode}] model={model} · emb={emb}\n")
-            parts.append("You:\n" + (r.get("prompt") or "").rstrip() + "\n")
-            parts.append("Assistant:\n" + (r.get("answer") or "").rstrip())
-            parts.append("\n---\n")
-        return "\n".join(parts).strip()
-
-    with right_grp:
-        bsel, bclr, bcpy, bdel = st.columns([1.25, 1, 1, 1], gap="small")
-        # NOTE: displayed_ids will be set immediately after we render the table;
-        # until then, keep a fallback empty list to avoid NameError on first paint.
-        with bsel:
-            if st.button("Select all", use_container_width=True, key="hist_select_all_top"):
-                ids = st.session_state.get("_hist_last_displayed_ids", [])
-                st.session_state["hist_view_ids"] = set(map(int, ids))
-                _rerun()
-        with bclr:
-            if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
-                st.session_state["hist_view_ids"] = set()
-                _rerun()
-        # ---- Bulk Copy (selected rows → clipboard) ----
-        with bcpy:
-            # Build current selection and render a real button *inside* the iframe.
-            _sel_ids  = {str(i) for i in st.session_state.get("hist_view_ids", set())}
-            _sel_rows = [r for r in chats if str(r.get("id")) in _sel_ids]
-            _payload  = _compose_copy_payload(_sel_rows) if _sel_rows else ""
-            _b64      = base64.b64encode(_payload.encode("utf-8")).decode("ascii")
-            _disabled = "disabled" if not _sel_rows else ""
-            _tooltip  = f"Copy {len(_sel_rows)} selected chat(s)" if _sel_rows else "Copy selected chat(s)"
-            components.html(
-                f"""
-                <div style="width:100%">
-                  <button class="hist-copy-btn" title="{_tooltip}" {_disabled}
-                    onclick="(function(btn){{
-                      if (btn.hasAttribute('disabled')) return;
-                      const b64 = '{_b64}';
-                      function b64ToUtf8(s){{
-                        try {{
-                          const bin = atob(s);
-                          const bytes = new Uint8Array(bin.length);
-                          for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
-                          return new TextDecoder('utf-8').decode(bytes);
-                        }} catch(e) {{
-                          try {{ return decodeURIComponent(escape(atob(s))); }}
-                          catch(_e) {{ return atob(s); }}
-                        }}
-                      }}
-                      const txt = b64ToUtf8(b64);
-                      function legacyCopy(t){{
-                        const ta=document.createElement('textarea');
-                        ta.value=t; ta.setAttribute('readonly','');
-                        ta.style.position='fixed'; ta.style.top='-1000px';
-                        document.body.appendChild(ta); ta.select();
-                        try{{ document.execCommand('copy'); }}catch(_){{
-                        }} document.body.removeChild(ta);
-                      }}
-                      const done = () => {{ btn.innerText='Copied!'; setTimeout(()=>{{btn.innerText='Copy';}}, 1200); }};
-                      if (navigator.clipboard && window.isSecureContext) {{
-                        navigator.clipboard.writeText(txt).then(done).catch(function(){{ legacyCopy(txt); done(); }});
-                      }} else {{
-                        legacyCopy(txt); done();
-                      }}
-                    }})(this)">
-                    Copy
-                  </button>
-                  <style>
-                    /* Make the iframe button visually match Streamlit toolbar buttons */
-                    :root {{
-                      --btn-border: #e2e8f0;
-                      --btn-bg: #ffffff;
-                      --btn-bg-hover: #f3f4f6;
-                    }}
-                    html, body {{
-                      margin:0; padding:0;
-                      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
-                                   Arial, "Noto Sans", "Liberation Sans", "Apple Color Emoji",
-                                   "Segoe UI Emoji", "Segoe UI Symbol", sans-serif;
-                      font-size: 14px;
-                      line-height: 1.2;
-                    }}
-                    .hist-copy-btn {{
-                      display:inline-flex; align-items:center; justify-content:center;
-                      width:100%;
-                      height:36px;                 /* toolbar height */
-                      padding:.25rem .8rem;        /* toolbar padding */
-                      font-size:.85rem;
-                      border-radius:8px;
-                      border:1px solid var(--btn-border);
-                      background:var(--btn-bg);
-                      white-space:nowrap;
-                      box-sizing:border-box;
-                      cursor:pointer;
-                      transition: background .15s ease, transform .02s ease, opacity .15s ease;
-                    }}
-                    .hist-copy-btn:hover {{ background:var(--btn-bg-hover); }}
-                    .hist-copy-btn:active {{ transform: translateY(1px); }}
-                    .hist-copy-btn[disabled] {{ opacity:.5; cursor:not-allowed; }}
-                    .hist-copy-btn:focus {{ outline:none; box-shadow:none; }}
-                  </style>
-                </div>
-                """,
-                height=40,
-            )
-        # ---- Bulk Delete (selected rows) ----
-        with bdel:
-            if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
-                sel_ids = list(st.session_state.get("hist_view_ids", set()))
-                if not sel_ids:
-                    st.toast("Select at least one row to delete.", icon="⚠️")
-                else:
-                    try:
-                        for _cid in sel_ids:
-                            delete_chat(project_name, int(_cid))
-                        st.session_state["hist_view_ids"] = set()
-                        st.toast(f"Deleted {len(sel_ids)} chat(s).", icon="🗑️")
-                        _rerun()
-                    except Exception as e:
-                        st.error(f"Delete failed: {e}")
-    st.markdown('</div>', unsafe_allow_html=True)  # end .toolbar
+    toolbar_ph = st.empty()
 
     # ---------- Build DF (ALWAYS render table right after toolbar) ----------
     df = _history_dataframe(project_name, flt=flt, show_cols=visible_extra_cols)
+    # Keep a stable, 0..N-1 index so edited_rows mapping stays correct
+    df = df.reset_index(drop=True)
     # Ensure the editor renders even with no rows by keeping the schema stable
     if df.empty:
         # keep only the known, desired columns (in the same order)
@@ -1319,7 +1202,10 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                 df[col] = pd.Series(dtype=("bool" if col == "view" else "object"))
         # keep column order tidy
         df = df[expected_cols]
-    displayed_ids = df["id"].tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
+    else:
+        # ★ Critical: apply the user's *latest* click before re-rendering the editor
+        df = _apply_pending_view_edits_from_editor(df, key="history_table")
+    displayed_ids = df["id"].astype(int).tolist() if "id" in df.columns else [int(r["id"]) for r in chats]
     # cache for the "Select all" button on first paint
     st.session_state["_hist_last_displayed_ids"] = displayed_ids
 
@@ -1352,6 +1238,125 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
     )
     _update_history_selection_from_editor(df_ret)
 
+    # ---------- Fill toolbar *after* table has updated selection ----------
+    with toolbar_ph.container():
+        st.markdown('<div class="toolbar">', unsafe_allow_html=True)
+        left_grp, right_grp = st.columns([7, 5], gap="small")
+        with left_grp:
+            cb1, cb2 = st.columns([1, 1], gap="small")
+            with cb1:
+                st.checkbox(
+                    "Save to project (exports/)",
+                    value=st.session_state.get("save_exports_to_project", True),
+                    key="save_exports_to_project",
+                )
+            with cb2:
+                st.checkbox(
+                    "Inject KaTeX (wkhtmltopdf)",
+                    value=st.session_state.get("inject_katex", False),
+                    key="inject_katex",
+                )
+
+        def _compose_copy_payload(rows: list[dict]) -> str:
+            parts: list[str] = []
+            for r in rows:
+                cid = r.get("id")
+                ts  = r.get("ts_iso") or _human_dt(r.get("ts"))
+                mode = r.get("mode",""); model = r.get("model") or ""; emb = r.get("embedder") or ""
+                parts.append(f"# Chat #{cid} — {ts}\n[{mode}] model={model} · emb={emb}\n")
+                parts.append("You:\n" + (r.get("prompt") or "").rstrip() + "\n")
+                parts.append("Assistant:\n" + (r.get("answer") or "").rstrip())
+                parts.append("\n---\n")
+            return "\n".join(parts).strip()
+
+        with right_grp:
+            bsel, bclr, bcpy, bdel = st.columns([1.25, 1, 1, 1], gap="small")
+            with bsel:
+                if st.button("Select all", use_container_width=True, key="hist_select_all_top"):
+                    ids = st.session_state.get("_hist_last_displayed_ids", [])
+                    st.session_state["hist_view_ids"] = set(map(int, ids))
+                    _rerun()
+            with bclr:
+                if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
+                    st.session_state["hist_view_ids"] = set()
+                    _rerun()
+            with bcpy:
+                sel_ids  = {int(i) for i in st.session_state.get("hist_view_ids", set())}
+                sel_rows = [r for r in chats if int(r.get("id")) in sel_ids]
+                payload  = _compose_copy_payload(sel_rows) if sel_rows else ""
+                b64      = base64.b64encode(payload.encode("utf-8")).decode("ascii")
+                disabled = "disabled" if not sel_rows else ""
+                tooltip  = f"Copy {len(sel_rows)} selected chat(s)" if sel_rows else "Copy selected chat(s)"
+                components.html(
+                    f"""
+                    <div style="width:100%">
+                      <button class="hist-copy-btn" title="{tooltip}" {disabled}
+                        onclick="(function(btn){{
+                          if (btn.hasAttribute('disabled')) return;
+                          const b64 = '{b64}';
+                          function b64ToUtf8(s){{
+                            try {{
+                              const bin = atob(s);
+                              const bytes = new Uint8Array(bin.length);
+                              for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+                              return new TextDecoder('utf-8').decode(bytes);
+                            }} catch(e) {{
+                              try {{ return decodeURIComponent(escape(atob(s))); }}
+                              catch(_e) {{ return atob(s); }}
+                            }}
+                          }}
+                          const txt = b64ToUtf8(b64);
+                          function legacyCopy(t){{
+                            const ta=document.createElement('textarea');
+                            ta.value=t; ta.setAttribute('readonly','');
+                            ta.style.position='fixed'; ta.style.top='-1000px';
+                            document.body.appendChild(ta); ta.select();
+                            try{{ document.execCommand('copy'); }}catch(_){{
+                            }} document.body.removeChild(ta);
+                          }}
+                          const done = () => {{ btn.innerText='Copied!'; setTimeout(()=>{{btn.innerText='Copy';}}, 1200); }};
+                          if (navigator.clipboard && window.isSecureContext) {{
+                            navigator.clipboard.writeText(txt).then(done).catch(function(){{ legacyCopy(txt); done(); }});
+                          }} else {{
+                            legacyCopy(txt); done();
+                          }}
+                        }})(this)">
+                        Copy
+                      </button>
+                      <style>
+                        :root {{ --btn-border:#e2e8f0; --btn-bg:#ffffff; --btn-bg-hover:#f3f4f6; }}
+                        html, body {{ margin:0; padding:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; font-size:14px; line-height:1.2; }}
+                        .hist-copy-btn {{
+                          display:inline-flex; align-items:center; justify-content:center;
+                          width:100%; height:36px; padding:.25rem .8rem; font-size:.85rem;
+                          border-radius:8px; border:1px solid var(--btn-border); background:var(--btn-bg);
+                          white-space:nowrap; box-sizing:border-box; cursor:pointer;
+                          transition: background .15s ease, transform .02s ease, opacity .15s ease;
+                        }}
+                        .hist-copy-btn:hover {{ background:var(--btn-bg-hover); }}
+                        .hist-copy-btn:active {{ transform: translateY(1px); }}
+                        .hist-copy-btn[disabled] {{ opacity:.5; cursor:not-allowed; }}
+                        .hist-copy-btn:focus {{ outline:none; box-shadow:none; }}
+                      </style>
+                    </div>
+                    """,
+                    height=40,
+                )
+            with bdel:
+                if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
+                    sel_ids_list = list(st.session_state.get("hist_view_ids", set()))
+                    if not sel_ids_list:
+                        st.toast("Select at least one row to delete.", icon="⚠️")
+                    else:
+                        try:
+                            for _cid in sel_ids_list:
+                                delete_chat(project_name, int(_cid))
+                            st.session_state["hist_view_ids"] = set()
+                            st.toast(f"Deleted {len(sel_ids_list)} chat(s).", icon="🗑️")
+                            _rerun()
+                        except Exception as e:
+                            st.error(f"Delete failed: {e}")
+        st.markdown('</div>', unsafe_allow_html=True)  # end .toolbar
 
     # ---------- Exports + downloads ----------
     if manager_ui:
