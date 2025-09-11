@@ -1352,13 +1352,31 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
         with right_grp:
             # Trimmed toolbar: Select all | Clear | Copy | Delete | Telegram
             bsel, bclr, bcpy, bdel, btgsend = st.columns([1.25, 1, 1, 1, 1], gap="small")
+
+            # ---- Selection intelligence (based on current view) ----
+            _displayed_ids: list[int] = list(map(int, st.session_state.get("_hist_last_displayed_ids", []) or []))
+            _selected_ids: set[int] = set(map(int, st.session_state.get("hist_view_ids", set()) or set()))
+            _selected_in_view: set[int] = _selected_ids.intersection(set(_displayed_ids))
+            _any_selected: bool = len(_selected_in_view) > 0
+            _all_selected: bool = (len(_displayed_ids) > 0) and (len(_selected_in_view) == len(_displayed_ids))
+            _has_rows: bool = len(_displayed_ids) > 0
             with bsel:
-                if st.button("Select all", use_container_width=True, key="hist_select_all_top"):
+                if st.button(
+                    "Select all",
+                    use_container_width=True,
+                    key="hist_select_all_top",
+                    disabled=(not _has_rows or _all_selected),
+                ):
                     ids = st.session_state.get("_hist_last_displayed_ids", [])
                     st.session_state["hist_view_ids"] = set(map(int, ids))
                     _rerun()
             with bclr:
-                if st.button("Clear", use_container_width=True, key="hist_clear_selection_top"):
+                if st.button(
+                    "Clear",
+                    use_container_width=True,
+                    key="hist_clear_selection_top",
+                    disabled=(not _any_selected),
+                ):
                     st.session_state["hist_view_ids"] = set()
                     _rerun()
             with bcpy:
@@ -1428,7 +1446,12 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     height=50,
                 )
             with bdel:
-                if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
+                if st.button(
+                    "Delete",
+                    use_container_width=True,
+                    key="hist_delete_bulk",
+                    disabled=(not _any_selected),
+                ):
                     sel_ids_list = list(st.session_state.get("hist_view_ids", set()))
                     if not sel_ids_list:
                         st.toast("Select at least one row to delete.", icon="⚠️")
