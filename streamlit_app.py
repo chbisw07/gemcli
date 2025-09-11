@@ -2318,8 +2318,8 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to load rag.json: {e}")
 
-    # --- Models & embeddings ---
-    with st.expander("Models & Embeddings", expanded=False):
+    # --- Models (LLM picker + config editor) ---
+    with st.expander("Models", expanded=False):
         default_cfg = str(MODELS_JSON_PATH)
         models_config = st.text_input("Model config (--config)", value=ui.get("models_config", default_cfg))
         ui["models_config"] = models_config
@@ -2350,8 +2350,9 @@ with st.sidebar:
             st.error(f"Failed to load models: {e}")
             st.stop()
 
-    # --- Models config (global) editor ---
-    with st.expander("Models config (global)", expanded=False):
+        # ---- Inline models.json editor (moved from separate expander) ----
+        st.divider()
+        st.caption("**Config (models.json)**")
         st.caption(f"Path: `{models_config}`")
         _models_raw = ""
         try:
@@ -2374,6 +2375,7 @@ with st.sidebar:
         with col_m2:
             if st.button("Reload models.json", key="btn_reload_models_json"):
                 _rerun()
+
 
     # --- Secrets (.env) editor ---
     with st.expander("Secrets (.env)", expanded=False):
