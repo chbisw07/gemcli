@@ -2350,6 +2350,184 @@ with st.sidebar:
             st.error(f"Failed to load models: {e}")
             st.stop()
 
+    # --- Models config (global) editor ---
+    with st.expander("Models config (global)", expanded=False):
+        st.caption(f"Path: `{models_config}`")
+        _models_raw = ""
+        try:
+            _models_raw = Path(models_config).read_text(encoding="utf-8")
+        except Exception as _e:
+            st.warning(f"Could not read models config: {str(_e)}")
+            _models_raw = "{}"
+        models_text = st.text_area("models.json", _models_raw, height=320, key="models_textarea")
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            if st.button("Save models.json", key="btn_save_models_json"):
+                try:
+                    data = json.loads(models_text)
+                    p = Path(models_config)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                    st.success("Saved. Re-run the app if models changed.")
+                except Exception as _e:
+                    st.error(f"Invalid JSON or write failed: {str(_e)}")
+        with col_m2:
+            if st.button("Reload models.json", key="btn_reload_models_json"):
+                _rerun()
+
+    # --- Secrets (.env) editor ---
+    with st.expander("Secrets (.env)", expanded=False):
+        st.caption(f"Path: `{str(ENV_PATH)}`")
+
+        # ---------- helpers (local scope) ----------
+        def _parse_env_file(path: Path) -> Dict[str, str]:
+            """Best-effort .env parser: KEY=VALUE lines, ignore comments/blank lines."""
+            out: Dict[str, str] = {}
+            try:
+                text = path.read_text(encoding="utf-8")
+            except Exception:
+                return out
+            for raw in text.splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.lower().startswith("export "):
+                    line = line[7:].lstrip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                # drop trailing comment when value is unquoted
+                if v and not (v.startswith("'") or v.startswith('"')):
+                    # allow inline comments: KEY=value # comment
+                    if " #" in v:
+                        v = v.split(" #", 1)[0].rstrip()
+                    elif "\t#" in v:
+                        v = v.split("\t#", 1)[0].rstrip()
+                # strip surrounding quotes
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                if k:
+                    out[k] = v
+            return out
+
+        def _dump_env_lines(kv: Dict[str, str]) -> str:
+            header = (
+                "# Tarkash .env (managed by UI)\n"
+                "# Edit via the app or by hand. Lines below were generated.\n"
+            )
+            lines = [header]
+            for k in sorted(kv.keys()):
+                v = kv[k] if kv[k] is not None else ""
+                # quote if contains spaces or special chars
+                if re.search(r"\s|[#\"']", v):
+                    v_out = json.dumps(v, ensure_ascii=False)  # safe JSON quoted
+                else:
+                    v_out = v
+                lines.append(f"{k}={v_out}")
+            return "\n".join(lines) + "\n"
+
+        def _write_env_file(path: Path, updates: Dict[str, str], keep_existing: bool = True) -> None:
+            existing = _parse_env_file(path) if (keep_existing and path.exists()) else {}
+            merged = dict(existing)
+            for k, v in (updates or {}).items():
+                if not k:
+                    continue
+                if v == "" or v is None:
+                    # treat empty value as 'remove' only if it exists already
+                    merged.pop(k, None)
+                else:
+                    merged[k] = v
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(_dump_env_lines(merged), encoding="utf-8")
+
+        # ---------- discover known keys ----------
+        known_keys: List[str] = []
+        try:
+            cfg_json = json.loads(Path(models_config).read_text(encoding="utf-8"))
+            for entry in (cfg_json.get("llm_models") or []):
+                if isinstance(entry, dict) and entry.get("api_key_reqd") and entry.get("api_key_env"):
+                    known_keys.append(entry["api_key_env"])
+            for entry in (cfg_json.get("embedding_models") or []):
+                if isinstance(entry, dict) and entry.get("api_key_reqd") and entry.get("api_key_env"):
+                    known_keys.append(entry["api_key_env"])
+        except Exception:
+            pass
+        # Helpful extras commonly used by the app
+        known_keys.extend(["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"])
+        known_keys = sorted(set([k for k in known_keys if isinstance(k, str) and k.strip()]))
+
+        # Load current values (prefer file, fall back to environment)
+        file_env = _parse_env_file(ENV_PATH)
+        def _get_val(k: str) -> str:
+            return file_env.get(k) or os.environ.get(k) or ""
+
+        st.caption("**Known keys from config**")
+        for k in known_keys:
+            c1, c2 = st.columns([2, 5])
+            with c1:
+                st.text_input("KEY", value=k, key=f"env_known_key_{k}", disabled=True, label_visibility="collapsed")
+            with c2:
+                st.text_input("VALUE", value=_get_val(k), key=f"env_known_val_{k}", type="password", label_visibility="collapsed")
+
+        # Extra rows the user can add
+        if "secret_rows" not in st.session_state:
+            st.session_state["secret_rows"] = [{"k": "", "v": ""}]
+
+        st.caption("**Add more**")
+        new_rows = []
+        for i, row in enumerate(st.session_state["secret_rows"]):
+            c1, c2 = st.columns([2, 5])
+            with c1:
+                nk = st.text_input("KEY", value=row.get("k",""), key=f"env_free_key_{i}", placeholder="MY_API_KEY", label_visibility="collapsed")
+            with c2:
+                nv = st.text_input("VALUE", value=row.get("v",""), key=f"env_free_val_{i}", type="password", placeholder="value", label_visibility="collapsed")
+            new_rows.append({"k": nk.strip(), "v": nv})
+        st.session_state["secret_rows"] = new_rows
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            if st.button("+ Add row", key="btn_env_add_row"):
+                st.session_state["secret_rows"].append({"k": "", "v": ""})
+                st.experimental_rerun()
+        with col_s2:
+            if st.button("Save to .env", key="btn_env_save", type="primary"):
+                # Collect updates
+                upd: Dict[str, str] = {}
+                # known
+                for k in known_keys:
+                    v = st.session_state.get(f"env_known_val_{k}", "")
+                    if k and v is not None:
+                        upd[k] = str(v)
+                # freeform (validate)
+                KEY_RX = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+                errs = []
+                for i, row in enumerate(st.session_state["secret_rows"]):
+                    k = (row.get("k") or "").strip()
+                    v = (row.get("v") or "").strip()
+                    if not k and not v:
+                        continue
+                    if not KEY_RX.match(k):
+                        errs.append(f"Row {i+1}: invalid KEY '{k}'. Use A–Z, 0–9, and underscores; must not start with a digit.")
+                        continue
+                    upd[k] = v
+                if errs:
+                    for e2 in errs:
+                        st.error(e2)
+                else:
+                    try:
+                        _write_env_file(ENV_PATH, upd, keep_existing=True)
+                        # reload into process so the session sees new values
+                        load_dotenv(dotenv_path=ENV_PATH, override=True)
+                        st.success("Saved secrets to .env and reloaded environment.")
+                    except Exception as _e:
+                        st.error(f"Save failed: {str(_e)}")
+        with col_s3:
+            if st.button("Reload from disk", key="btn_env_reload"):
+                _rerun()
+
+
     # --- Execution Options ---
     with st.expander("Execution Options", expanded=False):
         enable_tools = True  # always enabled
