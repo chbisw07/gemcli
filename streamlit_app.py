@@ -1350,8 +1350,8 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                 return False, str(e)
 
         with right_grp:
-            # Trimmed toolbar: keep Select/Clear, Copy, Send Telegram, Delete
-            bsel, bclr, bcpy, btgsend, bdel = st.columns([1.25, 1, 1, 1, 1], gap="small")
+            # Trimmed toolbar: Select all | Clear | Copy | Delete | Telegram
+            bsel, bclr, bcpy, bdel, btgsend = st.columns([1.25, 1, 1, 1, 1], gap="small")
             with bsel:
                 if st.button("Select all", use_container_width=True, key="hist_select_all_top"):
                     ids = st.session_state.get("_hist_last_displayed_ids", [])
@@ -1427,23 +1427,6 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                     """,
                     height=50,
                 )
-            with btgsend:
-                sel_ids_send  = {int(i) for i in st.session_state.get("hist_view_ids", set())}
-                sel_rows_send = [r for r in chats if int(r.get("id")) in sel_ids_send]
-                if st.button("Send Telegram", use_container_width=True, key="hist_send_tg", disabled=(not sel_rows_send)):
-                    # Prefer PDF upload; fall back to sending text if PDF generation fails.
-                    pdf_bytes = _export_chats_to_pdf_auto(project_name, sel_rows_send) if sel_rows_send else None
-                    if pdf_bytes:
-                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
-                        fname = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
-                        ok, info = _send_telegram_document(pdf_bytes, filename=fname, caption=f"Tarkash share ({len(sel_rows_send)} chat(s))")
-                    else:
-                        payload_send  = _compose_copy_payload(sel_rows_send) if sel_rows_send else ""
-                        ok, info = _send_telegram_channel(payload_send, caption=f"Tarkash share ({len(sel_rows_send)} chat(s))")
-                    if ok:
-                        st.toast(f"Sent {len(sel_rows_send)} chat(s) to Telegram", icon="📤")
-                    else:
-                        st.error(f"Telegram send failed: {info}")
             with bdel:
                 if st.button("Delete", use_container_width=True, key="hist_delete_bulk"):
                     sel_ids_list = list(st.session_state.get("hist_view_ids", set()))
@@ -1458,6 +1441,23 @@ def _render_history_cards(project_name: str, *, flt: dict, manager_ui: bool = Tr
                             _rerun()
                         except Exception as e:
                             st.error(f"Delete failed: {e}")
+            with btgsend:
+                sel_ids_send  = {int(i) for i in st.session_state.get("hist_view_ids", set())}
+                sel_rows_send = [r for r in chats if int(r.get("id")) in sel_ids_send]
+                if st.button("Telegram", use_container_width=True, key="hist_send_tg", disabled=(not sel_rows_send)):
+                    # Prefer PDF upload; fall back to sending text if PDF generation fails.
+                    pdf_bytes = _export_chats_to_pdf_auto(project_name, sel_rows_send) if sel_rows_send else None
+                    if pdf_bytes:
+                        tsf = time.strftime("%Y%m%d_%H%M%S", time.localtime(time.time()))
+                        fname = f"{_safe_name(project_name)}_chats_{tsf}.pdf"
+                        ok, info = _send_telegram_document(pdf_bytes, filename=fname, caption=f"Tarkash share ({len(sel_rows_send)} chat(s))")
+                    else:
+                        payload_send  = _compose_copy_payload(sel_rows_send) if sel_rows_send else ""
+                        ok, info = _send_telegram_channel(payload_send, caption=f"Tarkash share ({len(sel_rows_send)} chat(s))")
+                    if ok:
+                        st.toast(f"Sent {len(sel_rows_send)} chat(s) to Telegram", icon="📤")
+                    else:
+                        st.error(f"Telegram send failed: {info}")
         st.markdown('</div>', unsafe_allow_html=True)  # end .toolbar
 
     # ---------- Exports + downloads ----------
@@ -1718,10 +1718,10 @@ def _inject_css():
         }
         /* History header toolbar + smaller buttons */
         .hist-root .toolbar .stButton>button{
-          height:32px;
-          padding:.25rem .6rem;
+          height:46px;               /* match custom Copy pill */
+          padding:0 .75rem;          /* consistent horizontal padding */
           font-size:.85rem;
-          border-radius:8px;
+          border-radius:14px;        /* same curvature as Copy */
           white-space: nowrap;          /* avoid two-line button labels */
           min-width: 96px;              /* gives 'Select all' a bit more room */
         }
