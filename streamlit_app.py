@@ -1880,6 +1880,50 @@ with st.sidebar:
 
     # --- Indexation ---
     with st.expander("Indexation", expanded=False):
+        # Embedding model (moved here from Models & Embeddings; fully controlled to avoid double-clicks)
+        try:
+            models_config_path = ui.get("models_config") or str(MODELS_JSON_PATH)
+            with open(models_config_path, "r", encoding="utf-8") as f:
+                _models_cfg = json.load(f)
+            emb_list = _models_cfg.get("embedding_models", []) or []
+            emb_names = [e["name"] for e in emb_list]
+            seed_emb = (
+                ui.get("embedding_model")
+                or _models_cfg.get("default_embedding_model")
+                or (emb_names[0] if emb_names else "")
+            )
+        except Exception:
+            emb_list, emb_names, seed_emb = [], [], ""
+
+        if emb_names:
+            # Seed once; keep a single source of truth in session_state (no index/value on widget)
+            if ("embedding_model_select" not in st.session_state) or (
+                st.session_state["embedding_model_select"] not in emb_names
+            ):
+                st.session_state["embedding_model_select"] = (
+                    seed_emb if seed_emb in emb_names else emb_names[0]
+                )
+            st.selectbox(
+                "Embedding model (RAG / indexing)",
+                emb_names,
+                key="embedding_model_select",
+                help="Used by the indexer and RAG retrieval.",
+            )
+            selected_emb = st.session_state["embedding_model_select"]
+            ui["embedding_model"] = selected_emb
+            st.session_state["embedding_model"] = selected_emb
+            # Persist selection to rag.json immediately so indexer uses it
+            try:
+                cfg = load_rag(per_rag_path)
+                cfg.setdefault("embedder", {})
+                cfg["embedder"]["selected_name"] = selected_emb
+                cfg["chroma_dir"] = str(rag_index_dir)
+                save_rag(per_rag_path, cfg)
+            except Exception:
+                pass
+        else:
+            st.info("No embedding models found in models.json.")
+
         # Auto indexing toggle
         auto_index_flag = st.checkbox(
             "Auto indexing",
@@ -2045,52 +2089,27 @@ with st.sidebar:
             model_registry = ModelRegistry(models_config)
             models_list = model_registry.list()
             names = [m.name for m in models_list]
-            chosen_model_name = ui.get("llm_model") or model_registry.default_name or (names[0] if names else "")
-            chosen_model_name = st.selectbox(
-                "Model (--model)",
-                names,
-                index=names.index(chosen_model_name) if chosen_model_name in names else 0,
-            )
-            ui["llm_model"] = chosen_model_name
-            model = model_registry.get(chosen_model_name)
+            # --- Controlled selectbox: no index/value; drive via session_state only ---
+            seed_name = ui.get("llm_model") or model_registry.default_name or (names[0] if names else "")
+            if names:
+                if ("llm_model_select" not in st.session_state) or (
+                    st.session_state["llm_model_select"] not in names
+                ):
+                    st.session_state["llm_model_select"] = (
+                        seed_name if seed_name in names else names[0]
+                    )
+                st.selectbox("Model (--model)", names, key="llm_model_select")
+                selected_model_name = st.session_state["llm_model_select"]
+                ui["llm_model"] = selected_model_name
+                model = model_registry.get(selected_model_name)
+            else:
+                # No models available; keep placeholders
+                ui["llm_model"] = ""
+                model = None
             st.caption(f"Provider: {model.provider}  •  Endpoint: {model.endpoint}")
         except Exception as e:
             st.error(f"Failed to load models: {e}")
             st.stop()
-
-        # Embedding model
-        try:
-            with open(models_config, "r", encoding="utf-8") as f:
-                _models_cfg = json.load(f)
-            emb_list = _models_cfg.get("embedding_models", []) or []
-            emb_names = [e["name"] for e in emb_list]
-            default_emb = ui.get("embedding_model") or _models_cfg.get("default_embedding_model") or (
-                emb_names[0] if emb_names else ""
-            )
-        except Exception:
-            emb_list, emb_names, default_emb = [], [], ""
-
-        if emb_names:
-            chosen_emb = st.selectbox(
-                "Embedding model (RAG / indexing)",
-                emb_names,
-                index=emb_names.index(default_emb) if default_emb in emb_names else 0,
-                disabled=not _rag_enabled,
-                help=None if _rag_enabled else "Disabled while RAG is OFF",
-            )
-            if _rag_enabled:
-                ui["embedding_model"] = chosen_emb
-                st.session_state["embedding_model"] = chosen_emb
-                try:
-                    cfg = load_rag(RAG_PATH)
-                    cfg.setdefault("embedder", {})
-                    cfg["embedder"]["selected_name"] = chosen_emb
-                    cfg["chroma_dir"] = str(rag_index_dir)
-                    save_rag(RAG_PATH, cfg)
-                except Exception:
-                    pass
-        else:
-            st.info("No embedding models found in models.json.")
 
     # --- Execution Options ---
     with st.expander("Execution Options", expanded=False):
